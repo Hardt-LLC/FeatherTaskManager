@@ -38,10 +38,13 @@ const SEARCH: usize = 101;
 const PAUSE: usize = 102;
 const RATE: usize = 103;
 const TOP: usize = 104;
-const ADMIN: usize = 105;
+const SETTINGS: usize = 105;
 const PRIMARY: usize = 106;
 const SECONDARY: usize = 107;
 const REFRESH: usize = 108;
+const ELEVATE: usize = 109;
+const REPLACE_TASK_MANAGER: usize = 110;
+const RESTORE_TASK_MANAGER: usize = 111;
 const NAV: usize = 300;
 const APP_ICON: *const u16 = 101usize as *const u16;
 const SIDEBAR: i32 = 196;
@@ -122,6 +125,7 @@ enum Action {
     Start(String),
     Stop(String),
     Elevate,
+    ReplaceTaskManager(bool, Page),
 }
 enum Job {
     Startup,
@@ -154,7 +158,7 @@ struct App {
     pause: HWND,
     rate: HWND,
     top: HWND,
-    admin: HWND,
+    settings: HWND,
     primary: HWND,
     secondary: HWND,
     refresh: HWND,
@@ -218,7 +222,7 @@ impl App {
             pause: null_mut(),
             rate: null_mut(),
             top: null_mut(),
-            admin: null_mut(),
+            settings: null_mut(),
             primary: null_mut(),
             secondary: null_mut(),
             refresh: null_mut(),
@@ -369,15 +373,7 @@ pub fn run() {
             );
         }
         let args: Vec<String> = std::env::args().collect();
-        if let Some(i) = args.iter().position(|s| s == "--page") {
-            let page = match args.get(i + 1).map(String::as_str) {
-                Some("performance") => Page::Performance,
-                Some("startup") => Page::Startup,
-                Some("services") => Page::Services,
-                _ => Page::Processes,
-            };
-            switch_page(p, page);
-        }
+        switch_page(p, initial_page(&args));
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
         let mut msg: MSG = zeroed();
@@ -392,6 +388,23 @@ pub fn run() {
         }
         dispose(p);
         UnregisterClassW(class.as_ptr(), GetModuleHandleW(null()));
+    }
+}
+fn initial_page(args: &[String]) -> Page {
+    // IFEO appends taskmgr.exe and its arguments. They belong to Windows,
+    // not to Feather's own command-line interface.
+    if args.get(1).map(String::as_str) == Some("--task-manager") {
+        return Page::Processes;
+    }
+    match args
+        .windows(2)
+        .find(|pair| pair[0] == "--page")
+        .map(|pair| pair[1].as_str())
+    {
+        Some("performance") => Page::Performance,
+        Some("startup") => Page::Startup,
+        Some("services") => Page::Services,
+        _ => Page::Processes,
     }
 }
 fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<MonitorSample>) {
@@ -511,6 +524,15 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
                         crate::actions::relaunch_elevated(),
                         Page::Processes,
                         "관리자 권한 창을 열었습니다.",
+                    ),
+                    Action::ReplaceTaskManager(enable, page) => (
+                        crate::replacement::run_elevated(enable),
+                        page,
+                        if enable {
+                            "Feather를 Windows 작업 관리자로 설정했습니다. 다음 실행부터 적용됩니다."
+                        } else {
+                            "Windows 기본 작업 관리자로 복원했습니다."
+                        },
                     ),
                 };
                 JobResult::Action {
@@ -797,7 +819,7 @@ unsafe fn create_controls(p: *mut App) {
     }
     SendMessageW((*p).rate, CB_SETCURSEL, 1, 0);
     (*p).top = button(p, "항상 위에 표시", TOP);
-    (*p).admin = button(p, "관리자로 실행", ADMIN);
+    (*p).settings = button(p, "설정", SETTINGS);
     (*p).primary = button(p, "작업 끝내기", PRIMARY);
     (*p).secondary = button(p, "파일 위치 열기", SECONDARY);
     (*p).refresh = button(p, "새로고침", REFRESH);
@@ -861,7 +883,7 @@ unsafe fn create_fonts(p: *mut App) {
         (*p).pause,
         (*p).rate,
         (*p).top,
-        (*p).admin,
+        (*p).settings,
         (*p).primary,
         (*p).secondary,
         (*p).refresh,
@@ -959,7 +981,7 @@ unsafe fn layout(p: *mut App) {
         mv((*p).nav[i], s(12), s(126 + 52 * i as i32), s(172), s(44));
     }
     mv((*p).top, s(12), r.bottom - s(134), s(172), s(36));
-    mv((*p).admin, s(12), r.bottom - s(90), s(172), s(36));
+    mv((*p).settings, s(12), r.bottom - s(90), s(172), s(36));
     let x = s(220);
     mv((*p).search, x + s(42), s(215), r.right - x - s(356), s(26));
     mv((*p).rate, r.right - s(280), s(213), s(68), s(220));
@@ -1121,7 +1143,106 @@ unsafe fn command(p: *mut App, id: usize, notification: u32) {
         }
         PRIMARY if IsWindowEnabled((*p).primary) != 0 => primary_action(p),
         SECONDARY if IsWindowEnabled((*p).secondary) != 0 => secondary_action(p),
-        ADMIN if !(*p).busy && !(*p).modal => begin_action(p, Action::Elevate),
+        SETTINGS if !(*p).busy && !(*p).modal => settings_menu(p),
+        _ => {}
+    }
+}
+unsafe fn create_settings_menu(status: &Result<crate::replacement::Status, String>) -> HMENU {
+    use crate::replacement::Status;
+    let menu = CreatePopupMenu();
+    if menu.is_null() {
+        return menu;
+    }
+    let (label, can_replace, can_restore) = match status {
+        Ok(Status::Inactive) => ("작업 관리자 · Windows 기본값", true, false),
+        Ok(Status::Active) => ("작업 관리자 · Feather 사용 중", false, true),
+        Ok(Status::Other(_)) => ("작업 관리자 · 다른 설정 사용 중", false, false),
+        Err(_) => ("작업 관리자 · 상태 확인 실패", false, false),
+    };
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(label).as_ptr());
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    for (id, text, enabled) in [
+        (
+            REPLACE_TASK_MANAGER,
+            "Feather를 작업 관리자로 설정…",
+            can_replace,
+        ),
+        (
+            RESTORE_TASK_MANAGER,
+            "Windows 기본 작업 관리자로 복원…",
+            can_restore,
+        ),
+    ] {
+        AppendMenuW(
+            menu,
+            MF_STRING | if enabled { MF_ENABLED } else { MF_GRAYED },
+            id,
+            wide(text).as_ptr(),
+        );
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(menu, MF_STRING, ELEVATE, wide("관리자로 실행").as_ptr());
+    menu
+}
+unsafe fn settings_menu(p: *mut App) {
+    let status = crate::replacement::status();
+    match &status {
+        Err(error) => (*p).set_error(ErrorSource::Action, error.clone()),
+        Ok(crate::replacement::Status::Other(value)) => {
+            (*p).set_error(
+                ErrorSource::Action,
+                format!("기존 작업 관리자 연결을 먼저 해제하세요. 현재 설정: {value}"),
+            );
+        }
+        _ => {}
+    }
+    let menu = create_settings_menu(&status);
+    if menu.is_null() {
+        (*p).set_error(ErrorSource::Action, "설정 메뉴를 열지 못했습니다.".into());
+        redraw(p);
+        return;
+    }
+    (*p).modal = true;
+    update_buttons(p);
+    configure(p);
+    let mut bounds: RECT = zeroed();
+    GetWindowRect((*p).settings, &mut bounds);
+    let command = TrackPopupMenuEx(
+        menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+        bounds.left,
+        bounds.top,
+        (*p).hwnd,
+        null(),
+    ) as usize;
+    DestroyMenu(menu);
+    (*p).modal = false;
+    configure(p);
+    PostMessageW((*p).hwnd, SNAPSHOT_READY, 0, 0);
+    PostMessageW((*p).hwnd, JOB_READY, 0, 0);
+    update_buttons(p);
+    redraw(p);
+    match command {
+        ELEVATE => begin_action(p, Action::Elevate),
+        REPLACE_TASK_MANAGER | RESTORE_TASK_MANAGER => {
+            let enable = command == REPLACE_TASK_MANAGER;
+            let (title, prompt) = if enable {
+                ("Windows 작업 관리자 대체", concat!(
+                    "Feather를 Windows 작업 관리자로 설정할까요?\n\n",
+                    "Program Files의 Feather Task Manager 폴더에 앱을 설치하고, 이 PC의 모든 사용자에게 적용합니다. ",
+                    "Ctrl+Alt+Delete → 작업 관리자와 Ctrl+Shift+Esc로 Feather가 열립니다.\n\n",
+                    "관리자 권한이 필요합니다. 설치된 파일을 삭제하기 전에 설정에서 Windows 기본 작업 관리자로 복원하세요."
+                ))
+            } else {
+                ("Windows 작업 관리자 복원", concat!(
+                    "Windows 기본 작업 관리자로 되돌릴까요?\n\n",
+                    "관리자 권한이 필요하며 이 PC의 모든 사용자에게 적용합니다. Feather 앱은 설치된 폴더에 그대로 남습니다."
+                ))
+            };
+            if confirm(p, title, prompt) {
+                begin_action(p, Action::ReplaceTaskManager(enable, (*p).page));
+            }
+        }
         _ => {}
     }
 }
@@ -1257,7 +1378,7 @@ unsafe fn update_buttons(p: *mut App) {
     SetWindowTextW((*p).secondary, wide(second).as_ptr());
     EnableWindow((*p).primary, (ready && primary) as i32);
     EnableWindow((*p).secondary, (ready && secondary) as i32);
-    EnableWindow((*p).admin, ready as i32);
+    EnableWindow((*p).settings, ready as i32);
     let loading = ((*p).page == Page::Startup && (*p).startup_loading)
         || ((*p).page == Page::Services && (*p).services_loading);
     EnableWindow((*p).refresh, (!loading && !(*p).modal) as i32);
@@ -2412,6 +2533,49 @@ mod tests {
         test.sample(Vec::new(), now + Duration::from_secs(200));
         unsafe {
             assert_eq!((*test.p).history.len(), 1);
+        }
+    }
+    #[test]
+    fn ifeo_target_arguments_do_not_select_a_feather_page() {
+        let args = |values: &[&str]| values.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            initial_page(&args(&["Feather.exe", "--page", "performance"])),
+            Page::Performance
+        );
+        assert_eq!(
+            initial_page(&args(&[
+                "Feather.exe",
+                "--task-manager",
+                "C:\\Windows\\System32\\taskmgr.exe",
+                "--page",
+                "performance"
+            ])),
+            Page::Processes
+        );
+    }
+    #[test]
+    fn replacement_menu_only_offers_valid_transitions() {
+        use crate::replacement::Status;
+        for (status, replace, restore) in [
+            (Ok(Status::Inactive), true, false),
+            (Ok(Status::Active), false, true),
+            (Ok(Status::Other("another debugger".into())), false, false),
+            (Err("access denied".into()), false, false),
+        ] {
+            unsafe {
+                let menu = create_settings_menu(&status);
+                assert!(!menu.is_null());
+                for (id, expected) in [
+                    (REPLACE_TASK_MANAGER, replace),
+                    (RESTORE_TASK_MANAGER, restore),
+                    (ELEVATE, true),
+                ] {
+                    let state = GetMenuState(menu, id as u32, MF_BYCOMMAND);
+                    assert_ne!(state, u32::MAX);
+                    assert_eq!(state & (MF_GRAYED | MF_DISABLED) == 0, expected);
+                }
+                assert_ne!(DestroyMenu(menu), 0);
+            }
         }
     }
     #[test]

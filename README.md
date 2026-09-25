@@ -2,11 +2,11 @@
   <img src="assets/app.png" width="112" height="112" alt="Feather Task Manager 깃털 앱 아이콘">
 </p>
 
-# Feather Task Manager 0.2.1
+# Feather Task Manager 0.3.0
 
 느려진 Windows에서도 빠르게 상태를 확인하고 작업을 정리하기 위한 네이티브 작업 관리자입니다. Rust와 Win32로 만들었으며 브라우저 엔진·WebView·WMI를 사용하지 않습니다. 0.2에는 **성능·시작 앱·서비스** 화면과 새 UI를 추가했습니다.
 
-0.2.1에서는 이름을 **Feather Task Manager**로 바꾸고, 깃털 로고·Windows 앱 아이콘·네 가지 탭 아이콘을 통일했습니다. 아이콘은 배율별 크기를 사용하며 새 그래픽 런타임을 추가하지 않았습니다.
+0.3.0에서는 Windows 작업 관리자로 설정하고 원래 작업 관리자로 복원하는 기능을 추가했습니다. 깃털 로고·Windows 앱 아이콘·네 가지 탭 아이콘은 배율별 크기를 사용하며 새 그래픽 런타임을 추가하지 않았습니다.
 
 ## 실행
 
@@ -14,7 +14,34 @@
 
 Git 저장소에는 소스와 빌드에 필요한 아이콘 원본·생성 자산을 포함합니다. `dist`의 실행 파일·ZIP·미리보기는 로컬 빌드 결과이며 Git에는 포함하지 않습니다. 저장소를 처음 받았다면 아래 **소스에서 빌드** 절차로 생성하세요.
 
-기본 권한으로 시작합니다. **관리자로 실행**은 Windows UAC 확인을 거쳐 별도 관리자 창을 엽니다. 서비스 제어나 모든 사용자 시작 앱 변경에는 관리자 권한이 필요할 수 있습니다. Windows 기본 작업 관리자나 `Ctrl+Shift+Esc` 연결은 자동으로 바꾸지 않습니다.
+기본 권한으로 시작합니다. **설정 → 관리자로 실행**은 Windows UAC 확인을 거쳐 별도 관리자 창을 엽니다. 서비스 제어나 모든 사용자 시작 앱 변경에는 관리자 권한이 필요할 수 있습니다. Windows 작업 관리자 연결은 아래 설정을 선택할 때만 바뀝니다.
+
+## Windows 작업 관리자로 설정
+
+1. 왼쪽 아래 **설정 → Feather를 작업 관리자로 설정…**을 선택합니다.
+2. 설치 위치와 변경 내용을 확인하고 Windows UAC를 승인합니다. 실행 파일을 `Program Files\Feather Task Manager\FeatherTaskManager.exe`에 복사한 뒤 이 PC의 모든 사용자에게 연결을 적용합니다.
+3. 다음부터 `Ctrl+Alt+Delete → 작업 관리자`, `Ctrl+Shift+Esc` 또는 `taskmgr.exe` 실행 시 Feather가 열립니다. 이미 열린 작업 관리자 창은 바뀌지 않으며 재부팅은 필요하지 않습니다.
+
+Windows의 [프로그램별 실행 설정(IFEO)](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/gflags-details)을 사용합니다. [설정은 다음 실행부터 적용](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/gflags-overview)되며 위 단축키는 [Windows의 작업 관리자 실행 경로](https://support.microsoft.com/en-us/windows/keyboard-shortcuts-in-windows-dcc61a57-8ff0-cffe-9796-cb9706c75eec)입니다. 조직의 작업 관리자 차단 정책은 변경하지 않습니다. 보안 화면에서 실제 `Ctrl+Alt+Delete` 동작은 자동 검증하지 않았으므로 적용 후 직접 확인하세요.
+
+포터블 실행이 기본이며, 이 설정을 선택하면 연결에 사용할 실행 파일만 고정 위치에 설치합니다. 별도 설치 관리자·시작 메뉴 바로가기·제거 프로그램은 제공하지 않습니다. 다른 작업 관리자 연결이나 지원하지 않는 IFEO 설정이 있으면 덮어쓰지 않고 오류를 알립니다.
+
+**원복:** **설정 → Windows 기본 작업 관리자로 복원…**을 선택하고 UAC를 승인하세요. 설치된 실행 파일을 수동으로 삭제하기 전에 먼저 복원해야 합니다. 복원은 Feather의 연결만 해제하며 설치된 파일은 남겨 둡니다.
+
+**업데이트:** 먼저 연결을 복원하고 설치된 Feather 창을 모두 닫으세요. 새 포터블 실행 파일을 실행한 뒤 **Feather를 작업 관리자로 설정…**을 다시 선택하면 설치된 파일과 연결을 갱신합니다.
+
+앱 메뉴를 사용할 수 없어도 실행 파일이 남아 있다면 64비트 PowerShell에서 다음 명령으로 복원할 수 있습니다.
+
+```powershell
+$featherExe = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Feather Task Manager\FeatherTaskManager.exe'
+Start-Process -FilePath $featherExe -Verb RunAs -ArgumentList '--restore-task-manager' -Wait
+```
+
+실행 파일을 먼저 지웠다면 배포 ZIP에 포함된 `Restore-WindowsTaskManager.ps1`을 **관리자 권한의 64비트 PowerShell**에서 실행하세요. 이 스크립트는 정확히 일치하는 Feather의 `Debugger` 값 하나만 제거하며 다른 연결이나 잘못된 형식의 값은 그대로 둡니다. 소스 저장소에서는 `scripts\Restore-WindowsTaskManager.ps1`에 있습니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Restore-WindowsTaskManager.ps1
+```
 
 ## 네 가지 화면
 

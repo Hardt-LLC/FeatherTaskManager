@@ -173,7 +173,7 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
         dc,
         (*p).small,
         rgb(176, 191, 213),
-        "로컬 모니터링   ·   v0.2.1",
+        concat!("로컬 모니터링   ·   v", env!("CARGO_PKG_VERSION")),
         RECT {
             left: s(37),
             top: height - s(37),
@@ -923,7 +923,7 @@ pub(super) unsafe fn draw_button(p: *mut App, item: &DRAWITEMSTRUCT) {
     let focus = item.itemState & ODS_FOCUS != 0;
     let hover = (*p).hover == id;
     let nav = (NAV..NAV + 4).contains(&id);
-    let rail = nav || id == TOP || id == ADMIN;
+    let rail = nav || id == TOP || id == SETTINGS;
     let selected = nav && id - NAV == (*p).page as usize || id == TOP && (*p).topmost;
     let primary = id == PRIMARY;
     let dangerous = primary && (*p).page == Page::Processes;

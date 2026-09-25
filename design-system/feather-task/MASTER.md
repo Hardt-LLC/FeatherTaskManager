@@ -27,6 +27,7 @@ The generator's marketing-page sections and web fonts are not suitable for this 
 - Lazy-load startup/services; performance counters run only on its page. Minimize pauses periodic monitoring. No animation timers.
 - Show loading, empty, failure and stale states. Never display unavailable metrics as successfully measured zero.
 - Start/stop services and enable/disable startup only on explicit user action; retain selected identity during confirmation and asynchronous work.
+- Settings uses an on-demand native popup for administrator launch and Windows Task Manager replacement/restore. Show the current association; disable changes that would overwrite another program. Explain the all-user scope, permanent installation location and restore-before-delete requirement before UAC. No extra background polling or elevation during ordinary startup.
 
 ## Verification
 - Contrast for normal text >=4.5:1; icons/state boundaries >=3:1 when meaningful.

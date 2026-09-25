@@ -6,6 +6,7 @@ compile_error!("Feather Task Manager currently targets 64-bit Windows (x86_64-pc
 
 mod actions;
 mod performance;
+mod replacement;
 mod sampler;
 mod services;
 mod startup;
@@ -13,6 +14,32 @@ mod ui;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(enable) = match args.get(1).map(String::as_str) {
+        Some("--install-task-manager") => Some(true),
+        Some("--restore-task-manager") => Some(false),
+        _ => None,
+    } {
+        // The UI requests these explicit helpers through UAC; ordinary launches
+        // never install files or change the Windows Task Manager association.
+        if let Err(error) = replacement::apply(enable) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR};
+            let message: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();
+            let title: Vec<u16> = "Feather Task Manager"
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            unsafe {
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    message.as_ptr(),
+                    title.as_ptr(),
+                    MB_ICONERROR,
+                );
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--test-child") {
         std::thread::sleep(std::time::Duration::from_secs(30));
         return;
