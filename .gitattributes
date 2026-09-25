@@ -1,0 +1,13 @@
+* text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.svg text eol=lf
+*.cjs text eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
+*.rle binary
+
+# Preserve the upstream Rust license bundle's original whitespace.
+RUST_LIBRARY_NOTICES.html -whitespace

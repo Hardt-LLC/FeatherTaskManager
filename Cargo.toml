@@ -1,0 +1,32 @@
+[package]
+name = "feather-task"
+version = "0.2.1"
+edition = "2021"
+description = "Feather Task Manager - a small, responsive native Windows task manager"
+license = "MIT"
+build = "build.rs"
+
+[[bin]]
+name = "FeatherTaskManager"
+path = "src/main.rs"
+
+[dependencies]
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security",
+  "Win32_System_LibraryLoader", "Win32_System_Threading",
+  "Win32_System_SystemInformation", "Win32_System_ProcessStatus",
+  "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug",
+  "Win32_UI_Controls", "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_Shell",
+  "Win32_System_Services", "Win32_System_Registry", "Win32_System_Performance",
+  "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock", "Win32_Storage_FileSystem",
+  "Win32_System_Com", "Win32_System_Memory"
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

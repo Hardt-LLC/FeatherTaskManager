@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "recordedAtUtc": "2026-09-25T16:10:31.5873933Z",
+  "executable": "C:\\taskmgr\\dist\\FeatherTask.exe",
+  "executableSizeBytes": 634368,
+  "executableSha256": "4985bbf2d224d0f72ffafb041c6d87036e7443444e64d863878a322588934fd4",
+  "operatingSystem": "Microsoft Windows NT 10.0.26200.0",
+  "logicalProcessors": 16,
+  "requestedDurationSeconds": 10,
+  "launchWindowStyle": "Hidden",
+  "initialPage": "performance",
+  "notes": [
+    "Measurements apply only to the process launched by this script; helper/child processes are excluded.",
+    "Startup includes PowerShell Start-Process overhead. Main-window detection is not first paint or full UI readiness.",
+    "Hidden launches may have no MainWindowHandle; the metric is null after a bounded 10-second wait.",
+    "Input-idle detection means a GUI message loop became idle; it does not verify that initial data is loaded.",
+    "CPU percent = process CPU time / measured wall time / logical processors * 100.",
+    "Working set includes shared resident pages. Private bytes are committed private memory, not necessarily resident.",
+    "Sampled maxima use 250 ms sampling and may miss shorter peaks. Repeated runs are not cold-start measurements."
+  ],
+  "runs": [
+    {
+      "iteration": 1,
+      "status": "ok",
+      "processId": 36920,
+      "startupTimeToMainWindowMs": null,
+      "startupTimeToInputIdleMs": 120.81,
+      "startupObservationDurationMs": 10010.03,
+      "mainWindowDetected": false,
+      "sampleDurationSeconds": 10.1005,
+      "sampleCount": 38,
+      "cpuTimeMilliseconds": 188.0,
+      "cpuPercentNormalized": 0.1163,
+      "workingSetBytes": 22577152,
+      "workingSetMiB": 21.531,
+      "privateBytes": 10727424,
+      "privateMiB": 10.23,
+      "sampledMaxWorkingSetBytes": 22585344,
+      "sampledMaxPrivateBytes": 10862592,
+      "privateBytesGrowth": -8192,
+      "handleCountAtStart": 229,
+      "handleCount": 229,
+      "handleCountGrowth": 0,
+      "sampledMaxHandleCount": 229,
+      "threadCount": 7
+    }
+  ]
+}

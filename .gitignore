@@ -1,0 +1,11 @@
+/target/
+/vendor/
+/dist/
+
+# Local environment and editor state
+.env
+.env.*
+!.env.example
+*.log
+.vs/
+.vscode/

@@ -1,0 +1,14 @@
+PASS
+processes=557
+services=337
+startup_entries=17
+first_snapshot_ms=13.139
+sample_median_ms=9.821
+sample_max_ms=12.972
+executable=C:\taskmgr\dist\FeatherTaskManager.exe
+performance_cpu=AMD Ryzen 7 9800X3D 8-Core Processor
+performance_disk_ready=true
+performance_network_ready=true
+performance_gpu=Some(24.54227926686401)
+performance_warnings=[]
+Checks: live snapshots, own identity, memory bounds, finite CPU/I/O, stale PID rejection, System/self protection, disposable child termination, read-only service/startup enumeration, native performance providers.
