@@ -1,14 +1,17 @@
 //! Native virtual tables; collection and management operations stay off the UI thread.
 #![allow(clippy::needless_borrow)]
+use crate::trf as tf;
 use crate::{
+    i18n::{language, set_language, tr, Language},
     performance::{PerfSampler, PerfSnapshot},
+    process_tree::{Identity as ProcessIdentity, Row as TreeRow, TerminationPlan, Tree},
     sampler::{Process, Sampler, Snapshot},
     services::Service,
     startup::StartupEntry,
 };
 use std::{
     cmp::Ordering,
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
     sync::mpsc::{self, Receiver, Sender, SyncSender},
@@ -45,6 +48,10 @@ const REFRESH: usize = 108;
 const ELEVATE: usize = 109;
 const REPLACE_TASK_MANAGER: usize = 110;
 const RESTORE_TASK_MANAGER: usize = 111;
+const VIEW_MODE: usize = 112;
+const END_TREE: usize = 113;
+const LANGUAGE_KOREAN: usize = 114;
+const LANGUAGE_ENGLISH: usize = 115;
 const NAV: usize = 300;
 const APP_ICON: *const u16 = 101usize as *const u16;
 const SIDEBAR: i32 = 196;
@@ -74,18 +81,30 @@ enum Page {
 impl Page {
     fn title(self) -> &'static str {
         match self {
-            Self::Processes => "프로세스",
-            Self::Performance => "성능",
-            Self::Startup => "시작 앱",
-            Self::Services => "서비스",
+            Self::Processes => tr("프로세스", "Processes"),
+            Self::Performance => tr("성능", "Performance"),
+            Self::Startup => tr("시작 앱", "Startup apps"),
+            Self::Services => tr("서비스", "Services"),
         }
     }
     fn subtitle(self) -> &'static str {
         match self {
-            Self::Processes => "리소스 사용량을 한눈에 확인하고, 필요한 작업에 집중하세요.",
-            Self::Performance => "CPU, 메모리, 디스크와 네트워크의 최근 60초를 확인하세요.",
-            Self::Startup => "Windows에 로그인할 때 실행되는 데스크톱 앱을 관리하세요.",
-            Self::Services => "백그라운드 서비스의 상태를 확인하고 실행을 관리하세요.",
+            Self::Processes => tr(
+                "리소스 사용량을 한눈에 확인하고, 필요한 작업에 집중하세요.",
+                "See resource usage at a glance and manage running tasks.",
+            ),
+            Self::Performance => tr(
+                "CPU, 메모리, 디스크와 네트워크의 최근 60초를 확인하세요.",
+                "Explore the last 60 seconds of CPU, memory, disk and network activity.",
+            ),
+            Self::Startup => tr(
+                "Windows에 로그인할 때 실행되는 데스크톱 앱을 관리하세요.",
+                "Manage desktop apps that run when you sign in to Windows.",
+            ),
+            Self::Services => tr(
+                "백그라운드 서비스의 상태를 확인하고 실행을 관리하세요.",
+                "Check background services and manage their running state.",
+            ),
         }
     }
     fn from_index(i: usize) -> Self {
@@ -120,6 +139,7 @@ struct MonitorSample {
 }
 enum Action {
     End(u32, u64),
+    EndTree(TerminationPlan),
     Reveal(u32, u64),
     Toggle(Box<StartupEntry>, bool),
     Start(String),
@@ -139,7 +159,7 @@ enum JobResult {
     Action {
         result: Result<(), String>,
         page: Page,
-        notice: &'static str,
+        notice: String,
     },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +182,8 @@ struct App {
     primary: HWND,
     secondary: HWND,
     refresh: HWND,
+    view_mode: HWND,
+    end_tree: HWND,
     nav: [HWND; 4],
     font: HFONT,
     small: HFONT,
@@ -182,6 +204,9 @@ struct App {
     startup: Vec<StartupEntry>,
     services: Vec<Service>,
     rows: Vec<usize>,
+    tree_mode: bool,
+    tree_rows: Vec<TreeRow>,
+    collapsed: HashSet<ProcessIdentity>,
     filter: String,
     sort: usize,
     descending: bool,
@@ -194,6 +219,7 @@ struct App {
     interval: u64,
     hover: usize,
     startup_loading: bool,
+    startup_refresh_pending: bool,
     services_loading: bool,
     startup_loaded: bool,
     services_loaded: bool,
@@ -226,6 +252,8 @@ impl App {
             primary: null_mut(),
             secondary: null_mut(),
             refresh: null_mut(),
+            view_mode: null_mut(),
+            end_tree: null_mut(),
             nav: [null_mut(); 4],
             font: null_mut(),
             small: null_mut(),
@@ -246,6 +274,9 @@ impl App {
             startup: Vec::new(),
             services: Vec::new(),
             rows: Vec::new(),
+            tree_mode: false,
+            tree_rows: Vec::new(),
+            collapsed: HashSet::new(),
             filter: String::new(),
             sort: 3,
             descending: true,
@@ -258,6 +289,7 @@ impl App {
             interval: 1000,
             hover: 0,
             startup_loading: false,
+            startup_refresh_pending: false,
             services_loading: false,
             startup_loaded: false,
             services_loaded: false,
@@ -346,7 +378,11 @@ pub fn run() {
         if hwnd.is_null() {
             MessageBoxW(
                 null_mut(),
-                wide("창을 만들지 못했습니다.").as_ptr(),
+                wide(tr(
+                    "창을 만들지 못했습니다.",
+                    "Unable to create the window.",
+                ))
+                .as_ptr(),
                 wide("Feather Task Manager").as_ptr(),
                 MB_ICONERROR,
             );
@@ -360,7 +396,10 @@ pub fn run() {
         {
             (*p).set_error(
                 ErrorSource::General,
-                format!("모니터링 작업을 시작할 수 없습니다: {e}"),
+                tf!(
+                    "모니터링 작업을 시작할 수 없습니다: {e}",
+                    "Unable to start monitoring: {e}"
+                ),
             );
         }
         if let Err(e) = std::thread::Builder::new()
@@ -369,7 +408,10 @@ pub fn run() {
         {
             (*p).set_error(
                 ErrorSource::General,
-                format!("관리 작업을 시작할 수 없습니다: {e}"),
+                tf!(
+                    "관리 작업을 시작할 수 없습니다: {e}",
+                    "Unable to start management tasks: {e}"
+                ),
             );
         }
         let args: Vec<String> = std::env::args().collect();
@@ -494,51 +536,91 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
             Job::Startup => JobResult::Startup(crate::startup::list()),
             Job::Services => JobResult::Services(crate::services::list()),
             Job::Action(action) => {
+                if let Action::EndTree(plan) = action {
+                    let result = crate::actions::terminate_tree(&plan);
+                    let (result, notice) = match result {
+                        Ok(notice) => (Ok(()), notice),
+                        Err(error) => (Err(error), String::new()),
+                    };
+                    if complete
+                        .send(JobResult::Action {
+                            result,
+                            page: Page::Processes,
+                            notice,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    unsafe {
+                        PostMessageW(hwnd as HWND, JOB_READY, 0, 0);
+                    }
+                    continue;
+                }
                 let (result, page, notice) = match action {
+                    Action::EndTree(_) => unreachable!(),
                     Action::End(pid, created) => (
                         crate::actions::terminate(pid, created),
                         Page::Processes,
-                        "종료 요청을 보냈습니다.",
+                        tr(
+                            "종료 요청을 보냈습니다.",
+                            "The process termination request was sent.",
+                        ),
                     ),
                     Action::Reveal(pid, created) => (
                         crate::actions::reveal_executable(pid, created),
                         Page::Processes,
-                        "파일 위치를 열었습니다.",
+                        tr("파일 위치를 열었습니다.", "Opened the file location."),
                     ),
                     Action::Toggle(entry, enabled) => (
                         crate::startup::set_enabled(&entry, enabled),
                         Page::Startup,
-                        "시작 앱 설정을 변경했습니다.",
+                        tr(
+                            "시작 앱 설정을 변경했습니다.",
+                            "Updated the startup app setting.",
+                        ),
                     ),
                     Action::Start(name) => (
                         crate::services::start(&name),
                         Page::Services,
-                        "서비스 시작 요청을 보냈습니다.",
+                        tr(
+                            "서비스 시작 요청을 보냈습니다.",
+                            "The service start request was sent.",
+                        ),
                     ),
                     Action::Stop(name) => (
                         crate::services::stop(&name),
                         Page::Services,
-                        "서비스 중지 요청을 보냈습니다.",
+                        tr(
+                            "서비스 중지 요청을 보냈습니다.",
+                            "The service stop request was sent.",
+                        ),
                     ),
                     Action::Elevate => (
                         crate::actions::relaunch_elevated(),
                         Page::Processes,
-                        "관리자 권한 창을 열었습니다.",
+                        tr(
+                            "관리자 권한 창을 열었습니다.",
+                            "Opened an administrator window.",
+                        ),
                     ),
                     Action::ReplaceTaskManager(enable, page) => (
                         crate::replacement::run_elevated(enable),
                         page,
                         if enable {
-                            "Feather를 Windows 작업 관리자로 설정했습니다. 다음 실행부터 적용됩니다."
+                            tr("Feather를 Windows 작업 관리자로 설정했습니다. 다음 실행부터 적용됩니다.", "Feather is now the Windows Task Manager. The change applies next time you open it.")
                         } else {
-                            "Windows 기본 작업 관리자로 복원했습니다."
+                            tr(
+                                "Windows 기본 작업 관리자로 복원했습니다.",
+                                "Restored the default Windows Task Manager.",
+                            )
                         },
                     ),
                 };
                 JobResult::Action {
                     result,
                     page,
-                    notice,
+                    notice: notice.into(),
                 }
             }
         };
@@ -594,7 +676,18 @@ unsafe fn keyboard(p: *mut App, msg: &MSG) -> bool {
         SetWindowTextW((*p).search, wide("").as_ptr());
         return true;
     } else if key == VK_DELETE && msg.hwnd == (*p).list && (*p).page == Page::Processes {
-        PRIMARY
+        if GetKeyState(VK_SHIFT as i32) < 0 {
+            END_TREE
+        } else {
+            PRIMARY
+        }
+    } else if matches!(key, VK_LEFT | VK_RIGHT)
+        && msg.hwnd == (*p).list
+        && (*p).tree_mode
+        && (*p).page == Page::Processes
+    {
+        toggle_selected_branch(p, Some(key == VK_RIGHT));
+        return true;
     } else if key == VK_SPACE && msg.hwnd == (*p).list {
         PAUSE
     } else if ctrl && key == b'L' as u16 && (*p).page == Page::Processes {
@@ -806,27 +899,41 @@ unsafe fn create_controls(p: *mut App) {
         (*p).nav[i] = button(p, Page::from_index(i).title(), NAV + i);
     }
     (*p).search = create_control(p, "Edit", "", WS_TABSTOP | ES_AUTOHSCROLL as u32, SEARCH);
-    (*p).pause = button(p, "일시정지", PAUSE);
+    (*p).pause = button(p, tr("일시정지", "Pause"), PAUSE);
     (*p).rate = create_control(
         p,
         "ComboBox",
-        "갱신 간격",
+        tr("갱신 간격", "Refresh interval"),
         WS_TABSTOP | CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
         RATE,
     );
-    for label in ["0.5초", "1초", "2초", "5초"] {
+    for label in [
+        tr("0.5초", "0.5 s"),
+        tr("1초", "1 s"),
+        tr("2초", "2 s"),
+        tr("5초", "5 s"),
+    ] {
         SendMessageW((*p).rate, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
     }
     SendMessageW((*p).rate, CB_SETCURSEL, 1, 0);
-    (*p).top = button(p, "항상 위에 표시", TOP);
-    (*p).settings = button(p, "설정", SETTINGS);
-    (*p).primary = button(p, "작업 끝내기", PRIMARY);
-    (*p).secondary = button(p, "파일 위치 열기", SECONDARY);
-    (*p).refresh = button(p, "새로고침", REFRESH);
+    (*p).top = button(p, tr("항상 위에 표시", "Always on top"), TOP);
+    (*p).settings = button(p, tr("설정", "Settings"), SETTINGS);
+    (*p).primary = button(p, tr("작업 끝내기", "End task"), PRIMARY);
+    (*p).secondary = button(p, tr("파일 위치 열기", "Open file location"), SECONDARY);
+    (*p).refresh = button(p, tr("새로고침", "Refresh"), REFRESH);
+    (*p).view_mode = create_control(
+        p,
+        "ComboBox",
+        tr("프로세스 표시 방식", "Process view"),
+        WS_TABSTOP | CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
+        VIEW_MODE,
+    );
+    (*p).end_tree = button(p, tr("트리 전체 종료", "End process tree"), END_TREE);
+    populate_view_modes(p);
     (*p).list = create_control(
         p,
         "SysListView32",
-        "프로세스 목록",
+        tr("프로세스 목록", "Process list"),
         WS_TABSTOP
             | LVS_REPORT
             | LVS_OWNERDATA
@@ -872,11 +979,12 @@ unsafe fn create_fonts(p: *mut App) {
             wide(family).as_ptr(),
         )
     };
-    (*p).font = make(14, 400, "Malgun Gothic");
-    (*p).small = make(12, 400, "Malgun Gothic");
-    (*p).heading = make(28, 700, "Malgun Gothic");
+    let family = tr("Malgun Gothic", "Segoe UI");
+    (*p).font = make(14, 400, family);
+    (*p).small = make(12, 400, family);
+    (*p).heading = make(28, 700, family);
     (*p).metric = make(28, 600, "Segoe UI");
-    (*p).bold = make(14, 700, "Malgun Gothic");
+    (*p).bold = make(14, 700, family);
     for h in [
         (*p).list,
         (*p).search,
@@ -887,6 +995,8 @@ unsafe fn create_fonts(p: *mut App) {
         (*p).primary,
         (*p).secondary,
         (*p).refresh,
+        (*p).view_mode,
+        (*p).end_tree,
     ]
     .into_iter()
     .chain((*p).nav)
@@ -905,32 +1015,32 @@ unsafe fn create_fonts(p: *mut App) {
         }
     }
 }
-fn columns(page: Page) -> &'static [(&'static str, i32, bool)] {
+fn columns(page: Page) -> Vec<(&'static str, i32, bool)> {
     match page {
-        Page::Processes => &[
-            ("프로세스", 250, false),
+        Page::Processes => vec![
+            (tr("프로세스", "Processes"), 250, false),
             ("PID", 76, true),
             ("CPU", 80, true),
-            ("메모리", 112, true),
-            ("전용 메모리", 120, true),
-            ("I/O / 초", 110, true),
-            ("스레드", 70, true),
-            ("핸들", 70, true),
+            (tr("메모리", "Memory"), 112, true),
+            (tr("전용 메모리", "Private memory"), 120, true),
+            (tr("I/O / 초", "I/O / sec"), 110, true),
+            (tr("스레드", "Threads"), 70, true),
+            (tr("핸들", "Handles"), 70, true),
         ],
-        Page::Startup => &[
-            ("앱 이름", 230, false),
-            ("상태", 180, false),
-            ("위치", 200, false),
-            ("실행 명령", 420, false),
+        Page::Startup => vec![
+            (tr("앱 이름", "App name"), 230, false),
+            (tr("상태", "Status"), 180, false),
+            (tr("위치", "Location"), 200, false),
+            (tr("실행 명령", "Command"), 420, false),
         ],
-        Page::Services => &[
-            ("서비스 이름", 220, false),
-            ("표시 이름", 330, false),
-            ("상태", 120, false),
+        Page::Services => vec![
+            (tr("서비스 이름", "Service name"), 220, false),
+            (tr("표시 이름", "Display name"), 330, false),
+            (tr("상태", "Status"), 120, false),
             ("PID", 80, true),
-            ("시작 유형", 120, false),
+            (tr("시작 유형", "Startup type"), 120, false),
         ],
-        Page::Performance => &[],
+        Page::Performance => vec![],
     }
 }
 unsafe fn setup_columns(p: *mut App) {
@@ -940,7 +1050,14 @@ unsafe fn setup_columns(p: *mut App) {
         let column = LVCOLUMNW {
             mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM,
             fmt: if numeric { LVCFMT_RIGHT } else { LVCFMT_LEFT },
-            cx: scale(p, width),
+            cx: scale(
+                p,
+                if i == 0 && (*p).page == Page::Processes && (*p).tree_mode {
+                    320
+                } else {
+                    width
+                },
+            ),
             pszText: text.as_mut_ptr(),
             iSubItem: i as i32,
             ..zeroed()
@@ -953,20 +1070,28 @@ unsafe fn setup_columns(p: *mut App) {
         );
     }
     let cue = match (*p).page {
-        Page::Processes => "이름 또는 PID 검색 · Ctrl+F",
-        Page::Startup => "앱 이름 또는 실행 명령 검색",
-        Page::Services => "서비스 이름, 표시 이름 또는 PID 검색",
+        Page::Processes => tr("이름 또는 PID 검색 · Ctrl+F", "Search name or PID · Ctrl+F"),
+        Page::Startup => tr("앱 이름 또는 실행 명령 검색", "Search app name or command"),
+        Page::Services => tr(
+            "서비스 이름, 표시 이름 또는 PID 검색",
+            "Search service name or PID",
+        ),
         Page::Performance => "",
     };
     SendMessageW((*p).search, EM_SETCUEBANNER, 1, wide(cue).as_ptr() as isize);
     SetWindowTextW(
         (*p).list,
-        wide(&format!("{} 목록", (*p).page.title())).as_ptr(),
+        wide(&tf!("{} 목록", "{} list", (*p).page.title())).as_ptr(),
     );
     update_sort_header(p);
 }
 unsafe fn resize_columns(p: *mut App) {
     for (i, &(_, width, _)) in columns((*p).page).iter().enumerate() {
+        let width = if i == 0 && (*p).page == Page::Processes && (*p).tree_mode {
+            320
+        } else {
+            width
+        };
         SendMessageW((*p).list, LVM_SETCOLUMNWIDTH, i, scale(p, width) as isize);
     }
 }
@@ -982,6 +1107,7 @@ unsafe fn layout(p: *mut App) {
     }
     mv((*p).top, s(12), r.bottom - s(134), s(172), s(36));
     mv((*p).settings, s(12), r.bottom - s(90), s(172), s(36));
+    mv((*p).view_mode, r.right - s(356), s(36), s(164), s(180));
     let x = s(220);
     mv((*p).search, x + s(42), s(215), r.right - x - s(356), s(26));
     mv((*p).rate, r.right - s(280), s(213), s(68), s(220));
@@ -997,11 +1123,28 @@ unsafe fn layout(p: *mut App) {
     );
     mv(
         (*p).secondary,
-        r.right - s(292),
+        r.right - s(304),
         r.bottom - s(75),
-        s(136),
+        s(148),
         s(36),
     );
+    mv(
+        (*p).end_tree,
+        r.right - s(464),
+        r.bottom - s(75),
+        s(148),
+        s(36),
+    );
+    for h in [(*p).view_mode, (*p).end_tree] {
+        ShowWindow(
+            h,
+            if (*p).page == Page::Processes {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+    }
     let table = (*p).page != Page::Performance;
     for h in [(*p).list, (*p).search, (*p).primary] {
         ShowWindow(h, if table { SW_SHOW } else { SW_HIDE });
@@ -1042,7 +1185,11 @@ unsafe fn request_list(p: *mut App, page: Page) {
             (*p).services_loading = false;
             (*p).set_error(
                 ErrorSource::General,
-                "백그라운드 작업을 실행할 수 없습니다.".into(),
+                tr(
+                    "백그라운드 작업을 실행할 수 없습니다.",
+                    "Unable to run the background job.",
+                )
+                .into(),
             );
         }
         update_buttons(p);
@@ -1103,14 +1250,18 @@ unsafe fn command(p: *mut App, id: usize, notification: u32) {
             configure(p);
             redraw(p);
         }
+        VIEW_MODE if notification == CBN_SELCHANGE => {
+            let tree_mode = SendMessageW((*p).view_mode, CB_GETCURSEL, 0, 0) == 1;
+            set_tree_mode(p, tree_mode);
+        }
         PAUSE => {
             (*p).paused = !(*p).paused;
             SetWindowTextW(
                 (*p).pause,
                 wide(if (*p).paused {
-                    "계속"
+                    tr("계속", "Resume")
                 } else {
-                    "일시정지"
+                    tr("일시정지", "Pause")
                 })
                 .as_ptr(),
             );
@@ -1142,6 +1293,7 @@ unsafe fn command(p: *mut App, id: usize, notification: u32) {
             redraw(p);
         }
         PRIMARY if IsWindowEnabled((*p).primary) != 0 => primary_action(p),
+        END_TREE if IsWindowEnabled((*p).end_tree) != 0 => end_tree_action(p),
         SECONDARY if IsWindowEnabled((*p).secondary) != 0 => secondary_action(p),
         SETTINGS if !(*p).busy && !(*p).modal => settings_menu(p),
         _ => {}
@@ -1154,22 +1306,56 @@ unsafe fn create_settings_menu(status: &Result<crate::replacement::Status, Strin
         return menu;
     }
     let (label, can_replace, can_restore) = match status {
-        Ok(Status::Inactive) => ("작업 관리자 · Windows 기본값", true, false),
-        Ok(Status::Active) => ("작업 관리자 · Feather 사용 중", false, true),
-        Ok(Status::Other(_)) => ("작업 관리자 · 다른 설정 사용 중", false, false),
-        Err(_) => ("작업 관리자 · 상태 확인 실패", false, false),
+        Ok(Status::Inactive) => (
+            tr(
+                "작업 관리자 · Windows 기본값",
+                "Task Manager · Windows default",
+            ),
+            true,
+            false,
+        ),
+        Ok(Status::Active) => (
+            tr(
+                "작업 관리자 · Feather 사용 중",
+                "Task Manager · Feather active",
+            ),
+            false,
+            true,
+        ),
+        Ok(Status::Other(_)) => (
+            tr(
+                "작업 관리자 · 다른 설정 사용 중",
+                "Task Manager · Another app active",
+            ),
+            false,
+            false,
+        ),
+        Err(_) => (
+            tr(
+                "작업 관리자 · 상태 확인 실패",
+                "Task Manager · Status unavailable",
+            ),
+            false,
+            false,
+        ),
     };
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(label).as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     for (id, text, enabled) in [
         (
             REPLACE_TASK_MANAGER,
-            "Feather를 작업 관리자로 설정…",
+            tr(
+                "Feather를 작업 관리자로 설정…",
+                "Use Feather as Task Manager…",
+            ),
             can_replace,
         ),
         (
             RESTORE_TASK_MANAGER,
-            "Windows 기본 작업 관리자로 복원…",
+            tr(
+                "Windows 기본 작업 관리자로 복원…",
+                "Restore Windows Task Manager…",
+            ),
             can_restore,
         ),
     ] {
@@ -1181,7 +1367,24 @@ unsafe fn create_settings_menu(status: &Result<crate::replacement::Status, Strin
         );
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(menu, MF_STRING, ELEVATE, wide("관리자로 실행").as_ptr());
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ELEVATE,
+        wide(tr("관리자로 실행", "Run as administrator")).as_ptr(),
+    );
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    for (id, name, selected) in [
+        (LANGUAGE_KOREAN, "한국어", language() == Language::Korean),
+        (LANGUAGE_ENGLISH, "English", language() == Language::English),
+    ] {
+        AppendMenuW(
+            menu,
+            MF_STRING | if selected { MF_CHECKED } else { MF_UNCHECKED },
+            id,
+            wide(name).as_ptr(),
+        );
+    }
     menu
 }
 unsafe fn settings_menu(p: *mut App) {
@@ -1191,14 +1394,24 @@ unsafe fn settings_menu(p: *mut App) {
         Ok(crate::replacement::Status::Other(value)) => {
             (*p).set_error(
                 ErrorSource::Action,
-                format!("기존 작업 관리자 연결을 먼저 해제하세요. 현재 설정: {value}"),
+                tf!(
+                    "기존 작업 관리자 연결을 먼저 해제하세요. 현재 설정: {value}",
+                    "Remove the existing Task Manager replacement first. Current setting: {value}"
+                ),
             );
         }
         _ => {}
     }
     let menu = create_settings_menu(&status);
     if menu.is_null() {
-        (*p).set_error(ErrorSource::Action, "설정 메뉴를 열지 못했습니다.".into());
+        (*p).set_error(
+            ErrorSource::Action,
+            tr(
+                "설정 메뉴를 열지 못했습니다.",
+                "Unable to open the settings menu.",
+            )
+            .into(),
+        );
         redraw(p);
         return;
     }
@@ -1223,27 +1436,226 @@ unsafe fn settings_menu(p: *mut App) {
     update_buttons(p);
     redraw(p);
     match command {
+        LANGUAGE_KOREAN | LANGUAGE_ENGLISH => {
+            let chosen = if command == LANGUAGE_KOREAN {
+                Language::Korean
+            } else {
+                Language::English
+            };
+            match set_language(chosen) {
+                Ok(()) => refresh_language(p),
+                Err(error) => (*p).set_error(ErrorSource::Action, error),
+            }
+            redraw(p);
+        }
         ELEVATE => begin_action(p, Action::Elevate),
         REPLACE_TASK_MANAGER | RESTORE_TASK_MANAGER => {
             let enable = command == REPLACE_TASK_MANAGER;
             let (title, prompt) = if enable {
-                ("Windows 작업 관리자 대체", concat!(
+                (tr("Windows 작업 관리자 대체", "Replace Windows Task Manager"), tr(concat!(
                     "Feather를 Windows 작업 관리자로 설정할까요?\n\n",
                     "Program Files의 Feather Task Manager 폴더에 앱을 설치하고, 이 PC의 모든 사용자에게 적용합니다. ",
                     "Ctrl+Alt+Delete → 작업 관리자와 Ctrl+Shift+Esc로 Feather가 열립니다.\n\n",
                     "관리자 권한이 필요합니다. 설치된 파일을 삭제하기 전에 설정에서 Windows 기본 작업 관리자로 복원하세요."
-                ))
+                ), "Use Feather as the Windows Task Manager?\n\nThe app will be installed in Program Files\\Feather Task Manager and will apply to all users on this PC. Ctrl+Alt+Delete → Task Manager and Ctrl+Shift+Esc will open Feather.\n\nAdministrator permission is required. Restore the default Windows Task Manager in Settings before deleting the installed files."))
             } else {
-                ("Windows 작업 관리자 복원", concat!(
+                (tr("Windows 작업 관리자 복원", "Restore Windows Task Manager"), tr(concat!(
                     "Windows 기본 작업 관리자로 되돌릴까요?\n\n",
                     "관리자 권한이 필요하며 이 PC의 모든 사용자에게 적용합니다. Feather 앱은 설치된 폴더에 그대로 남습니다."
-                ))
+                ), "Restore the default Windows Task Manager?\n\nAdministrator permission is required and this applies to all users on this PC. Feather will remain in its installation folder."))
             };
             if confirm(p, title, prompt) {
                 begin_action(p, Action::ReplaceTaskManager(enable, (*p).page));
             }
         }
         _ => {}
+    }
+}
+unsafe fn populate_view_modes(p: *mut App) {
+    SendMessageW((*p).view_mode, CB_RESETCONTENT, 0, 0);
+    for value in [
+        tr("목록 보기", "List view"),
+        tr("프로세스 트리", "Process tree"),
+    ] {
+        SendMessageW(
+            (*p).view_mode,
+            CB_ADDSTRING,
+            0,
+            wide(value).as_ptr() as isize,
+        );
+    }
+    SendMessageW((*p).view_mode, CB_SETCURSEL, (*p).tree_mode as usize, 0);
+}
+unsafe fn refresh_language(p: *mut App) {
+    let identity = selected_identity(p);
+    // Startup rows contain localized status/location strings. An already
+    // queued result can contain the previous language, or a mixture if the
+    // language changed during collection. Discard it and collect once more.
+    (*p).startup_loaded = false;
+    (*p).startup_refresh_pending = (*p).startup_loading;
+    (*p).updating = true;
+    for (i, handle) in (*p).nav.iter().enumerate() {
+        SetWindowTextW(*handle, wide(Page::from_index(i).title()).as_ptr());
+    }
+    for (handle, value) in [
+        (
+            (*p).pause,
+            if (*p).paused {
+                tr("계속", "Resume")
+            } else {
+                tr("일시정지", "Pause")
+            },
+        ),
+        ((*p).top, tr("항상 위에 표시", "Always on top")),
+        ((*p).settings, tr("설정", "Settings")),
+        ((*p).refresh, tr("새로고침", "Refresh")),
+        ((*p).end_tree, tr("트리 전체 종료", "End process tree")),
+        ((*p).view_mode, tr("프로세스 표시 방식", "Process view")),
+    ] {
+        SetWindowTextW(handle, wide(value).as_ptr());
+    }
+    SendMessageW((*p).rate, CB_RESETCONTENT, 0, 0);
+    for value in [
+        tr("0.5초", "0.5 s"),
+        tr("1초", "1 s"),
+        tr("2초", "2 s"),
+        tr("5초", "5 s"),
+    ] {
+        SendMessageW((*p).rate, CB_ADDSTRING, 0, wide(value).as_ptr() as isize);
+    }
+    let interval = [500, 1000, 2000, 5000]
+        .iter()
+        .position(|&i| i == (*p).interval)
+        .unwrap_or(1);
+    SendMessageW((*p).rate, CB_SETCURSEL, interval, 0);
+    populate_view_modes(p);
+    (*p).notice.clear();
+    create_fonts(p);
+    setup_columns(p);
+    rebuild(p, identity);
+    layout(p);
+    update_buttons(p);
+    if (*p).page == Page::Startup {
+        request_list(p, Page::Startup);
+    }
+    if (*p).page == Page::Services {
+        request_list(p, Page::Services);
+    }
+    InvalidateRect((*p).hwnd, null(), 1);
+}
+unsafe fn set_tree_mode(p: *mut App, enabled: bool) {
+    let identity = selected_identity(p);
+    (*p).tree_mode = enabled;
+    SendMessageW((*p).view_mode, CB_SETCURSEL, enabled as usize, 0);
+    SendMessageW(
+        (*p).list,
+        LVM_SETCOLUMNWIDTH,
+        0,
+        scale(p, if enabled { 320 } else { 250 }) as isize,
+    );
+    rebuild(p, identity);
+    redraw(p);
+}
+unsafe fn toggle_selected_branch(p: *mut App, expand: Option<bool>) {
+    if (*p).page != Page::Processes || !(*p).tree_mode || !(&(*p).filter).is_empty() {
+        return;
+    }
+    let selected = SendMessageW(
+        (*p).list,
+        LVM_GETNEXTITEM,
+        usize::MAX,
+        LVNI_SELECTED as isize,
+    );
+    if selected < 0 {
+        return;
+    }
+    let Some(row) = (&(*p).tree_rows).get(selected as usize).copied() else {
+        return;
+    };
+    // Arrow keys follow the native tree convention: move to a parent or first
+    // child when the requested branch is already collapsed or expanded.
+    if let Some(expand) = expand {
+        let destination = if expand && row.expanded {
+            (&(*p).tree_rows)
+                .get(selected as usize + 1)
+                .filter(|child| child.depth > row.depth)
+                .map(|_| selected as usize + 1)
+        } else if !expand && (!row.has_children || !row.expanded) {
+            (0..selected as usize)
+                .rev()
+                .find(|&index| (&(*p).tree_rows)[index].depth < row.depth)
+        } else {
+            None
+        };
+        if let Some(destination) = destination {
+            let clear = LVITEMW {
+                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                ..zeroed()
+            };
+            SendMessageW(
+                (*p).list,
+                LVM_SETITEMSTATE,
+                usize::MAX,
+                &clear as *const _ as isize,
+            );
+            let selected = LVITEMW {
+                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                state: LVIS_SELECTED | LVIS_FOCUSED,
+                ..zeroed()
+            };
+            SendMessageW(
+                (*p).list,
+                LVM_SETITEMSTATE,
+                destination,
+                &selected as *const _ as isize,
+            );
+            SendMessageW((*p).list, LVM_ENSUREVISIBLE, destination, 0);
+            return;
+        }
+    }
+    if !row.has_children {
+        return;
+    }
+    let Some(process) = (*p)
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.processes.get(row.index))
+    else {
+        return;
+    };
+    let id = ProcessIdentity::from(process);
+    let expand = expand.unwrap_or(!row.expanded);
+    if expand {
+        (*p).collapsed.remove(&id);
+    } else {
+        (*p).collapsed.insert(id);
+    }
+    rebuild(p, Some(Identity::Process(id.pid, id.created)));
+    redraw(p);
+}
+unsafe fn captured_tree_plan(p: *mut App) -> Result<TerminationPlan, String> {
+    let index = selected_row(p)
+        .ok_or_else(|| tr("프로세스를 선택하세요.", "Select a process.").to_owned())?;
+    let snapshot = (*p).snapshot.as_ref().ok_or_else(|| {
+        tr("프로세스 정보가 없습니다.", "Process data is unavailable.").to_owned()
+    })?;
+    Tree::new(&snapshot.processes).plan(index)
+}
+unsafe fn end_tree_action(p: *mut App) {
+    let plan = match captured_tree_plan(p) {
+        Ok(plan) => plan,
+        Err(error) => {
+            (*p).set_error(ErrorSource::Action, error);
+            redraw(p);
+            return;
+        }
+    };
+    let prompt = tf!(
+        "{} (PID {}) 및 하위 프로세스, 총 {}개를 종료할까요?\n\n현재 목록에서 확인된 트리 전체가 대상이며 숨겨진 하위 항목도 포함됩니다. 이 확인창을 연 뒤 새로 생성된 프로세스는 포함하지 않습니다.\n\n저장하지 않은 작업이 사라질 수 있습니다.",
+        "End {} (PID {}) and its descendants, {} processes in total?\n\nThis includes the entire captured tree, including hidden children. Processes created after this confirmation opened are not included.\n\nUnsaved work may be lost.",
+        plan.root_name, plan.root.pid, plan.len());
+    if confirm(p, tr("트리 전체 종료", "End process tree"), &prompt) {
+        begin_action(p, Action::EndTree(plan));
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1305,7 +1717,7 @@ unsafe fn total_rows(p: *mut App) -> usize {
 }
 unsafe fn selected_detail(p: *mut App) -> String {
     if (*p).busy {
-        return "요청을 처리하는 중…".into();
+        return tr("요청을 처리하는 중…", "Processing your request…").into();
     }
     if let Some(e) = &(*p).error {
         return e.clone();
@@ -1315,14 +1727,34 @@ unsafe fn selected_detail(p: *mut App) -> String {
     }
     let Some(row) = selected_row(p) else {
         return match (*p).page {
-            Page::Startup => "로그인 시작 앱 · 일부 앱은 Windows 설정에서 관리합니다.".into(),
-            Page::Services => "서비스를 선택하면 시작 또는 중지할 수 있습니다.".into(),
-            _ => "작업을 선택하면 파일 위치를 열거나 종료할 수 있습니다.".into(),
+            Page::Startup => tr(
+                "로그인 시작 앱 · 일부 앱은 Windows 설정에서 관리합니다.",
+                "Startup apps · Some apps are managed in Windows Settings.",
+            )
+            .into(),
+            Page::Services => tr(
+                "서비스를 선택하면 시작 또는 중지할 수 있습니다.",
+                "Select a service to start or stop it.",
+            )
+            .into(),
+            _ => tr(
+                "작업을 선택하면 파일 위치를 열거나 종료할 수 있습니다.",
+                "Select a process to end it or open its file location.",
+            )
+            .into(),
         };
     };
     match (*p).page {
         Page::Processes => selected_process(p)
-            .map(|s| format!("{}  ·  PID {}  ·  부모 PID {}", s.name, s.pid, s.parent_pid))
+            .map(|s| {
+                tf!(
+                    "{}  ·  PID {}  ·  부모 PID {}",
+                    "{}  ·  PID {}  ·  Parent PID {}",
+                    s.name,
+                    s.pid,
+                    s.parent_pid
+                )
+            })
             .unwrap_or_default(),
         Page::Startup => (&(*p).startup)
             .get(row)
@@ -1345,8 +1777,8 @@ unsafe fn update_buttons(p: *mut App) {
     let ready = !(*p).busy && !(*p).modal;
     let mut primary = false;
     let mut secondary = false;
-    let mut label = "작업 끝내기";
-    let mut second = "파일 위치 열기";
+    let mut label = tr("작업 끝내기", "End task");
+    let mut second = tr("파일 위치 열기", "Open file location");
     match (*p).page {
         Page::Processes => {
             if let Some(s) = selected_process(p) {
@@ -1355,17 +1787,17 @@ unsafe fn update_buttons(p: *mut App) {
             }
         }
         Page::Startup => {
-            label = "사용 안 함";
+            label = tr("사용 안 함", "Disable");
             if let Some(s) = selected_row(p).and_then(|r| (&(*p).startup).get(r)) {
                 primary = s.manageable && !(*p).startup_loading;
                 if !s.enabled {
-                    label = "사용";
+                    label = tr("사용", "Enable");
                 }
             }
         }
         Page::Services => {
-            label = "시작";
-            second = "중지";
+            label = tr("시작", "Start");
+            second = tr("중지", "Stop");
             if let Some(s) = selected_row(p).and_then(|r| (&(*p).services).get(r)) {
                 primary =
                     s.state == SERVICE_STOPPED && s.start_type != Some(4) && !(*p).services_loading;
@@ -1377,6 +1809,9 @@ unsafe fn update_buttons(p: *mut App) {
     SetWindowTextW((*p).primary, wide(label).as_ptr());
     SetWindowTextW((*p).secondary, wide(second).as_ptr());
     EnableWindow((*p).primary, (ready && primary) as i32);
+    let tree_allowed = (*p).page == Page::Processes && primary && captured_tree_plan(p).is_ok();
+    EnableWindow((*p).end_tree, (ready && tree_allowed) as i32);
+    EnableWindow((*p).view_mode, (!(*p).modal) as i32);
     EnableWindow((*p).secondary, (ready && secondary) as i32);
     EnableWindow((*p).settings, ready as i32);
     let loading = ((*p).page == Page::Startup && (*p).startup_loading)
@@ -1404,7 +1839,7 @@ unsafe fn primary_action(p: *mut App) {
     match (*p).page {
         Page::Processes => {
             if let Some(s) = selected_process(p) {
-                if confirm(p,"작업 끝내기",&format!("{} (PID {}) 프로세스를 종료할까요?\n\n저장하지 않은 작업은 사라질 수 있습니다.",s.name,s.pid)){begin_action(p,Action::End(s.pid,s.created));}
+                if confirm(p,tr("작업 끝내기", "End task"),&tf!("{} (PID {}) 프로세스를 종료할까요?\n\n저장하지 않은 작업은 사라질 수 있습니다.", "End {} (PID {})?\n\nUnsaved work may be lost.",s.name,s.pid)){begin_action(p,Action::End(s.pid,s.created));}
             }
         }
         Page::Startup => {
@@ -1439,7 +1874,7 @@ unsafe fn secondary_action(p: *mut App) {
                 .and_then(|r| (&(*p).services).get(r))
                 .cloned()
             {
-                if confirm(p,"서비스 중지",&format!("{} 서비스를 중지할까요?\n\n이 서비스를 사용하는 Windows 기능이나 앱에 영향을 줄 수 있습니다.\n서비스 이름: {}",s.display_name,s.name)){begin_action(p,Action::Stop(s.name));}
+                if confirm(p,tr("서비스 중지", "Stop service"),&tf!("{} 서비스를 중지할까요?\n\n이 서비스를 사용하는 Windows 기능이나 앱에 영향을 줄 수 있습니다.\n서비스 이름: {}", "Stop {}?\n\nThis may affect Windows features or apps using this service.\nService name: {}",s.display_name,s.name)){begin_action(p,Action::Stop(s.name));}
             }
         }
         _ => {}
@@ -1456,7 +1891,11 @@ unsafe fn begin_action(p: *mut App, action: Action) {
         (*p).busy = false;
         (*p).set_error(
             ErrorSource::Action,
-            "관리 작업을 실행할 수 없습니다.".into(),
+            tr(
+                "관리 작업을 실행할 수 없습니다.",
+                "Unable to run the management action.",
+            )
+            .into(),
         );
     }
     update_buttons(p);
@@ -1554,6 +1993,13 @@ unsafe fn drain_jobs(p: *mut App) {
         match result {
             JobResult::Startup(result) => {
                 (*p).startup_loading = false;
+                if (*p).startup_refresh_pending {
+                    (*p).startup_refresh_pending = false;
+                    if (*p).page == Page::Startup {
+                        request_list(p, Page::Startup);
+                    }
+                    continue;
+                }
                 match result {
                     Ok(s) => {
                         (*p).startup = s;
@@ -1596,7 +2042,7 @@ unsafe fn drain_jobs(p: *mut App) {
                 (*p).busy = false;
                 match result {
                     Ok(()) => {
-                        (*p).notice = notice.into();
+                        (*p).notice = notice;
                         (*p).clear_error();
                         request_list(p, page);
                         let _ = (*p).tx.send(Command::Refresh);
@@ -1628,7 +2074,7 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
     let filter = &(*p).filter;
     (*p).rows = (0..total_rows(p))
         .filter(|&row| {
-            if filter.is_empty() {
+            if filter.is_empty() || ((*p).page == Page::Processes && (*p).tree_mode) {
                 return true;
             }
             match (*p).page {
@@ -1690,6 +2136,37 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
         };
         (if desc { result.reverse() } else { result }).then(a.cmp(&b))
     });
+    (*p).tree_rows.clear();
+    if (*p).page == Page::Processes && (*p).tree_mode {
+        if let Some(snapshot) = (*p).snapshot.as_ref() {
+            let identities = snapshot
+                .processes
+                .iter()
+                .map(ProcessIdentity::from)
+                .collect::<HashSet<_>>();
+            (*p).collapsed
+                .retain(|identity| identities.contains(identity));
+            let matches = if filter.is_empty() {
+                None
+            } else {
+                Some(
+                    snapshot
+                        .processes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, process)| {
+                            process.name.to_lowercase().contains(filter)
+                                || process.pid.to_string().contains(filter)
+                        })
+                        .map(|(index, _)| index)
+                        .collect::<HashSet<_>>(),
+                )
+            };
+            (*p).tree_rows =
+                Tree::new(&snapshot.processes).rows(&(*p).rows, &(*p).collapsed, matches.as_ref());
+            (*p).rows = (*p).tree_rows.iter().map(|row| row.index).collect();
+        }
+    }
     let clear = LVITEMW {
         stateMask: LVIS_SELECTED | LVIS_FOCUSED,
         ..zeroed()
@@ -1750,20 +2227,31 @@ unsafe fn update_sort_header(p: *mut App) {
 }
 unsafe fn empty_message(p: *mut App) -> String {
     if let Some(e) = &(*p).error {
-        return format!("목록을 불러오지 못했습니다.\n{e}\n새로고침으로 다시 시도하세요.");
+        return tf!(
+            "목록을 불러오지 못했습니다.\n{e}\n새로고침으로 다시 시도하세요.",
+            "Unable to load the list.\n{e}\nSelect Refresh to try again."
+        );
     }
     if ((*p).page == Page::Startup && (*p).startup_loading)
         || ((*p).page == Page::Services && (*p).services_loading)
         || ((*p).page == Page::Processes && (*p).snapshot.is_none())
     {
-        return "목록을 불러오는 중…".into();
+        return tr("목록을 불러오는 중…", "Loading the list…").into();
     }
     if !(&(*p).filter).is_empty() {
-        "검색 결과가 없습니다.\n다른 이름이나 PID로 검색해 보세요.".into()
+        tr(
+            "검색 결과가 없습니다.\n다른 이름이나 PID로 검색해 보세요.",
+            "No matching results.\nTry a different name or PID.",
+        )
+        .into()
     } else if (*p).page == Page::Startup {
-        "관리할 데스크톱 시작 앱이 없습니다.\n일부 앱은 Windows 설정에서 관리할 수 있습니다.".into()
+        tr(
+            "관리할 데스크톱 시작 앱이 없습니다.\n일부 앱은 Windows 설정에서 관리할 수 있습니다.",
+            "No desktop startup apps to manage.\nSome apps are managed in Windows Settings.",
+        )
+        .into()
     } else {
-        "표시할 항목이 없습니다.".into()
+        tr("표시할 항목이 없습니다.", "No items to display.").into()
     }
 }
 unsafe fn notify(p: *mut App, l: LPARAM) -> LRESULT {
@@ -1831,7 +2319,22 @@ unsafe fn notify(p: *mut App, l: LPARAM) -> LRESULT {
         }
         NM_DBLCLK => {
             if (*p).page == Page::Processes {
-                PostMessageW((*p).hwnd, WM_COMMAND, SECONDARY, 0);
+                if (*p).tree_mode {
+                    let click = &*(l as *const NMITEMACTIVATE);
+                    // A first click on the glyph already toggled the branch.
+                    if !branch_glyph_hit(p, click) {
+                        toggle_selected_branch(p, None);
+                    }
+                } else {
+                    PostMessageW((*p).hwnd, WM_COMMAND, SECONDARY, 0);
+                }
+            }
+            0
+        }
+        NM_CLICK if (*p).page == Page::Processes && (*p).tree_mode => {
+            let click = &*(l as *const NMITEMACTIVATE);
+            if branch_glyph_hit(p, click) {
+                toggle_selected_branch(p, None);
             }
             0
         }
@@ -1856,13 +2359,67 @@ unsafe fn notify(p: *mut App, l: LPARAM) -> LRESULT {
                     } else {
                         rgb(250, 251, 253)
                     };
-                    CDRF_DODEFAULT as isize
+                    if (*p).page == Page::Processes && (*p).tree_mode {
+                        CDRF_NOTIFYSUBITEMDRAW as isize
+                    } else {
+                        CDRF_DODEFAULT as isize
+                    }
+                }
+                stage
+                    if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM
+                        && draw.iSubItem == 0
+                        && (*p).page == Page::Processes
+                        && (*p).tree_mode =>
+                {
+                    let row_index = draw.nmcd.dwItemSpec;
+                    if let Some(row) = (&(*p).tree_rows).get(row_index) {
+                        let value = cell_at(p, row.index, 0);
+                        let mut bounds = RECT {
+                            left: LVIR_BOUNDS as i32,
+                            ..zeroed()
+                        };
+                        SendMessageW(
+                            (*p).list,
+                            LVM_GETITEMRECT,
+                            row_index,
+                            &mut bounds as *mut _ as isize,
+                        );
+                        bounds.right =
+                            bounds.left + SendMessageW((*p).list, LVM_GETCOLUMNWIDTH, 0, 0) as i32;
+                        paint::tree_cell(p, draw.nmcd.hdc, bounds, row, &value, draw.clrTextBk);
+                        CDRF_SKIPDEFAULT as isize
+                    } else {
+                        CDRF_DODEFAULT as isize
+                    }
                 }
                 _ => CDRF_DODEFAULT as isize,
             }
         }
         _ => 0,
     }
+}
+unsafe fn branch_glyph_hit(p: *mut App, click: &NMITEMACTIVATE) -> bool {
+    if click.iItem < 0 || click.iSubItem != 0 {
+        return false;
+    }
+    let Some(row) = (&(*p).tree_rows).get(click.iItem as usize) else {
+        return false;
+    };
+    if !row.has_children {
+        return false;
+    }
+    let mut bounds = RECT {
+        left: LVIR_BOUNDS as i32,
+        ..zeroed()
+    };
+    SendMessageW(
+        (*p).list,
+        LVM_GETITEMRECT,
+        click.iItem as usize,
+        &mut bounds as *mut _ as isize,
+    );
+    let left = bounds.left + scale(p, 8 + row.depth.min(12) as i32 * 18);
+    click.ptAction.x >= left && click.ptAction.x <= left + scale(p, 18)
 }
 unsafe fn cell_at(p: *mut App, row: usize, col: i32) -> String {
     match (*p).page {
@@ -1984,6 +2541,10 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
                 update_buttons(p);
                 capture::save_client(p, &dir.join(name))?;
             }
+            switch_page(p, Page::Processes);
+            set_tree_mode(p, true);
+            capture::save_client(p, &dir.join("process-tree.bmp"))?;
+            set_tree_mode(p, false);
             // Exercise the same native layout at its supported minimum size
             // and with the 150% WM_DPICHANGED font/layout path. The latter is
             // a controlled DPI simulation, not a second physical monitor.
@@ -2014,6 +2575,11 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
                     layout(p);
                     update_buttons(p);
                     capture::save_client(p, &dir.join(format!("{name}-{suffix}.bmp")))?;
+                    if page == Page::Processes {
+                        set_tree_mode(p, true);
+                        capture::save_client(p, &dir.join(format!("process-tree-{suffix}.bmp")))?;
+                        set_tree_mode(p, false);
+                    }
                 }
             }
             Ok(())
@@ -2283,6 +2849,216 @@ mod tests {
         assert_eq!(test.count(), 3);
     }
     #[test]
+    fn tree_view_keeps_selection_and_numeric_cells_aligned_through_collapse_and_search() {
+        let test = TestWindow::new();
+        let mut root = process(201, 100, "Parent.exe", 30, 1.0);
+        root.parent_pid = 4;
+        let mut child = process(202, 200, "Child.exe", 20, 2.0);
+        child.parent_pid = 201;
+        let mut leaf = process(203, 300, "Leaf.exe", 10, 3.0);
+        leaf.parent_pid = 202;
+        test.snapshot(vec![root, child, leaf]);
+        test.select(0);
+        unsafe {
+            set_tree_mode(test.p, true);
+        }
+        assert_eq!(test.identity(), Some(Identity::Process(201, 100)));
+        assert_eq!(test.text(0, 0), "Parent.exe");
+        assert_eq!(test.text(1, 1), "202");
+        assert_eq!(test.text(2, 3), "10.0 MB");
+        unsafe {
+            assert_eq!(
+                (*test.p)
+                    .tree_rows
+                    .iter()
+                    .map(|row| row.depth)
+                    .collect::<Vec<_>>(),
+                [0, 1, 2]
+            );
+            let mut bounds = RECT {
+                left: LVIR_BOUNDS as i32,
+                ..zeroed()
+            };
+            SendMessageW(
+                (*test.p).list,
+                LVM_GETITEMRECT,
+                0,
+                &mut bounds as *mut _ as isize,
+            );
+            let click = NMITEMACTIVATE {
+                hdr: NMHDR {
+                    hwndFrom: (*test.p).list,
+                    idFrom: 200,
+                    code: NM_CLICK,
+                },
+                iItem: 0,
+                iSubItem: 0,
+                ptAction: POINT {
+                    x: bounds.left + scale(test.p, 12),
+                    y: (bounds.top + bounds.bottom) / 2,
+                },
+                ..zeroed()
+            };
+            SendMessageW((*test.p).hwnd, WM_NOTIFY, 200, &click as *const _ as isize);
+        }
+        assert_eq!(test.count(), 1);
+        assert_eq!(test.identity(), Some(Identity::Process(201, 100)));
+        let plan = unsafe { captured_tree_plan(test.p).unwrap() };
+        assert_eq!(
+            plan.len(),
+            3,
+            "A collapsed branch must still target its full captured tree"
+        );
+        assert_eq!(plan.targets()[0].pid, 203);
+        test.search("leaf");
+        assert_eq!(
+            test.count(),
+            3,
+            "Filtering reveals matches and their ancestry"
+        );
+        test.search("");
+        assert_eq!(test.count(), 1, "Filtering must preserve collapsed state");
+        unsafe {
+            toggle_selected_branch(test.p, Some(true));
+            set_tree_mode(test.p, false);
+        }
+        assert_eq!(test.count(), 3);
+        assert_eq!(test.identity(), Some(Identity::Process(201, 100)));
+        test.snapshot(vec![process(901, 901, "New.exe", 2, 1.0)]);
+        assert_eq!(
+            plan.len(),
+            3,
+            "A confirmation plan cannot be replaced by later samples"
+        );
+        assert_eq!(plan.root.pid, 201);
+    }
+    #[test]
+    fn language_switch_updates_native_controls_and_retains_selection_and_filter() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        test.search("Beta");
+        test.select(0);
+        let identity = test.identity();
+        crate::i18n::with_language(Language::English, || unsafe {
+            refresh_language(test.p);
+            assert_eq!(Page::Processes.title(), "Processes");
+            assert_eq!(columns(Page::Processes)[3].0, "Memory");
+            assert_eq!(test.identity(), identity);
+            assert_eq!(test.count(), 1);
+            let mut text = [0u16; 80];
+            let length = GetWindowTextW((*test.p).end_tree, text.as_mut_ptr(), 80);
+            assert_eq!(
+                String::from_utf16_lossy(&text[..length as usize]),
+                "End process tree"
+            );
+            let length = GetWindowTextW((*test.p).settings, text.as_mut_ptr(), 80);
+            assert_eq!(
+                String::from_utf16_lossy(&text[..length as usize]),
+                "Settings"
+            );
+            assert!(empty_message(test.p).contains("No matching results"));
+            let menu = create_settings_menu(&Ok(crate::replacement::Status::Inactive));
+            assert_ne!(
+                GetMenuState(menu, LANGUAGE_ENGLISH as u32, MF_BYCOMMAND) & MF_CHECKED,
+                0
+            );
+            assert_eq!(
+                GetMenuState(menu, LANGUAGE_KOREAN as u32, MF_BYCOMMAND) & MF_CHECKED,
+                0
+            );
+            DestroyMenu(menu);
+        });
+        unsafe {
+            refresh_language(test.p);
+        }
+        assert_eq!(test.identity(), identity);
+    }
+    #[test]
+    fn language_switch_retries_in_flight_startup_once_without_losing_selection() {
+        let test = TestWindow::new();
+        let entries = crate::startup::list().unwrap();
+        test.page(Page::Startup);
+        assert!(matches!(test.jobs.try_recv(), Ok(Job::Startup)));
+        test.result(JobResult::Startup(Ok(entries.clone())));
+        if !entries.is_empty() {
+            test.select(0);
+        }
+        let identity = test.identity();
+        unsafe {
+            request_list(test.p, Page::Startup);
+        }
+        assert!(matches!(test.jobs.try_recv(), Ok(Job::Startup)));
+        crate::i18n::with_language(Language::English, || unsafe {
+            refresh_language(test.p);
+            assert!((*test.p).startup_refresh_pending);
+            assert!(!(*test.p).startup_loaded);
+            assert!(
+                test.jobs.try_recv().is_err(),
+                "Do not duplicate the in-flight request"
+            );
+            assert_eq!(test.identity(), identity);
+            // This old result would erase the selected row if accepted.
+            test.result(JobResult::Startup(Ok(Vec::new())));
+            assert_eq!(test.count(), entries.len());
+            assert_eq!(test.identity(), identity);
+            assert!(matches!(test.jobs.try_recv(), Ok(Job::Startup)));
+            assert!(
+                test.jobs.try_recv().is_err(),
+                "Schedule only one replacement request"
+            );
+            assert!(!(*test.p).startup_refresh_pending);
+            assert!((*test.p).startup_loading);
+            let mut localized = entries.clone();
+            for entry in &mut localized {
+                entry.status = "Fresh English status".into();
+                entry.location = "Fresh English location".into();
+            }
+            test.result(JobResult::Startup(Ok(localized)));
+            assert_eq!(test.identity(), identity);
+            if !entries.is_empty() {
+                assert_eq!(test.text(0, 1), "Fresh English status");
+                assert_eq!(test.text(0, 2), "Fresh English location");
+            }
+            assert!((*test.p).startup_loaded);
+            assert!(!(*test.p).startup_loading);
+            drain_jobs(test.p);
+            assert!(
+                test.jobs.try_recv().is_err(),
+                "No continuing refresh after recovery"
+            );
+        });
+    }
+    #[test]
+    fn language_switch_invalidates_inactive_startup_cache_and_discards_old_errors() {
+        let test = TestWindow::new();
+        test.page(Page::Startup);
+        assert!(matches!(test.jobs.try_recv(), Ok(Job::Startup)));
+        test.page(Page::Processes);
+        test.snapshot(rows());
+        test.select(0);
+        let identity = test.identity();
+        crate::i18n::with_language(Language::English, || unsafe {
+            refresh_language(test.p);
+            test.result(JobResult::Startup(Err("Old-language failure".into())));
+            assert!((*test.p).error.is_none());
+            assert!(!(*test.p).startup_loaded);
+            assert!(test.jobs.try_recv().is_err(), "Keep inactive pages lazy");
+            assert_eq!(test.identity(), identity);
+            test.page(Page::Startup);
+            assert!(matches!(test.jobs.try_recv(), Ok(Job::Startup)));
+            test.result(JobResult::Startup(Ok(Vec::new())));
+            test.page(Page::Processes);
+            refresh_language(test.p);
+            assert!(
+                !(*test.p).startup_loaded,
+                "Invalidate an already-loaded inactive cache too"
+            );
+            test.page(Page::Startup);
+            assert!(matches!(test.jobs.try_recv(), Ok(Job::Startup)));
+            assert!(test.jobs.try_recv().is_err());
+        });
+    }
+    #[test]
     fn native_process_selection_survives_reordering_but_not_pid_reuse() {
         let test = TestWindow::new();
         test.snapshot(rows());
@@ -2501,7 +3277,7 @@ mod tests {
         test.result(JobResult::Action {
             result: Err("Service action denied".into()),
             page: Page::Services,
-            notice: "unused",
+            notice: "unused".into(),
         });
         test.failed_snapshot("Unrelated monitor failure");
         test.snapshot(rows());

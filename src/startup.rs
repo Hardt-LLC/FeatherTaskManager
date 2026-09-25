@@ -9,6 +9,8 @@
 //! Existing trailing bytes are preserved. Packaged StartupTask apps, RunOnce,
 //! scheduled tasks, policies, and startup impact measurements are out of scope.
 
+use crate::i18n::tr;
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -60,8 +62,8 @@ impl Hive {
     }
     fn label(self) -> &'static str {
         match self {
-            Self::User => "현재 사용자",
-            Self::Machine => "모든 사용자",
+            Self::User => tr("현재 사용자", "Current user"),
+            Self::Machine => tr("모든 사용자", "All users"),
         }
     }
 }
@@ -108,10 +110,11 @@ fn wide(text: &str) -> Vec<u16> {
 
 fn win_error(context: &str, code: u32) -> String {
     if code == ERROR_ACCESS_DENIED {
-        format!("{context}: 접근이 거부되었습니다. 모든 사용자 항목은 관리자 권한이 필요할 수 있습니다.")
+        crate::trf!("{context}: 접근이 거부되었습니다. 모든 사용자 항목은 관리자 권한이 필요할 수 있습니다.", "{context}: Access denied. Entries for all users may require administrator privileges.")
     } else {
-        format!(
+        crate::trf!(
             "{context}: {} (오류 {code})",
+            "{context}: {} (error {code})",
             std::io::Error::from_raw_os_error(code as i32)
         )
     }
@@ -123,7 +126,13 @@ fn open_key(hive: Hive, path: &str, access: u32) -> Result<Option<Key>, String> 
     match code {
         ERROR_SUCCESS => Ok(Some(Key(key))),
         ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
-        _ => Err(win_error("시작 앱 레지스트리를 열 수 없습니다", code)),
+        _ => Err(win_error(
+            tr(
+                "시작 앱 레지스트리를 열 수 없습니다",
+                "Cannot open the startup app registry",
+            ),
+            code,
+        )),
     }
 }
 
@@ -143,7 +152,13 @@ fn create_key(hive: Hive, path: &str) -> Result<Key, String> {
         )
     };
     if code != ERROR_SUCCESS {
-        Err(win_error("시작 앱 상태를 변경할 수 없습니다", code))
+        Err(win_error(
+            tr(
+                "시작 앱 상태를 변경할 수 없습니다",
+                "Cannot change the startup app state",
+            ),
+            code,
+        ))
     } else {
         Ok(Key(key))
     }
@@ -166,11 +181,21 @@ fn query_value(key: &Key, name: &[u16]) -> Result<Option<Value>, String> {
         return Ok(None);
     }
     if code != ERROR_SUCCESS {
-        return Err(win_error("시작 앱 값을 읽을 수 없습니다", code));
+        return Err(win_error(
+            tr(
+                "시작 앱 값을 읽을 수 없습니다",
+                "Cannot read the startup app value",
+            ),
+            code,
+        ));
     }
     for _ in 0..4 {
         if size as usize > MAX_VALUE_BYTES {
-            return Err("시작 앱 레지스트리 값이 너무 큽니다. 변경하지 않았습니다.".into());
+            return Err(tr(
+                "시작 앱 레지스트리 값이 너무 큽니다. 변경하지 않았습니다.",
+                "The startup app registry value is too large. Nothing was changed.",
+            )
+            .into());
         }
         let mut data = vec![0; size as usize];
         let code = unsafe {
@@ -190,12 +215,22 @@ fn query_value(key: &Key, name: &[u16]) -> Result<Option<Value>, String> {
             continue;
         }
         if code != ERROR_SUCCESS {
-            return Err(win_error("시작 앱 값을 읽을 수 없습니다", code));
+            return Err(win_error(
+                tr(
+                    "시작 앱 값을 읽을 수 없습니다",
+                    "Cannot read the startup app value",
+                ),
+                code,
+            ));
         }
         data.truncate(size as usize);
         return Ok(Some(Value { kind, data }));
     }
-    Err("시작 앱 값이 계속 변경되고 있습니다. 새로 고침 후 다시 시도하세요.".into())
+    Err(tr(
+        "시작 앱 값이 계속 변경되고 있습니다. 새로 고침 후 다시 시도하세요.",
+        "The startup app value keeps changing. Refresh the list and try again.",
+    )
+    .into())
 }
 
 fn approval_value(hive: Hive, path: &str, name: &[u16]) -> Result<Option<Value>, String> {
@@ -227,7 +262,11 @@ fn changed_approval(
     timestamp: u64,
 ) -> Result<Value, String> {
     if approved_state(previous).is_none() {
-        return Err("Windows의 시작 앱 상태 형식을 확인할 수 없어 변경하지 않았습니다.".into());
+        return Err(tr(
+            "Windows의 시작 앱 상태 형식을 확인할 수 없어 변경하지 않았습니다.",
+            "The Windows startup app state format could not be verified. Nothing was changed.",
+        )
+        .into());
     }
     let mut data = previous
         .map(|v| v.data.clone())
@@ -263,11 +302,11 @@ fn command_text(value: &Value) -> Option<String> {
 
 fn state_text(state: Option<bool>, manageable: bool) -> String {
     match (state, manageable) {
-        (None, _) => "상태 확인 필요 · 읽기 전용",
-        (Some(true), false) => "사용 · 읽기 전용",
-        (Some(false), false) => "사용 안 함 · 읽기 전용",
-        (Some(true), true) => "사용",
-        (Some(false), true) => "사용 안 함",
+        (None, _) => tr("상태 확인 필요 · 읽기 전용", "State unknown · Read only"),
+        (Some(true), false) => tr("사용 · 읽기 전용", "Enabled · Read only"),
+        (Some(false), false) => tr("사용 안 함 · 읽기 전용", "Disabled · Read only"),
+        (Some(true), true) => tr("사용", "Enabled"),
+        (Some(false), true) => tr("사용 안 함", "Disabled"),
     }
     .into()
 }
@@ -304,7 +343,13 @@ fn registry_entries(hive: Hive, view: u32) -> Result<Vec<StartupEntry>, String> 
             break;
         }
         if code != ERROR_SUCCESS {
-            return Err(win_error("시작 앱 목록을 읽을 수 없습니다", code));
+            return Err(win_error(
+                tr(
+                    "시작 앱 목록을 읽을 수 없습니다",
+                    "Cannot read the startup app list",
+                ),
+                code,
+            ));
         }
         index += 1;
         let mut value_name = name[..length as usize].to_vec();
@@ -322,12 +367,18 @@ fn registry_entries(hive: Hive, view: u32) -> Result<Vec<StartupEntry>, String> 
         result.push(StartupEntry {
             id: format!("run:{hive:?}:{bits}:{id_name}"),
             name: if label.is_empty() {
-                "(이름 없음)".into()
+                tr("(이름 없음)", "(Unnamed)").into()
             } else {
                 label
             },
-            command: command.unwrap_or_else(|| "지원하지 않는 명령 형식".into()),
-            location: format!("{} · 레지스트리 {bits}비트", hive.label()),
+            command: command.unwrap_or_else(|| {
+                tr("지원하지 않는 명령 형식", "Unsupported command format").into()
+            }),
+            location: crate::trf!(
+                "{} · 레지스트리 {bits}비트",
+                "{} · {bits}-bit registry",
+                hive.label()
+            ),
             enabled: state.unwrap_or(false),
             manageable,
             status: state_text(state, manageable),
@@ -358,11 +409,19 @@ fn file_identity(path: &Path, lock: bool) -> Result<(File, FileIdentity), String
         .share_mode(share)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|e| format!("시작 앱 파일을 확인할 수 없습니다: {e}"))?;
+        .map_err(|e| {
+            crate::trf!(
+                "시작 앱 파일을 확인할 수 없습니다: {e}",
+                "Cannot verify the startup app file: {e}"
+            )
+        })?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
         return Err(win_error(
-            "시작 앱 파일 정보를 확인할 수 없습니다",
+            tr(
+                "시작 앱 파일 정보를 확인할 수 없습니다",
+                "Cannot read the startup app file information",
+            ),
             unsafe { GetLastError() },
         ));
     }
@@ -403,8 +462,9 @@ fn folder_entries(hive: Hive) -> Result<Vec<StartupEntry>, String> {
         )
     };
     if hr < 0 {
-        return Err(format!(
+        return Err(crate::trf!(
             "시작프로그램 폴더 경로를 읽을 수 없습니다 (0x{:08X}).",
+            "Cannot read the startup folder path (0x{:08X}).",
             hr as u32
         ));
     }
@@ -413,12 +473,22 @@ fn folder_entries(hive: Hive) -> Result<Vec<StartupEntry>, String> {
     let files = match fs::read_dir(&folder) {
         Ok(files) => files,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("시작프로그램 폴더를 읽을 수 없습니다: {e}")),
+        Err(e) => {
+            return Err(crate::trf!(
+                "시작프로그램 폴더를 읽을 수 없습니다: {e}",
+                "Cannot read the startup folder: {e}"
+            ))
+        }
     };
     let approval_path = format!(r"{APPROVED}\StartupFolder");
     let mut result = Vec::new();
     for file in files {
-        let file = file.map_err(|e| format!("시작프로그램 파일을 읽을 수 없습니다: {e}"))?;
+        let file = file.map_err(|e| {
+            crate::trf!(
+                "시작프로그램 파일을 읽을 수 없습니다: {e}",
+                "Cannot read the startup file: {e}"
+            )
+        })?;
         let name = file.file_name();
         if name.to_string_lossy().eq_ignore_ascii_case("desktop.ini")
             || file.file_type().map(|t| t.is_dir()).unwrap_or(false)
@@ -439,7 +509,11 @@ fn folder_entries(hive: Hive) -> Result<Vec<StartupEntry>, String> {
             id: format!("folder:{hive:?}:{id_name}"),
             name: name.to_string_lossy().into_owned(),
             command: path.to_string_lossy().into_owned(),
-            location: format!("{} · 시작프로그램 폴더", hive.label()),
+            location: crate::trf!(
+                "{} · 시작프로그램 폴더",
+                "{} · Startup folder",
+                hive.label()
+            ),
             enabled: state.unwrap_or(false),
             manageable,
             status: state_text(state, manageable),
@@ -496,7 +570,13 @@ fn write_value(key: &Key, name: &[u16], value: &Value) -> Result<(), String> {
     if code == ERROR_SUCCESS {
         Ok(())
     } else {
-        Err(win_error("시작 앱 상태를 저장할 수 없습니다", code))
+        Err(win_error(
+            tr(
+                "시작 앱 상태를 저장할 수 없습니다",
+                "Cannot save the startup app state",
+            ),
+            code,
+        ))
     }
 }
 
@@ -505,10 +585,19 @@ fn write_value(key: &Key, name: &[u16], value: &Value) -> Result<(), String> {
 /// still race the final check/write, so the result is read back and verified.
 pub fn set_enabled(entry: &StartupEntry, enabled: bool) -> Result<(), String> {
     if !entry.manageable || approved_state(entry.approval.as_ref()).is_none() {
-        return Err("이 시작 앱은 읽기 전용입니다. Windows 설정에서 상태를 확인하세요.".into());
+        return Err(tr(
+            "이 시작 앱은 읽기 전용입니다. Windows 설정에서 상태를 확인하세요.",
+            "This startup app is read only. Check its state in Windows Settings.",
+        )
+        .into());
     }
-    let stale =
-        || "시작 앱이 다른 프로그램에서 변경되었습니다. 새로 고침 후 다시 시도하세요.".to_string();
+    let stale = || {
+        tr(
+            "시작 앱이 다른 프로그램에서 변경되었습니다. 새로 고침 후 다시 시도하세요.",
+            "Another application changed this startup app. Refresh the list and try again.",
+        )
+        .to_string()
+    };
     let _file_guard = match &entry.source {
         Source::Registry { path, view, value } => {
             let key = open_key(entry.hive, path, KEY_QUERY_VALUE | *view)?.ok_or_else(stale)?;
@@ -551,7 +640,11 @@ pub fn set_enabled(entry: &StartupEntry, enabled: bool) -> Result<(), String> {
     }
     write_value(&key, &entry.value_name, &updated)?;
     if query_value(&key, &entry.value_name)?.as_ref() != Some(&updated) {
-        return Err("시작 앱 상태가 저장 직후 변경되었습니다. 새로 고침하여 확인하세요.".into());
+        return Err(tr(
+            "시작 앱 상태가 저장 직후 변경되었습니다. 새로 고침하여 확인하세요.",
+            "The startup app state changed immediately after saving. Refresh the list to check it.",
+        )
+        .into());
     }
     Ok(())
 }
@@ -559,6 +652,22 @@ pub fn set_enabled(entry: &StartupEntry, enabled: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{with_language, Language};
+
+    #[test]
+    fn english_startup_status_scope_and_errors_are_localized() {
+        with_language(Language::English, || {
+            assert_eq!(Hive::User.label(), "Current user");
+            assert_eq!(Hive::Machine.label(), "All users");
+            assert_eq!(state_text(Some(true), true), "Enabled");
+            assert_eq!(state_text(Some(false), false), "Disabled · Read only");
+            assert_eq!(state_text(None, false), "State unknown · Read only");
+            assert_eq!(
+                win_error("Save", ERROR_ACCESS_DENIED),
+                "Save: Access denied. Entries for all users may require administrator privileges."
+            );
+        });
+    }
 
     struct Fixture {
         key_path: String,

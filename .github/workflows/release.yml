@@ -1,0 +1,87 @@
+name: Signed Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag, such as v2026.9.1
+        required: true
+        type: string
+      publish:
+        description: Publish the verified assets to GitHub Releases
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: signed-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2025
+    environment: release
+    env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      FEATHER_SIGNING_SUBJECT: CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US
+      FEATHER_SIGNING_METADATA: ${{ github.workspace }}\installer\signing-metadata.example.json
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Check release version and signing configuration
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = ./scripts/version.ps1
+          if ($env:RELEASE_TAG -cne $version.Tag) { throw 'The selected tag does not match Cargo and PE resource versions.' }
+          git show-ref --verify --quiet "refs/tags/$($version.Tag)"
+          if ($LASTEXITCODE -ne 0) { throw 'An existing Git tag is required.' }
+          foreach ($name in 'AZURE_TENANT_ID','AZURE_CLIENT_ID','AZURE_CLIENT_SECRET') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Configure the $name GitHub Actions secret." }
+          }
+      - name: Prepare pinned Rust and signing tools
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed.' }
+          rustup override set 1.98.0
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain selection failed.' }
+          ./scripts/prepare-release-tools.ps1
+      - name: Check and test
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'Formatting failed.' }
+          cargo clippy --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
+      - name: Build, sign, and verify app, installer, and uninstaller
+        run: ./scripts/build-release.ps1
+      - name: Save verified release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-${{ inputs.tag }}
+          if-no-files-found: error
+          path: |
+            dist/FeatherTaskManager-*-Portable-x64.exe
+            dist/FeatherTaskManager-*-Setup-x64.exe
+            dist/FeatherTaskManager-*-Portable-x64.zip
+            dist/SHA256SUMS.txt
+            dist/release-manifest.json
+      - name: Publish the release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = ./scripts/version.ps1
+          ./scripts/publish-release.ps1 -NotesFile "releases/$($version.Version).md"

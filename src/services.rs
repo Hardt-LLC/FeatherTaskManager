@@ -1,5 +1,7 @@
 //! Native service snapshots and explicit user actions. Call these on a worker.
 
+use crate::i18n::tr;
+
 use std::{
     collections::HashMap,
     mem::{size_of, size_of_val},
@@ -37,19 +39,19 @@ impl Drop for ServiceHandle {
 fn service_error(context: &str, code: u32) -> String {
     let message = match code {
         ERROR_ACCESS_DENIED => {
-            "권한이 없습니다. 필요한 경우 Feather Task를 관리자 권한으로 실행하세요.".to_owned()
+            tr("권한이 없습니다. 필요한 경우 Feather Task를 관리자 권한으로 실행하세요.", "Access denied. Run Feather Task Manager as administrator if needed.").to_owned()
         }
-        ERROR_SERVICE_ALREADY_RUNNING => "서비스가 이미 실행 중입니다.".to_owned(),
-        ERROR_SERVICE_NOT_ACTIVE => "서비스가 이미 중지되어 있습니다.".to_owned(),
-        ERROR_SERVICE_DISABLED => "사용 안 함으로 설정된 서비스입니다.".to_owned(),
+        ERROR_SERVICE_ALREADY_RUNNING => tr("서비스가 이미 실행 중입니다.", "The service is already running.").to_owned(),
+        ERROR_SERVICE_NOT_ACTIVE => tr("서비스가 이미 중지되어 있습니다.", "The service is already stopped.").to_owned(),
+        ERROR_SERVICE_DISABLED => tr("사용 안 함으로 설정된 서비스입니다.", "This service is disabled.").to_owned(),
         ERROR_DEPENDENT_SERVICES_RUNNING => {
-            "이 서비스에 의존하는 서비스가 실행 중이므로 중지할 수 없습니다.".to_owned()
+            tr("이 서비스에 의존하는 서비스가 실행 중이므로 중지할 수 없습니다.", "This service cannot be stopped while dependent services are running.").to_owned()
         }
         ERROR_SERVICE_CANNOT_ACCEPT_CTRL => {
-            "서비스가 현재 요청을 받을 수 없습니다. 상태 변경이 끝난 후 다시 시도하세요.".to_owned()
+            tr("서비스가 현재 요청을 받을 수 없습니다. 상태 변경이 끝난 후 다시 시도하세요.", "The service cannot accept requests right now. Try again after its state transition completes.").to_owned()
         }
         ERROR_SERVICE_DOES_NOT_EXIST => {
-            "서비스가 더 이상 존재하지 않습니다. 목록을 새로 고치세요.".to_owned()
+            tr("서비스가 더 이상 존재하지 않습니다. 목록을 새로 고치세요.", "The service no longer exists. Refresh the list.").to_owned()
         }
         _ => std::io::Error::from_raw_os_error(code as i32).to_string(),
     };
@@ -60,7 +62,10 @@ fn open_manager(access: u32) -> Result<ServiceHandle, String> {
     let raw = unsafe { OpenSCManagerW(null(), null(), access) };
     if raw.is_null() {
         return Err(service_error(
-            "서비스 관리자에 연결할 수 없습니다",
+            tr(
+                "서비스 관리자에 연결할 수 없습니다",
+                "Cannot connect to the service manager",
+            ),
             unsafe { GetLastError() },
         ));
     }
@@ -70,7 +75,7 @@ fn open_manager(access: u32) -> Result<ServiceHandle, String> {
 fn wide_name(name: &str) -> Result<Vec<u16>, String> {
     let mut wide: Vec<u16> = name.encode_utf16().collect();
     if wide.is_empty() || wide.len() > 256 || wide.contains(&0) || name.contains(['/', '\\']) {
-        return Err("올바르지 않은 서비스 이름입니다.".into());
+        return Err(tr("올바르지 않은 서비스 이름입니다.", "Invalid service name.").into());
     }
     wide.push(0);
     Ok(wide)
@@ -83,23 +88,33 @@ fn buffer_string(buffer: &[usize], pointer: *const u16) -> Result<String, String
     let offset = (pointer as usize)
         .checked_sub(base)
         .filter(|offset| *offset < bytes && offset % size_of::<u16>() == 0)
-        .ok_or("서비스 목록의 문자열 주소가 올바르지 않습니다.")?;
+        .ok_or(tr(
+            "서비스 목록의 문자열 주소가 올바르지 않습니다.",
+            "Invalid string address in the service list.",
+        ))?;
     let len = (bytes - offset) / size_of::<u16>();
     // The pointer is aligned and the complete slice lies within the owned buffer.
     let chars = unsafe { std::slice::from_raw_parts(pointer, len) };
-    let end = chars
-        .iter()
-        .position(|c| *c == 0)
-        .ok_or("서비스 목록의 문자열이 올바르게 끝나지 않았습니다.")?;
+    let end = chars.iter().position(|c| *c == 0).ok_or(tr(
+        "서비스 목록의 문자열이 올바르게 끝나지 않았습니다.",
+        "An unterminated string was found in the service list.",
+    ))?;
     Ok(String::from_utf16_lossy(&chars[..end]))
 }
 
 fn parse_page(buffer: &[usize], count: u32) -> Result<Vec<Service>, String> {
     let required = (count as usize)
         .checked_mul(size_of::<ENUM_SERVICE_STATUS_PROCESSW>())
-        .ok_or("서비스 목록의 크기가 올바르지 않습니다.")?;
+        .ok_or(tr(
+            "서비스 목록의 크기가 올바르지 않습니다.",
+            "Invalid service list size.",
+        ))?;
     if required > size_of_val(buffer) {
-        return Err("서비스 목록이 버퍼 범위를 벗어났습니다.".into());
+        return Err(tr(
+            "서비스 목록이 버퍼 범위를 벗어났습니다.",
+            "The service list exceeds the buffer bounds.",
+        )
+        .into());
     }
     let mut result = Vec::with_capacity(count as usize);
     let entries = buffer.as_ptr().cast::<ENUM_SERVICE_STATUS_PROCESSW>();
@@ -175,7 +190,13 @@ pub fn list() -> Result<Vec<Service>, String> {
             0
         };
         if success == 0 && error != ERROR_MORE_DATA {
-            return Err(service_error("서비스 목록을 읽을 수 없습니다", error));
+            return Err(service_error(
+                tr(
+                    "서비스 목록을 읽을 수 없습니다",
+                    "Cannot read the service list",
+                ),
+                error,
+            ));
         }
         result.extend(parse_page(&buffer, returned)?);
         if success != 0 {
@@ -189,15 +210,19 @@ pub fn list() -> Result<Vec<Service>, String> {
         if next_bytes > current_bytes {
             buffer.resize(next_bytes.div_ceil(size_of::<usize>()), 0);
         } else if returned == 0 || resume == previous_resume {
-            return Err(
-                "서비스 목록 조회가 진행되지 않았습니다. 새로 고친 후 다시 시도하세요.".into(),
-            );
+            return Err(tr(
+                "서비스 목록 조회가 진행되지 않았습니다. 새로 고친 후 다시 시도하세요.",
+                "Service enumeration made no progress. Refresh the list and try again.",
+            )
+            .into());
         }
     }
     if !complete {
-        return Err(
-            "서비스 목록 조회의 안전 한도를 초과했습니다. 새로 고친 후 다시 시도하세요.".into(),
-        );
+        return Err(tr(
+            "서비스 목록 조회의 안전 한도를 초과했습니다. 새로 고친 후 다시 시도하세요.",
+            "Service enumeration exceeded its safety limit. Refresh the list and try again.",
+        )
+        .into());
     }
     result.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     result.dedup_by(|a, b| a.name == b.name);
@@ -228,15 +253,17 @@ pub fn start(name: &str) -> Result<(), String> {
     let manager = open_manager(SC_MANAGER_CONNECT)?;
     let raw = unsafe { OpenServiceW(manager.0, name.as_ptr(), SERVICE_START) };
     if raw.is_null() {
-        return Err(service_error("서비스를 시작할 수 없습니다", unsafe {
-            GetLastError()
-        }));
+        return Err(service_error(
+            tr("서비스를 시작할 수 없습니다", "Cannot start the service"),
+            unsafe { GetLastError() },
+        ));
     }
     let service = ServiceHandle(raw);
     if unsafe { StartServiceW(service.0, 0, null()) } == 0 {
-        return Err(service_error("서비스를 시작할 수 없습니다", unsafe {
-            GetLastError()
-        }));
+        return Err(service_error(
+            tr("서비스를 시작할 수 없습니다", "Cannot start the service"),
+            unsafe { GetLastError() },
+        ));
     }
     Ok(())
 }
@@ -248,63 +275,86 @@ pub fn stop(name: &str) -> Result<(), String> {
     let manager = open_manager(SC_MANAGER_CONNECT)?;
     let raw = unsafe { OpenServiceW(manager.0, name.as_ptr(), SERVICE_STOP) };
     if raw.is_null() {
-        return Err(service_error("서비스를 중지할 수 없습니다", unsafe {
-            GetLastError()
-        }));
+        return Err(service_error(
+            tr("서비스를 중지할 수 없습니다", "Cannot stop the service"),
+            unsafe { GetLastError() },
+        ));
     }
     let service = ServiceHandle(raw);
     let mut status = SERVICE_STATUS::default();
     if unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) } == 0 {
-        return Err(service_error("서비스를 중지할 수 없습니다", unsafe {
-            GetLastError()
-        }));
+        return Err(service_error(
+            tr("서비스를 중지할 수 없습니다", "Cannot stop the service"),
+            unsafe { GetLastError() },
+        ));
     }
     Ok(())
 }
 
 pub fn state_label(state: u32) -> &'static str {
     match state {
-        SERVICE_STOPPED => "중지됨",
-        SERVICE_START_PENDING => "시작 중",
-        SERVICE_STOP_PENDING => "중지 중",
-        SERVICE_RUNNING => "실행 중",
-        SERVICE_CONTINUE_PENDING => "다시 시작 중",
-        SERVICE_PAUSE_PENDING => "일시 중지 중",
-        SERVICE_PAUSED => "일시 중지됨",
-        _ => "알 수 없음",
+        SERVICE_STOPPED => tr("중지됨", "Stopped"),
+        SERVICE_START_PENDING => tr("시작 중", "Starting"),
+        SERVICE_STOP_PENDING => tr("중지 중", "Stopping"),
+        SERVICE_RUNNING => tr("실행 중", "Running"),
+        SERVICE_CONTINUE_PENDING => tr("다시 시작 중", "Resuming"),
+        SERVICE_PAUSE_PENDING => tr("일시 중지 중", "Pausing"),
+        SERVICE_PAUSED => tr("일시 중지됨", "Paused"),
+        _ => tr("알 수 없음", "Unknown"),
     }
 }
 
 pub fn start_type_label(value: Option<u32>) -> &'static str {
     match value {
-        Some(SERVICE_BOOT_START) => "부팅",
-        Some(SERVICE_SYSTEM_START) => "시스템",
-        Some(SERVICE_AUTO_START) => "자동",
-        Some(SERVICE_DEMAND_START) => "수동",
-        Some(SERVICE_DISABLED) => "사용 안 함",
-        _ => "확인 불가",
+        Some(SERVICE_BOOT_START) => tr("부팅", "Boot"),
+        Some(SERVICE_SYSTEM_START) => tr("시스템", "System"),
+        Some(SERVICE_AUTO_START) => tr("자동", "Automatic"),
+        Some(SERVICE_DEMAND_START) => tr("수동", "Manual"),
+        Some(SERVICE_DISABLED) => tr("사용 안 함", "Disabled"),
+        _ => tr("확인 불가", "Unavailable"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{with_language, Language};
     use std::collections::HashSet;
 
     #[test]
     fn labels_distinguish_pending_disabled_and_unknown() {
-        assert_eq!(state_label(SERVICE_RUNNING), "실행 중");
-        assert_ne!(
-            state_label(SERVICE_START_PENDING),
-            state_label(SERVICE_RUNNING)
-        );
-        assert_ne!(
-            state_label(SERVICE_STOP_PENDING),
-            state_label(SERVICE_STOPPED)
-        );
-        assert_eq!(state_label(u32::MAX), "알 수 없음");
-        assert_eq!(start_type_label(Some(SERVICE_DISABLED)), "사용 안 함");
-        assert_eq!(start_type_label(None), "확인 불가");
+        with_language(Language::Korean, || {
+            assert_eq!(state_label(SERVICE_RUNNING), "실행 중");
+            assert_ne!(
+                state_label(SERVICE_START_PENDING),
+                state_label(SERVICE_RUNNING)
+            );
+            assert_ne!(
+                state_label(SERVICE_STOP_PENDING),
+                state_label(SERVICE_STOPPED)
+            );
+            assert_eq!(state_label(u32::MAX), "알 수 없음");
+            assert_eq!(start_type_label(Some(SERVICE_DISABLED)), "사용 안 함");
+            assert_eq!(start_type_label(None), "확인 불가");
+        });
+    }
+
+    #[test]
+    fn english_service_labels_and_errors_do_not_change_service_names() {
+        with_language(Language::English, || {
+            assert_eq!(state_label(SERVICE_START_PENDING), "Starting");
+            assert_eq!(state_label(SERVICE_RUNNING), "Running");
+            assert_eq!(state_label(SERVICE_PAUSED), "Paused");
+            assert_eq!(start_type_label(Some(SERVICE_AUTO_START)), "Automatic");
+            assert_eq!(start_type_label(None), "Unavailable");
+            assert_eq!(wide_name("").unwrap_err(), "Invalid service name.");
+            assert!(service_error("Start", ERROR_SERVICE_DISABLED)
+                .contains("This service is disabled."));
+            assert_eq!(
+                wide_name("서비스_123").unwrap(),
+                "서비스_123\0".encode_utf16().collect::<Vec<_>>()
+            );
+        });
     }
 
     #[test]

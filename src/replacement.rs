@@ -3,6 +3,8 @@
 //! Windows' IFEO Debugger value redirects taskmgr.exe. The command always names a
 //! copy under the system's trusted Program Files folder, never a portable path.
 
+use crate::i18n::tr;
+
 use std::{
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
@@ -103,8 +105,9 @@ fn error(context: &str) -> String {
 }
 
 fn registry_error(code: u32) -> String {
-    format!(
+    crate::trf!(
         "작업 관리자 연결 설정에 접근할 수 없습니다: {}",
+        "Cannot access the Task Manager association settings: {}",
         std::io::Error::from_raw_os_error(code as i32)
     )
 }
@@ -114,8 +117,9 @@ fn install_path() -> Result<PathBuf, String> {
     let result =
         unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFilesX64, 0, null_mut(), &mut raw) };
     if result < 0 || raw.is_null() {
-        return Err(format!(
+        return Err(crate::trf!(
             "Windows Program Files 폴더를 확인할 수 없습니다 (0x{:08X}).",
+            "Cannot locate the Windows Program Files folder (0x{:08X}).",
             result as u32
         ));
     }
@@ -128,7 +132,11 @@ fn install_path() -> Result<PathBuf, String> {
     }));
     unsafe { CoTaskMemFree(raw.cast()) };
     if !path.is_absolute() {
-        return Err("Windows Program Files 폴더가 절대 경로가 아닙니다.".into());
+        return Err(tr(
+            "Windows Program Files 폴더가 절대 경로가 아닙니다.",
+            "The Windows Program Files folder is not an absolute path.",
+        )
+        .into());
     }
     path.push(APP_FOLDER);
     path.push(APP_EXE);
@@ -136,16 +144,21 @@ fn install_path() -> Result<PathBuf, String> {
 }
 
 fn debugger_command(path: &Path) -> Result<String, String> {
-    let text = path
-        .to_str()
-        .ok_or("설치 경로를 유니코드로 읽을 수 없습니다.")?;
+    let text = path.to_str().ok_or(tr(
+        "설치 경로를 유니코드로 읽을 수 없습니다.",
+        "The installation path contains invalid Unicode.",
+    ))?;
     if !path.is_absolute()
         || text.contains(['\0', '"'])
         || path
             .file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("taskmgr.exe"))
     {
-        return Err("작업 관리자 연결에 사용할 수 없는 실행 파일 경로입니다.".into());
+        return Err(tr(
+            "작업 관리자 연결에 사용할 수 없는 실행 파일 경로입니다.",
+            "This executable path cannot be used for the Task Manager association.",
+        )
+        .into());
     }
     Ok(format!("\"{text}\" --task-manager"))
 }
@@ -199,7 +212,11 @@ fn read_value(key: &Key, name: &str) -> Result<Option<Value>, String> {
         return Err(registry_error(result));
     }
     if size > MAX_REGISTRY_VALUE {
-        return Err("기존 작업 관리자 연결 값이 너무 커서 안전하게 변경할 수 없습니다.".into());
+        return Err(tr(
+            "기존 작업 관리자 연결 값이 너무 커서 안전하게 변경할 수 없습니다.",
+            "The existing Task Manager association value is too large to change safely.",
+        )
+        .into());
     }
     let mut bytes = vec![0; size as usize];
     let result = unsafe {
@@ -255,7 +272,13 @@ fn classify(value: Option<&Value>, command: &str) -> Status {
             decode_string(value)
                 .filter(|text| !text.is_empty())
                 .map(|text| text.chars().take(240).collect())
-                .unwrap_or_else(|| "알 수 없는 형식의 Debugger 설정".into()),
+                .unwrap_or_else(|| {
+                    tr(
+                        "알 수 없는 형식의 Debugger 설정",
+                        "Unrecognized Debugger setting format",
+                    )
+                    .into()
+                }),
         ),
     }
 }
@@ -263,7 +286,7 @@ fn classify(value: Option<&Value>, command: &str) -> Status {
 fn ensure_no_filter(key: &Key) -> Result<(), String> {
     if let Some(value) = read_value(key, "UseFilter")? {
         if value.kind != REG_DWORD || value.bytes != 0_u32.to_le_bytes() {
-            return Err("taskmgr.exe에 다른 프로그램의 경로별 실행 필터가 설정되어 있습니다. 해당 프로그램에서 먼저 연결을 해제하세요.".into());
+            return Err(tr("taskmgr.exe에 다른 프로그램의 경로별 실행 필터가 설정되어 있습니다. 해당 프로그램에서 먼저 연결을 해제하세요.", "Another application has configured a path-specific execution filter for taskmgr.exe. Remove its association in that application first.").into());
         }
     }
     // IFEO may contain path-specific FilterFullPath subkeys. Leave all existing
@@ -289,7 +312,7 @@ fn ensure_no_filter(key: &Key) -> Result<(), String> {
         return Err(registry_error(result));
     }
     if children != 0 {
-        return Err("taskmgr.exe에 다른 프로그램의 경로별 설정이 있습니다. 해당 프로그램에서 먼저 연결을 해제하세요.".into());
+        return Err(tr("taskmgr.exe에 다른 프로그램의 경로별 설정이 있습니다. 해당 프로그램에서 먼저 연결을 해제하세요.", "Another application has configured path-specific settings for taskmgr.exe. Remove its association in that application first.").into());
     }
     Ok(())
 }
@@ -311,15 +334,23 @@ pub fn status() -> Result<Status, String> {
 
 /// Called only by an explicit UI action, on the action worker rather than the UI thread.
 pub fn run_elevated(enable: bool) -> Result<(), String> {
-    let path = std::env::current_exe()
-        .map_err(|err| format!("현재 실행 파일을 찾을 수 없습니다: {err}"))?;
+    let path = std::env::current_exe().map_err(|err| {
+        crate::trf!(
+            "현재 실행 파일을 찾을 수 없습니다: {err}",
+            "Cannot locate this executable: {err}"
+        )
+    })?;
     let file = wide(path.as_os_str());
     let verb = wide("runas");
-    let parameters = wide(if enable {
-        "--install-task-manager"
-    } else {
-        "--restore-task-manager"
-    });
+    let parameters = wide(format!(
+        "{} --language {}",
+        if enable {
+            "--install-task-manager"
+        } else {
+            "--restore-task-manager"
+        },
+        crate::i18n::language().code()
+    ));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
@@ -331,24 +362,41 @@ pub fn run_elevated(enable: bool) -> Result<(), String> {
     };
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_CANCELLED as i32) {
-            return Err("관리자 권한 요청이 취소되어 연결 설정을 변경하지 않았습니다.".into());
+            return Err(tr(
+                "관리자 권한 요청이 취소되어 연결 설정을 변경하지 않았습니다.",
+                "The administrator request was cancelled. The association was not changed.",
+            )
+            .into());
         }
-        return Err(error("관리자 권한으로 연결 설정을 실행할 수 없습니다"));
+        return Err(error(tr(
+            "관리자 권한으로 연결 설정을 실행할 수 없습니다",
+            "Cannot run the association setup as administrator",
+        )));
     }
     if info.hProcess.is_null() {
-        return Err("연결 설정 프로세스를 확인할 수 없습니다.".into());
+        return Err(tr(
+            "연결 설정 프로세스를 확인할 수 없습니다.",
+            "Cannot verify the association setup process.",
+        )
+        .into());
     }
     let process = Process(info.hProcess);
     if unsafe { WaitForSingleObject(process.0, INFINITE) } != WAIT_OBJECT_0 {
-        return Err(error("연결 설정의 완료를 확인할 수 없습니다"));
+        return Err(error(tr(
+            "연결 설정의 완료를 확인할 수 없습니다",
+            "Cannot verify that the association setup completed",
+        )));
     }
     let mut exit = 0;
     if unsafe { GetExitCodeProcess(process.0, &mut exit) } == 0 {
-        return Err(error("연결 설정 결과를 확인할 수 없습니다"));
+        return Err(error(tr(
+            "연결 설정 결과를 확인할 수 없습니다",
+            "Cannot read the association setup result",
+        )));
     }
     if exit != 0 {
         return Err(
-            "연결 설정을 완료하지 못했습니다. 관리자 창에 표시된 오류를 확인하세요.".into(),
+            tr("연결 설정을 완료하지 못했습니다. 관리자 창에 표시된 오류를 확인하세요.", "The association setup did not complete. Check the error shown in the administrator window.").into(),
         );
     }
     let verified = if enable {
@@ -363,7 +411,11 @@ pub fn run_elevated(enable: bool) -> Result<(), String> {
     if verified {
         Ok(())
     } else {
-        Err("연결 설정이 다른 프로그램에 의해 변경되었습니다. 현재 상태를 다시 확인하세요.".into())
+        Err(tr(
+            "연결 설정이 다른 프로그램에 의해 변경되었습니다. 현재 상태를 다시 확인하세요.",
+            "Another application changed the association. Check its current state again.",
+        )
+        .into())
     }
 }
 
@@ -389,7 +441,7 @@ fn ensure_owned_or_empty(key: &Key, command: &str) -> Result<(), String> {
         classify(read_value(key, "Debugger")?.as_ref(), command),
         Status::Other(_)
     ) {
-        return Err("다른 프로그램의 작업 관리자 연결이 이미 있습니다. 기존 프로그램에서 먼저 기본 작업 관리자로 복원하세요. 기존 설정은 변경하지 않았습니다.".into());
+        return Err(tr("다른 프로그램의 작업 관리자 연결이 이미 있습니다. 기존 프로그램에서 먼저 기본 작업 관리자로 복원하세요. 기존 설정은 변경하지 않았습니다.", "Another application is already associated with Task Manager. Restore the Windows default in that application first. The existing settings were not changed.").into());
     }
     Ok(())
 }
@@ -431,7 +483,10 @@ fn sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<u32>, String> {
     let mut value = vec![0_u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(4)];
     let mut size = (value.len() * 4) as u32;
     if unsafe { CreateWellKnownSid(kind, null_mut(), value.as_mut_ptr().cast(), &mut size) } == 0 {
-        return Err(error("설치 폴더의 보안 식별자를 만들 수 없습니다"));
+        return Err(error(tr(
+            "설치 폴더의 보안 식별자를 만들 수 없습니다",
+            "Cannot create security identifiers for the installation folder",
+        )));
     }
     Ok(value)
 }
@@ -454,7 +509,10 @@ impl DirectorySecurity {
         let mut acl = vec![0_u32; 128];
         let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
         if unsafe { InitializeAcl(acl_ptr, (acl.len() * 4) as u32, ACL_REVISION) } == 0 {
-            return Err(error("설치 폴더의 접근 권한을 만들 수 없습니다"));
+            return Err(error(tr(
+                "설치 폴더의 접근 권한을 만들 수 없습니다",
+                "Cannot create access permissions for the installation folder",
+            )));
         }
         for (identity, access) in [
             (&admins, FILE_ALL_ACCESS),
@@ -471,7 +529,10 @@ impl DirectorySecurity {
                 )
             } == 0
             {
-                return Err(error("설치 폴더의 접근 권한을 만들 수 없습니다"));
+                return Err(error(tr(
+                    "설치 폴더의 접근 권한을 만들 수 없습니다",
+                    "Cannot create access permissions for the installation folder",
+                )));
             }
         }
         let mut descriptor = SECURITY_DESCRIPTOR::default();
@@ -483,7 +544,10 @@ impl DirectorySecurity {
             || unsafe { SetSecurityDescriptorControl(raw, SE_DACL_PROTECTED, SE_DACL_PROTECTED) }
                 == 0
         {
-            return Err(error("설치 폴더의 보안 정보를 만들 수 없습니다"));
+            return Err(error(tr(
+                "설치 폴더의 보안 정보를 만들 수 없습니다",
+                "Cannot create security information for the installation folder",
+            )));
         }
         Ok(Self {
             descriptor,
@@ -503,15 +567,24 @@ fn open_directory(path: &Path) -> Result<File, String> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|err| format!("설치 폴더를 열 수 없습니다 ({}): {err}", path.display()))?;
+        .map_err(|err| {
+            crate::trf!(
+                "설치 폴더를 열 수 없습니다 ({}): {err}",
+                "Cannot open the installation folder ({}): {err}",
+                path.display()
+            )
+        })?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(error("설치 폴더를 확인할 수 없습니다"));
+        return Err(error(tr(
+            "설치 폴더를 확인할 수 없습니다",
+            "Cannot verify the installation folder",
+        )));
     }
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
     {
-        return Err("설치 경로에 폴더 연결 또는 다른 파일이 있어 연결 설정을 중단했습니다.".into());
+        return Err(tr("설치 경로에 폴더 연결 또는 다른 파일이 있어 연결 설정을 중단했습니다.", "Association setup stopped because the installation path contains a directory link or another file.").into());
     }
     Ok(file)
 }
@@ -521,14 +594,20 @@ fn protected_directory(file: &File, require_admin_owner: bool) -> Result<(), Str
     let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     unsafe { GetKernelObjectSecurity(file.as_raw_handle(), information, null_mut(), 0, &mut size) };
     if size == 0 {
-        return Err(error("설치 파일의 보안 정보를 읽을 수 없습니다"));
+        return Err(error(tr(
+            "설치 파일의 보안 정보를 읽을 수 없습니다",
+            "Cannot read security information for the installation file",
+        )));
     }
     let mut descriptor = vec![0_u32; (size as usize).div_ceil(4)];
     let raw = descriptor.as_mut_ptr().cast();
     if unsafe { GetKernelObjectSecurity(file.as_raw_handle(), information, raw, size, &mut size) }
         == 0
     {
-        return Err(error("설치 파일의 보안 정보를 읽을 수 없습니다"));
+        return Err(error(tr(
+            "설치 파일의 보안 정보를 읽을 수 없습니다",
+            "Cannot read security information for the installation file",
+        )));
     }
     // Windows returned a valid self-relative descriptor in the live allocation.
     unsafe { validate_security_descriptor(raw, require_admin_owner) }
@@ -563,7 +642,7 @@ unsafe fn validate_security_descriptor(
         || owner.is_null()
         || !trusted(owner)
     {
-        return Err("설치 폴더의 소유자가 관리자 또는 Windows 시스템이 아닙니다. 안전한 Program Files 폴더가 필요합니다.".into());
+        return Err(tr("설치 폴더의 소유자가 관리자 또는 Windows 시스템이 아닙니다. 안전한 Program Files 폴더가 필요합니다.", "The installation folder is not owned by administrators or Windows System. A secure Program Files folder is required.").into());
     }
     let mut present = 0;
     let mut acl = null_mut();
@@ -571,7 +650,11 @@ unsafe fn validate_security_descriptor(
         || present == 0
         || acl.is_null()
     {
-        return Err("설치 폴더가 일반 사용자의 쓰기 접근으로부터 보호되어 있지 않습니다.".into());
+        return Err(tr(
+            "설치 폴더가 일반 사용자의 쓰기 접근으로부터 보호되어 있지 않습니다.",
+            "The installation folder is not protected against write access by standard users.",
+        )
+        .into());
     }
     const MUTATING: u32 = GENERIC_ALL
         | GENERIC_WRITE
@@ -586,7 +669,10 @@ unsafe fn validate_security_descriptor(
     for index in 0..unsafe { (*acl).AceCount } {
         let mut raw_ace = null_mut();
         if unsafe { GetAce(acl, index as u32, &mut raw_ace) } == 0 {
-            return Err(error("설치 폴더의 접근 권한을 확인할 수 없습니다"));
+            return Err(error(tr(
+                "설치 폴더의 접근 권한을 확인할 수 없습니다",
+                "Cannot verify installation folder permissions",
+            )));
         }
         let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
         // Program Files may inherit Creator Owner rules. The app's own folder and
@@ -600,23 +686,37 @@ unsafe fn validate_security_descriptor(
                 let identity = (&ace.SidStart as *const u32).cast_mut().cast();
                 if ace.Mask & MUTATING != 0 && !trusted(identity) {
                     return Err(
-                        "설치 폴더에 일반 사용자의 쓰기 권한이 있어 연결 설정을 중단했습니다."
+                        tr("설치 폴더에 일반 사용자의 쓰기 권한이 있어 연결 설정을 중단했습니다.", "Association setup stopped because standard users have write access to the installation folder.")
                             .into(),
                     );
                 }
             }
             1 => {} // Deny ACEs never grant a write permission.
-            _ => return Err("설치 폴더에 확인할 수 없는 접근 권한 규칙이 있습니다.".into()),
+            _ => {
+                return Err(tr(
+                    "설치 폴더에 확인할 수 없는 접근 권한 규칙이 있습니다.",
+                    "The installation folder contains an access rule that cannot be verified.",
+                )
+                .into())
+            }
         }
     }
     Ok(())
 }
 
 fn files_equal(left: &Path, right: &Path) -> Result<bool, String> {
-    let mut left =
-        File::open(left).map_err(|err| format!("실행 파일을 읽을 수 없습니다: {err}"))?;
-    let mut right =
-        File::open(right).map_err(|err| format!("설치된 실행 파일을 읽을 수 없습니다: {err}"))?;
+    let mut left = File::open(left).map_err(|err| {
+        crate::trf!(
+            "실행 파일을 읽을 수 없습니다: {err}",
+            "Cannot read the executable: {err}"
+        )
+    })?;
+    let mut right = File::open(right).map_err(|err| {
+        crate::trf!(
+            "설치된 실행 파일을 읽을 수 없습니다: {err}",
+            "Cannot read the installed executable: {err}"
+        )
+    })?;
     if left.metadata().map_err(|err| err.to_string())?.len()
         != right.metadata().map_err(|err| err.to_string())?.len()
     {
@@ -645,28 +745,39 @@ fn open_protected_executable(path: &Path) -> Result<File, String> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|err| format!("설치된 실행 파일을 확인할 수 없습니다: {err}"))?;
+        .map_err(|err| {
+            crate::trf!(
+                "설치된 실행 파일을 확인할 수 없습니다: {err}",
+                "Cannot verify the installed executable: {err}"
+            )
+        })?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(error("설치된 실행 파일을 확인할 수 없습니다"));
+        return Err(error(tr(
+            "설치된 실행 파일을 확인할 수 없습니다",
+            "Cannot verify the installed executable",
+        )));
     }
     if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
-        return Err("설치할 실행 파일 위치에 링크 또는 폴더가 있어 중단했습니다.".into());
+        return Err(tr(
+            "설치할 실행 파일 위치에 링크 또는 폴더가 있어 중단했습니다.",
+            "Installation stopped because the executable destination is a link or a folder.",
+        )
+        .into());
     }
     protected_directory(&file, true)?;
     Ok(file)
 }
 
-fn install_executable(target: &Path) -> Result<(), String> {
-    let source = std::env::current_exe().map_err(|err| err.to_string())?;
-    if source
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("taskmgr.exe"))
-    {
-        return Err("실행 파일 이름이 taskmgr.exe이면 Windows 실행 연결이 반복될 수 있습니다. FeatherTaskManager.exe로 이름을 복원하세요.".into());
-    }
-    let folder = target.parent().ok_or("설치 폴더가 없습니다.")?;
-    let program_files = folder.parent().ok_or("Program Files 폴더가 없습니다.")?;
+fn lock_install_directory(target: &Path) -> Result<(Vec<File>, File), String> {
+    let folder = target.parent().ok_or(tr(
+        "설치 폴더가 없습니다.",
+        "The installation folder is missing.",
+    ))?;
+    let program_files = folder.parent().ok_or(tr(
+        "Program Files 폴더가 없습니다.",
+        "The Program Files folder is missing.",
+    ))?;
     // Lock each existing ancestor and reject junctions/symlinks before creating.
     let mut locks = Vec::new();
     for ancestor in program_files
@@ -677,7 +788,13 @@ fn install_executable(target: &Path) -> Result<(), String> {
     {
         locks.push(open_directory(ancestor)?);
     }
-    protected_directory(locks.last().ok_or("Program Files 폴더가 없습니다.")?, false)?;
+    protected_directory(
+        locks.last().ok_or(tr(
+            "Program Files 폴더가 없습니다.",
+            "The Program Files folder is missing.",
+        ))?,
+        false,
+    )?;
     let mut security = DirectorySecurity::new()?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -687,16 +804,79 @@ fn install_executable(target: &Path) -> Result<(), String> {
     if unsafe { CreateDirectoryW(wide(folder).as_ptr(), &attributes) } == 0
         && std::io::Error::last_os_error().raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32)
     {
-        return Err(error("Program Files에 설치하려면 관리자 권한이 필요합니다"));
+        return Err(error(tr(
+            "Program Files에 설치하려면 관리자 권한이 필요합니다",
+            "Administrator privileges are required to install in Program Files",
+        )));
     }
     let folder_lock = open_directory(folder)?;
     protected_directory(&folder_lock, true)?;
+    Ok((locks, folder_lock))
+}
+
+/// Installer-only helper. It prepares the fixed protected directory, without
+/// copying the application or changing the Task Manager association.
+pub fn prepare_install_directory() -> Result<(), String> {
+    lock_install_directory(&install_path()?).map(|_| ())
+}
+
+/// Verify the installer's extracted executable and its parent before success.
+pub fn validate_installation() -> Result<(), String> {
+    let target = install_path()?;
+    let mut locks = Vec::new();
+    for parent in target
+        .parent()
+        .ok_or(tr(
+            "설치 폴더가 없습니다.",
+            "The installation folder is missing.",
+        ))?
+        .ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        locks.push(open_directory(parent)?);
+    }
+    protected_directory(
+        locks.last().ok_or(tr(
+            "설치 폴더가 없습니다.",
+            "The installation folder is missing.",
+        ))?,
+        true,
+    )?;
+    open_protected_executable(&target)?;
+    Ok(())
+}
+
+fn install_executable(target: &Path) -> Result<(), String> {
+    let source = std::env::current_exe().map_err(|err| err.to_string())?;
+    if source
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("taskmgr.exe"))
+    {
+        return Err(tr("실행 파일 이름이 taskmgr.exe이면 Windows 실행 연결이 반복될 수 있습니다. FeatherTaskManager.exe로 이름을 복원하세요.", "Naming the executable taskmgr.exe can cause a Windows launch loop. Restore its name to FeatherTaskManager.exe.").into());
+    }
+    let folder = target.parent().ok_or(tr(
+        "설치 폴더가 없습니다.",
+        "The installation folder is missing.",
+    ))?;
+    let (locks, folder_lock) = lock_install_directory(target)?;
+    let mut security = DirectorySecurity::new()?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: (&mut security.descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+        bInheritHandle: 0,
+    };
     if let Ok(metadata) = std::fs::symlink_metadata(target) {
         use std::os::windows::fs::MetadataExt;
         if metadata.file_attributes() & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
             != 0
         {
-            return Err("설치할 실행 파일 위치에 링크 또는 폴더가 있어 중단했습니다.".into());
+            return Err(tr(
+                "설치할 실행 파일 위치에 링크 또는 폴더가 있어 중단했습니다.",
+                "Installation stopped because the executable destination is a link or a folder.",
+            )
+            .into());
         }
         // Matching bytes do not make a user-writable binary safe for global IFEO.
         let _target_lock = open_protected_executable(target)?;
@@ -714,8 +894,12 @@ fn install_executable(target: &Path) -> Result<(), String> {
     ));
     let mut temporary_created = false;
     let result = (|| {
-        let mut input =
-            File::open(&source).map_err(|err| format!("실행 파일을 읽을 수 없습니다: {err}"))?;
+        let mut input = File::open(&source).map_err(|err| {
+            crate::trf!(
+                "실행 파일을 읽을 수 없습니다: {err}",
+                "Cannot read the executable: {err}"
+            )
+        })?;
         // Apply an explicit protected ACL to the file too: existing directory
         // inheritance is never allowed to make the elevated launch target mutable.
         let raw = unsafe {
@@ -730,13 +914,20 @@ fn install_executable(target: &Path) -> Result<(), String> {
             )
         };
         if raw == INVALID_HANDLE_VALUE {
-            return Err(error("설치 파일을 만들 수 없습니다"));
+            return Err(error(tr(
+                "설치 파일을 만들 수 없습니다",
+                "Cannot create the installation file",
+            )));
         }
         temporary_created = true;
         let mut output = unsafe { File::from_raw_handle(raw) };
         protected_directory(&output, true)?;
-        std::io::copy(&mut input, &mut output)
-            .map_err(|err| format!("실행 파일을 복사할 수 없습니다: {err}"))?;
+        std::io::copy(&mut input, &mut output).map_err(|err| {
+            crate::trf!(
+                "실행 파일을 복사할 수 없습니다: {err}",
+                "Cannot copy the executable: {err}"
+            )
+        })?;
         output.flush().map_err(|err| err.to_string())?;
         output.sync_all().map_err(|err| err.to_string())?;
         drop(output);
@@ -748,9 +939,13 @@ fn install_executable(target: &Path) -> Result<(), String> {
             )
         } == 0
         {
-            return Err(format!(
+            return Err(crate::trf!(
                 "{}. 설치된 Feather Task Manager가 실행 중이면 닫고 다시 시도하세요.",
-                error("설치 파일을 교체할 수 없습니다")
+                "{}. If the installed Feather Task Manager is running, close it and try again.",
+                error(tr(
+                    "설치 파일을 교체할 수 없습니다",
+                    "Cannot replace the installation file"
+                ))
             ));
         }
         open_protected_executable(target)?;
@@ -768,7 +963,28 @@ fn install_executable(target: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{with_language, Language};
     use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER, REG_BINARY};
+
+    #[test]
+    fn english_association_errors_and_unknown_status_are_localized() {
+        with_language(Language::English, || {
+            assert_eq!(
+                debugger_command(Path::new("relative.exe")).unwrap_err(),
+                "This executable path cannot be used for the Task Manager association."
+            );
+            assert!(registry_error(ERROR_FILE_NOT_FOUND)
+                .starts_with("Cannot access the Task Manager association settings:"));
+            let invalid = Value {
+                kind: REG_BINARY,
+                bytes: vec![1],
+            };
+            assert_eq!(
+                classify(Some(&invalid), "expected"),
+                Status::Other("Unrecognized Debugger setting format".into())
+            );
+        });
+    }
 
     #[test]
     fn commands_quote_paths_and_refuse_recursive_names() {

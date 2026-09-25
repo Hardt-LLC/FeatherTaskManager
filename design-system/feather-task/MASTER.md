@@ -28,6 +28,8 @@ The generator's marketing-page sections and web fonts are not suitable for this 
 - Show loading, empty, failure and stale states. Never display unavailable metrics as successfully measured zero.
 - Start/stop services and enable/disable startup only on explicit user action; retain selected identity during confirmation and asynchronous work.
 - Settings uses an on-demand native popup for administrator launch and Windows Task Manager replacement/restore. Show the current association; disable changes that would overwrite another program. Explain the all-user scope, permanent installation location and restore-before-delete requirement before UAC. No extra background polling or elevation during ordinary startup.
+- Shortcut labels and descriptions use separate fixed columns, with no space padding. Korean uses Malgun Gothic and English uses Segoe UI; changing language updates native controls immediately.
+- Process list/tree modes share numeric columns. Tree indentation and branch chevrons occupy only the name column. Tree search includes ancestor context; termination confirmation captures identities and includes collapsed descendants.
 
 ## Verification
 - Contrast for normal text >=4.5:1; icons/state boundaries >=3:1 when meaningful.

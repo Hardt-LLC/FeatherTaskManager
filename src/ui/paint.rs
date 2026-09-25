@@ -70,9 +70,9 @@ fn uptime(seconds: u64) -> String {
     let hours = seconds % 86400 / 3600;
     let mins = seconds % 3600 / 60;
     if days > 0 {
-        format!("{days}일 {hours}시간")
+        tf!("{days}일 {hours}시간", "{days}d {hours}h")
     } else {
-        format!("{hours}시간 {mins}분")
+        tf!("{hours}시간 {mins}분", "{hours}h {mins}m")
     }
 }
 
@@ -124,7 +124,7 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
         dc,
         (*p).small,
         rgb(155, 173, 200),
-        "내 컴퓨터",
+        tr("내 컴퓨터", "My computer"),
         rect(p, 24, 100, 145, 18),
         DT_SINGLELINE,
     );
@@ -147,14 +147,14 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
         dc,
         (*p).small,
         rgb(176, 191, 213),
-        "바로 가기",
+        tr("바로 가기", "Shortcuts"),
         rect(p, 24, 369, 140, 20),
         DT_SINGLELINE,
     );
-    for (i, value) in [
-        "Ctrl+1…4    화면 이동",
-        "Ctrl+F          검색",
-        "F5                 새로고침",
+    for (i, (shortcut, action)) in [
+        ("Ctrl+1…4", tr("화면 이동", "Navigate")),
+        ("Ctrl+F", tr("검색", "Search")),
+        ("F5", tr("새로고침", "Refresh")),
     ]
     .iter()
     .enumerate()
@@ -163,9 +163,17 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
             dc,
             (*p).small,
             rgb(151, 170, 198),
-            value,
-            rect(p, 24, 399 + i as i32 * 26, 156, 20),
-            DT_SINGLELINE,
+            shortcut,
+            rect(p, 24, 399 + i as i32 * 26, 68, 20),
+            DT_SINGLELINE | DT_VCENTER,
+        );
+        label(
+            dc,
+            (*p).small,
+            rgb(151, 170, 198),
+            action,
+            rect(p, 104, 399 + i as i32 * 26, 76, 20),
+            DT_SINGLELINE | DT_VCENTER,
         );
     }
     circle(dc, s(25), height - s(28), s(3), rgb(80, 203, 154));
@@ -173,7 +181,7 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
         dc,
         (*p).small,
         rgb(176, 191, 213),
-        concat!("로컬 모니터링   ·   v", env!("CARGO_PKG_VERSION")),
+        &format!("{} · v{}", tr("로컬", "Local"), env!("CARGO_PKG_VERSION")),
         RECT {
             left: s(37),
             top: height - s(37),
@@ -213,7 +221,11 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
         t.elapsed() > Duration::from_millis((*p).interval.saturating_mul(3).max(5000))
     });
     let (status, color, bg) = if (*p).error.is_some() {
-        ("확인 필요", DANGER, rgb(255, 236, 238))
+        (
+            tr("확인 필요", "Needs attention"),
+            DANGER,
+            rgb(255, 236, 238),
+        )
     } else if (*p).page == Page::Performance
         && ((*p).performance_error.is_some()
             || (*p)
@@ -221,25 +233,33 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
                 .as_ref()
                 .is_some_and(|v| !v.warnings.is_empty()))
     {
-        ("일부 확인 필요", rgb(149, 96, 0), rgb(255, 245, 219))
+        (
+            tr("일부 확인 필요", "Partial data"),
+            rgb(149, 96, 0),
+            rgb(255, 245, 219),
+        )
     } else if (*p).paused {
-        ("일시정지", MUTED, rgb(230, 235, 243))
+        (tr("일시정지", "Paused"), MUTED, rgb(230, 235, 243))
     } else if (*p).busy {
-        ("처리 중", BLUE, SELECTED)
+        (tr("처리 중", "Working"), BLUE, SELECTED)
     } else if ((*p).page == Page::Startup && (*p).startup_loading)
         || ((*p).page == Page::Services && (*p).services_loading)
     {
-        ("불러오는 중", MUTED, rgb(230, 235, 243))
+        (tr("불러오는 중", "Loading"), MUTED, rgb(230, 235, 243))
     } else if (*p).page == Page::Startup && (*p).startup_loaded {
-        ("수동 갱신", MUTED, rgb(230, 235, 243))
+        (tr("수동 갱신", "Manual refresh"), MUTED, rgb(230, 235, 243))
     } else if (*p).page == Page::Performance && (*p).performance.is_none() {
-        ("연결 중", BLUE, SELECTED)
+        (tr("연결 중", "Connecting"), BLUE, SELECTED)
     } else if stale {
-        ("업데이트 대기", rgb(149, 96, 0), rgb(255, 245, 219))
+        (
+            tr("업데이트 대기", "Waiting for update"),
+            rgb(149, 96, 0),
+            rgb(255, 245, 219),
+        )
     } else if (*p).snapshot.is_none() {
-        ("불러오는 중", MUTED, rgb(230, 235, 243))
+        (tr("불러오는 중", "Loading"), MUTED, rgb(230, 235, 243))
     } else {
-        ("실시간", GREEN, rgb(226, 245, 235))
+        (tr("실시간", "Live"), GREEN, rgb(226, 245, 235))
     };
     let badge = RECT {
         left: width - s(142),
@@ -265,11 +285,11 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
         dc,
         (*p).small,
         MUTED,
-        "갱신 간격",
+        tr("갱신 간격", "Refresh interval"),
         RECT {
             left: width - s(280),
             top: s(184),
-            right: width - s(204),
+            right: width - s(170),
             bottom: s(204),
         },
         DT_SINGLELINE,
@@ -280,14 +300,21 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
             .performance
             .as_ref()
             .map(|perf| {
-                format!(
+                tf!(
                     "{}  ·  논리 CPU {}개  ·  가동 {}",
+                    "{}  ·  {} logical CPUs  ·  Up {}",
                     perf.cpu_name,
                     perf.logical_cpus,
                     uptime(perf.uptime_seconds)
                 )
             })
-            .unwrap_or_else(|| "성능 카운터를 연결하고 있습니다…".into());
+            .unwrap_or_else(|| {
+                tr(
+                    "성능 카운터를 연결하고 있습니다…",
+                    "Connecting performance counters…",
+                )
+                .into()
+            });
         label(
             dc,
             (*p).small,
@@ -307,7 +334,7 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
             dc,
             (*p).small,
             MUTED,
-            "검색",
+            tr("검색", "Search"),
             RECT {
                 left,
                 top: s(184),
@@ -363,9 +390,14 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
             _ => false,
         };
         let count = if loading {
-            "목록을 불러오는 중…".into()
+            tr("목록을 불러오는 중…", "Loading the list…").into()
         } else {
-            format!("{}개 표시 · 전체 {}개", (*p).rows.len(), total_rows(p))
+            tf!(
+                "{}개 표시 · 전체 {}개",
+                "{} shown · {} total",
+                (*p).rows.len(),
+                total_rows(p)
+            )
         };
         label(
             dc,
@@ -380,6 +412,25 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
             },
             DT_SINGLELINE,
         );
+        if (*p).page == Page::Processes && (*p).tree_mode {
+            label(
+                dc,
+                (*p).small,
+                MUTED,
+                if (&(*p).filter).is_empty() {
+                    tr("← / → 펼치기·접기", "← / → expand or collapse")
+                } else {
+                    tr("일치 항목과 상위 프로세스", "Matches and their ancestors")
+                },
+                RECT {
+                    left: left + s(220),
+                    top: s(248),
+                    right: width - s(24),
+                    bottom: s(266),
+                },
+                DT_RIGHT | DT_SINGLELINE,
+            );
+        }
         let detail = selected_detail(p);
         label(
             dc,
@@ -389,40 +440,58 @@ pub(super) unsafe fn paint_to(p: *mut App, dc: HDC) {
             RECT {
                 left,
                 top: height - s(80),
-                right: width - s(316),
+                right: width
+                    - s(if (*p).page == Page::Processes {
+                        480
+                    } else {
+                        328
+                    }),
                 bottom: height - s(38),
             },
             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
         );
     }
     let status_text = if let Some(error) = &(*p).error {
-        format!("확인 필요: {error}")
+        tf!("확인 필요: {error}", "Needs attention: {error}")
     } else if !(&(*p).notice).is_empty() {
         (*p).notice.clone()
     } else if (*p).page == Page::Performance {
         if let Some(error) = &(*p).performance_error {
-            format!("성능 정보: {error}")
+            tf!("성능 정보: {error}", "Performance: {error}")
         } else if let Some(perf) = &(*p).performance {
             if !perf.warnings.is_empty() {
                 perf.warnings.join(" · ")
             } else {
-                "디스크: 가장 바쁜 장치 · GPU: 가장 바쁜 엔진 · 네트워크: 활성 물리 어댑터 합계"
+                tr("디스크: 가장 바쁜 장치 · GPU: 가장 바쁜 엔진 · 네트워크: 활성 물리 어댑터 합계", "Disk: busiest device · GPU: busiest engine · Network: active physical adapters")
                     .into()
             }
         } else {
-            "성능 정보는 이 화면을 보고 있을 때만 수집합니다.".into()
+            tr(
+                "성능 정보는 이 화면을 보고 있을 때만 수집합니다.",
+                "Performance counters are collected only while this page is open.",
+            )
+            .into()
         }
     } else if (*p).page == Page::Startup {
-        "자동 시작 항목: Run 레지스트리 · 시작프로그램 폴더".into()
+        tr(
+            "자동 시작 항목: Run 레지스트리 · 시작프로그램 폴더",
+            "Startup sources: Run registry keys · Startup folders",
+        )
+        .into()
     } else if (*p).page == Page::Services {
-        "시작·중지 요청 후 상태가 바뀌는 데 시간이 걸릴 수 있습니다. 서비스 목록은 5초마다 갱신합니다.".into()
+        tr("시작·중지 요청 후 상태가 바뀌는 데 시간이 걸릴 수 있습니다. 서비스 목록은 5초마다 갱신합니다.", "Service state changes may take time. This list refreshes every 5 seconds.").into()
     } else {
-        format!(
+        tf!(
             "{}  ·  수집 {:.1} ms  ·  최소화하면 자동으로 수집을 멈춥니다.",
+            "{}  ·  Sample {:.1} ms  ·  Monitoring pauses when minimized.",
             if (*p).paused {
-                "일시정지".into()
+                tr("일시정지", "Paused").into()
             } else {
-                format!("{:.1}초마다 갱신", (*p).interval as f64 / 1000.0)
+                tf!(
+                    "{:.1}초마다 갱신",
+                    "Refresh every {:.1} s",
+                    (*p).interval as f64 / 1000.0
+                )
             },
             (*p).snapshot.as_ref().map_or(0.0, |s| s.sample_ms)
         )
@@ -468,45 +537,55 @@ unsafe fn summary_cards(p: *mut App, dc: HDC, left: i32, right: i32) {
         .unwrap_or_else(|| "—".into());
     let cards: Vec<(&str, String, String, u32)> = match (*p).page {
         Page::Processes => vec![
-            ("CPU 사용량", cpu, "전체 프로세서 기준".into(), BLUE),
             (
-                "물리 메모리",
+                tr("CPU 사용량", "CPU usage"),
+                cpu,
+                tr("전체 프로세서 기준", "All logical processors").into(),
+                BLUE,
+            ),
+            (
+                tr("물리 메모리", "Physical memory"),
                 mem,
-                snap.map(|s| format!("전체 {}", human_bytes(s.memory_total as f64)))
+                snap.map(|s| tf!("전체 {}", "{} total", human_bytes(s.memory_total as f64)))
                     .unwrap_or_default(),
                 rgb(115, 79, 198),
             ),
             (
-                "실행 중인 프로세스",
+                tr("실행 중인 프로세스", "Running processes"),
                 snap.map(|s| s.processes.len().to_string())
                     .unwrap_or_else(|| "—".into()),
-                "앱과 백그라운드 작업".into(),
+                tr("앱과 백그라운드 작업", "Apps and background tasks").into(),
                 rgb(15, 120, 112),
             ),
         ],
         Page::Performance => vec![
-            ("CPU", cpu, "전체 프로세서".into(), BLUE),
             (
-                "메모리",
+                "CPU",
+                cpu,
+                tr("전체 프로세서", "All processors").into(),
+                BLUE,
+            ),
+            (
+                tr("메모리", "Memory"),
                 mem,
-                snap.map(|s| format!("전체 {}", human_bytes(s.memory_total as f64)))
+                snap.map(|s| tf!("전체 {}", "{} total", human_bytes(s.memory_total as f64)))
                     .unwrap_or_default(),
                 rgb(115, 79, 198),
             ),
             (
-                "디스크 활성 시간",
+                tr("디스크 활성 시간", "Disk active time"),
                 perf.and_then(|s| s.disk_active_percent)
                     .map(|v| format!("{v:.1}%"))
                     .unwrap_or_else(|| "—".into()),
-                "가장 바쁜 장치".into(),
+                tr("가장 바쁜 장치", "Busiest device").into(),
                 rgb(15, 120, 112),
             ),
             (
-                "GPU 엔진",
+                tr("GPU 엔진", "GPU engine"),
                 perf.and_then(|s| s.gpu_percent)
                     .map(|v| format!("{v:.1}%"))
                     .unwrap_or_else(|| "—".into()),
-                "가장 바쁜 엔진".into(),
+                tr("가장 바쁜 엔진", "Busiest engine").into(),
                 rgb(166, 88, 10),
             ),
         ],
@@ -516,33 +595,33 @@ unsafe fn summary_cards(p: *mut App, dc: HDC, left: i32, right: i32) {
             let managed = (*p).startup.iter().filter(|e| e.manageable).count();
             vec![
                 (
-                    "시작 앱",
+                    tr("시작 앱", "Startup apps"),
                     if (*p).startup_loaded {
                         all.to_string()
                     } else {
                         "—".into()
                     },
-                    "등록된 자동 실행 항목".into(),
+                    tr("등록된 자동 실행 항목", "Registered startup entries").into(),
                     BLUE,
                 ),
                 (
-                    "사용",
+                    tr("사용", "Enabled"),
                     if (*p).startup_loaded {
                         on.to_string()
                     } else {
                         "—".into()
                     },
-                    "로그인 시 자동 실행".into(),
+                    tr("로그인 시 자동 실행", "Run automatically at sign-in").into(),
                     GREEN,
                 ),
                 (
-                    "변경 가능한 항목",
+                    tr("변경 가능한 항목", "Manageable entries"),
                     if (*p).startup_loaded {
                         managed.to_string()
                     } else {
                         "—".into()
                     },
-                    "지원되는 상태의 항목".into(),
+                    tr("지원되는 상태의 항목", "Entries with supported state").into(),
                     rgb(115, 79, 198),
                 ),
             ]
@@ -553,33 +632,33 @@ unsafe fn summary_cards(p: *mut App, dc: HDC, left: i32, right: i32) {
             let stopped = (*p).services.iter().filter(|s| s.state == 1).count();
             vec![
                 (
-                    "등록된 서비스",
+                    tr("등록된 서비스", "Registered services"),
                     if (*p).services_loaded {
                         all.to_string()
                     } else {
                         "—".into()
                     },
-                    "Windows 서비스".into(),
+                    tr("Windows 서비스", "Windows services").into(),
                     BLUE,
                 ),
                 (
-                    "실행 중",
+                    tr("실행 중", "Running"),
                     if (*p).services_loaded {
                         running.to_string()
                     } else {
                         "—".into()
                     },
-                    "백그라운드에서 동작".into(),
+                    tr("백그라운드에서 동작", "Active in the background").into(),
                     GREEN,
                 ),
                 (
-                    "중지됨",
+                    tr("중지됨", "Stopped"),
                     if (*p).services_loaded {
                         stopped.to_string()
                     } else {
                         "—".into()
                     },
-                    "현재 실행하지 않음".into(),
+                    tr("현재 실행하지 않음", "Not currently running").into(),
                     MUTED,
                 ),
             ]
@@ -681,28 +760,62 @@ unsafe fn performance_panels(p: *mut App, dc: HDC, left: i32, right: i32, top: i
     let disk = perf
         .filter(|s| s.disk_rates_ready)
         .map(|s| {
-            format!(
+            tf!(
                 "읽기 {}  ·  쓰기 {} /s",
+                "Read {}  ·  Write {} /s",
                 human_bytes(s.disk_read_bytes_per_sec),
                 human_bytes(s.disk_write_bytes_per_sec)
             )
         })
-        .unwrap_or_else(|| "측정 대기 · 카운터 상태 확인 중".into());
+        .unwrap_or_else(|| {
+            tr(
+                "측정 대기 · 카운터 상태 확인 중",
+                "Waiting for counter data",
+            )
+            .into()
+        });
     let network = perf
         .filter(|s| s.network_rates_ready)
         .map(|s| {
-            format!(
+            tf!(
                 "수신 {}  ·  송신 {} /s",
+                "Receive {}  ·  Send {} /s",
                 human_bytes(s.network_rx_bytes_per_sec),
                 human_bytes(s.network_tx_bytes_per_sec)
             )
         })
-        .unwrap_or_else(|| "측정 대기 · 어댑터 상태 확인 중".into());
+        .unwrap_or_else(|| {
+            tr(
+                "측정 대기 · 어댑터 상태 확인 중",
+                "Waiting for adapter data",
+            )
+            .into()
+        });
     let specs = [
-        ("CPU", cpu, "전체 CPU 사용률", BLUE),
-        ("메모리", memory, "물리 메모리 사용률", rgb(115, 79, 198)),
-        ("디스크", disk, "읽기 + 쓰기 처리량", rgb(15, 120, 112)),
-        ("네트워크", network, "수신 + 송신 처리량", rgb(166, 88, 10)),
+        (
+            "CPU",
+            cpu,
+            tr("전체 CPU 사용률", "Total CPU utilization"),
+            BLUE,
+        ),
+        (
+            tr("메모리", "Memory"),
+            memory,
+            tr("물리 메모리 사용률", "Physical memory utilization"),
+            rgb(115, 79, 198),
+        ),
+        (
+            tr("디스크", "Disk"),
+            disk,
+            tr("읽기 + 쓰기 처리량", "Read + write throughput"),
+            rgb(15, 120, 112),
+        ),
+        (
+            tr("네트워크", "Network"),
+            network,
+            tr("수신 + 송신 처리량", "Receive + send throughput"),
+            rgb(166, 88, 10),
+        ),
     ];
     for (i, (title, value, hint, color)) in specs.iter().enumerate() {
         let x = left + (i % 2) as i32 * (w + gap);
@@ -731,7 +844,7 @@ unsafe fn performance_panels(p: *mut App, dc: HDC, left: i32, right: i32, top: i
             dc,
             (*p).small,
             MUTED,
-            "최근 60초",
+            tr("최근 60초", "Last 60 seconds"),
             RECT {
                 left: x + w - scale(p, 100),
                 top: y + scale(p, 14),
@@ -744,12 +857,28 @@ unsafe fn performance_panels(p: *mut App, dc: HDC, left: i32, right: i32, top: i
         let value_y = if compact { 37 } else { 44 };
         let pair = perf.and_then(|s| match i {
             2 if s.disk_rates_ready => Some((
-                format!("읽기 {}/s", human_bytes(s.disk_read_bytes_per_sec)),
-                format!("쓰기 {}/s", human_bytes(s.disk_write_bytes_per_sec)),
+                tf!(
+                    "읽기 {}/s",
+                    "Read {}/s",
+                    human_bytes(s.disk_read_bytes_per_sec)
+                ),
+                tf!(
+                    "쓰기 {}/s",
+                    "Write {}/s",
+                    human_bytes(s.disk_write_bytes_per_sec)
+                ),
             )),
             3 if s.network_rates_ready => Some((
-                format!("수신 {}/s", human_bytes(s.network_rx_bytes_per_sec)),
-                format!("송신 {}/s", human_bytes(s.network_tx_bytes_per_sec)),
+                tf!(
+                    "수신 {}/s",
+                    "Receive {}/s",
+                    human_bytes(s.network_rx_bytes_per_sec)
+                ),
+                tf!(
+                    "송신 {}/s",
+                    "Send {}/s",
+                    human_bytes(s.network_tx_bytes_per_sec)
+                ),
             )),
             _ => None,
         });
@@ -886,7 +1015,7 @@ unsafe fn graph(p: *mut App, dc: HDC, r: RECT, kind: usize, color: u32) {
             dc,
             (*p).small,
             MUTED,
-            "데이터를 수집하고 있습니다",
+            tr("데이터를 수집하고 있습니다", "Collecting data"),
             r,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
@@ -1051,4 +1180,87 @@ pub(super) unsafe fn draw_button(p: *mut App, item: &DRAWITEMSTRUCT) {
         SelectObject(dc, old);
         DeleteObject(pen);
     }
+}
+
+/// Draw tree indentation in device pixels, keeping every numeric column aligned.
+pub(super) unsafe fn tree_cell(
+    p: *mut App,
+    dc: HDC,
+    bounds: RECT,
+    row: &TreeRow,
+    name: &str,
+    background: u32,
+) {
+    let saved = SaveDC(dc);
+    IntersectClipRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
+    fill(dc, bounds, background);
+    let inset = bounds.left + scale(p, 8 + row.depth.min(12) as i32 * 18);
+    let center_y = (bounds.top + bounds.bottom) / 2;
+    if row.depth > 0 {
+        line(
+            dc,
+            &[
+                POINT {
+                    x: inset - scale(p, 5),
+                    y: bounds.top,
+                },
+                POINT {
+                    x: inset - scale(p, 5),
+                    y: center_y,
+                },
+                POINT {
+                    x: inset,
+                    y: center_y,
+                },
+            ],
+            BORDER,
+            scale(p, 1).max(1),
+        );
+    }
+    if row.has_children {
+        let x = inset + scale(p, 6);
+        let d = scale(p, 3);
+        let points = if row.expanded {
+            [
+                POINT {
+                    x: x - d,
+                    y: center_y - d / 2,
+                },
+                POINT { x, y: center_y + d },
+                POINT {
+                    x: x + d,
+                    y: center_y - d / 2,
+                },
+            ]
+        } else {
+            [
+                POINT {
+                    x: x - d / 2,
+                    y: center_y - d,
+                },
+                POINT {
+                    x: x + d,
+                    y: center_y,
+                },
+                POINT {
+                    x: x - d / 2,
+                    y: center_y + d,
+                },
+            ]
+        };
+        line(dc, &points, MUTED, scale(p, 1).max(1));
+    }
+    label(
+        dc,
+        (*p).font,
+        INK,
+        name,
+        RECT {
+            left: inset + scale(p, 20),
+            right: bounds.right - scale(p, 6),
+            ..bounds
+        },
+        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+    );
+    RestoreDC(dc, saved);
 }
