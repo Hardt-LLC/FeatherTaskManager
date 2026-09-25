@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/app.png" width="112" height="112" alt="Feather Task Manager 깃털 앱 아이콘">
+</p>
+
 # Feather Task Manager 0.2.1
 
 느려진 Windows에서도 빠르게 상태를 확인하고 작업을 정리하기 위한 네이티브 작업 관리자입니다. Rust와 Win32로 만들었으며 브라우저 엔진·WebView·WMI를 사용하지 않습니다. 0.2에는 **성능·시작 앱·서비스** 화면과 새 UI를 추가했습니다.
