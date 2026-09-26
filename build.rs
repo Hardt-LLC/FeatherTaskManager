@@ -96,6 +96,11 @@ fn main() {
         String::from_utf8_lossy(&result.stderr)
     );
     println!("cargo:rustc-link-arg={}", output.display());
+    // Every imported DLL is provided by Windows. Resolve static imports only
+    // from System32, before main runs, so an adjacent DLL cannot be planted next
+    // to the portable executable (including when the user approves elevation).
+    // https://learn.microsoft.com/cpp/build/reference/dependentloadflag
+    println!("cargo:rustc-link-arg=/DEPENDENTLOADFLAG:0x800");
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
 }

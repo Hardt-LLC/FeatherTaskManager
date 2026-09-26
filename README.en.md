@@ -4,7 +4,7 @@
 
 [한국어](README.md) · [Download](https://github.com/Hardt-LLC/FeatherTaskManager/releases/latest)
 
-A lightweight Windows task manager built with Rust and Win32. Supports Windows 10/11 x64.
+A lightweight Windows task manager built with Rust and Win32. Supports Windows 10 version 1607 or later and Windows 11, x64.
 
 ## Benefits
 
@@ -29,7 +29,7 @@ Release executables and installers are signed by **HARDT** through Azure Artifac
 - Open **Processes** to choose **List** or **Process tree**. Select a process to end it or its tree after confirmation.
 - Open **Performance**, **Startup apps** or **Services** for monitoring and management.
 - Select **Settings → English / 한국어** to save your preferred language.
-- To replace Windows Task Manager, select **Settings → Use Feather as Task Manager…** and approve the administrator prompt. This enables `Ctrl+Shift+Esc` and `Ctrl+Alt+Delete → Task Manager`. Select **Restore Windows Task Manager…** before manually deleting the app.
+- To replace Windows Task Manager, install with Setup first, then select **Settings → Use Feather as Task Manager…** and approve the administrator prompt. This enables `Ctrl+Shift+Esc` and `Ctrl+Alt+Delete → Task Manager`. Select **Restore Windows Task Manager…** before manually deleting the app.
 
 | Shortcut | Action |
 | --- | --- |

@@ -13,43 +13,57 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: signed-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: windows-2025
     environment: release
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
     env:
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
       FEATHER_SIGNING_SUBJECT: CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US
       FEATHER_SIGNING_METADATA: ${{ github.workspace }}\installer\signing-metadata.example.json
     defaults:
       run:
         shell: pwsh
     steps:
+      - name: Validate tag input before checkout
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v20\d{2}\.([1-9]|1[0-2])\.([1-9]\d{0,4})$') { throw 'An explicit yyyy.m.x release tag is required.' }
       - name: Check out the release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.tag }}
+          ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
-      - name: Check release version and signing configuration
+          persist-credentials: false
+      - name: Verify the tag is the checked-out main-branch commit
+        id: source
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # Establish provenance using trusted workflow code before executing
+          # any script from the selected tag.
+          $head = git rev-parse --verify 'HEAD^{commit}'
+          if ($LASTEXITCODE -ne 0) { throw 'HEAD could not be resolved.' }
+          $tagCommit = git rev-parse --verify ('refs/tags/' + $env:RELEASE_TAG + '^{commit}')
+          if ($LASTEXITCODE -ne 0 -or $head -cne $tagCommit) { throw 'Checkout does not match the exact release tag.' }
+          git merge-base --is-ancestor $head refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Release tag must belong to origin/main history.' }
+          git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'The checkout contains modified tracked files.' }
           $version = ./scripts/version.ps1
           if ($env:RELEASE_TAG -cne $version.Tag) { throw 'The selected tag does not match Cargo and PE resource versions.' }
-          git show-ref --verify --quiet "refs/tags/$($version.Tag)"
-          if ($LASTEXITCODE -ne 0) { throw 'An existing Git tag is required.' }
-          foreach ($name in 'AZURE_TENANT_ID','AZURE_CLIENT_ID','AZURE_CLIENT_SECRET') {
-            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Configure the $name GitHub Actions secret." }
-          }
+          $commit = ./scripts/verify-release-source.ps1 -Tag $env:RELEASE_TAG
+          "commit=$commit" >> $env:GITHUB_OUTPUT
       - name: Prepare pinned Rust and signing tools
         run: |
           rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
@@ -65,8 +79,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
           cargo test --locked
           if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
-      - name: Build, sign, and verify app, installer, and uninstaller
-        run: ./scripts/build-release.ps1
+          ./scripts/test-release-source.ps1
+          ./scripts/test-remote-release-tag.ps1
+      - name: Build without signing credentials
+        run: ./scripts/build.ps1
+      - name: Sign and verify app, installer, and uninstaller
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: ./scripts/build-release.ps1 -SkipBuild
       - name: Save verified release files
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -78,8 +100,31 @@ jobs:
             dist/FeatherTaskManager-*-Portable-x64.zip
             dist/SHA256SUMS.txt
             dist/release-manifest.json
-      - name: Publish the release
-        if: ${{ inputs.publish }}
+
+  publish:
+    if: ${{ inputs.publish }}
+    needs: build
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    env:
+      FEATHER_SIGNING_SUBJECT: CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the exact verified source commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download only this run's signed release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-${{ inputs.tag }}
+          path: dist
+      - name: Publish the release after rechecking source and signatures
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

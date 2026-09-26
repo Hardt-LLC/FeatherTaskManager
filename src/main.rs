@@ -5,10 +5,10 @@
 compile_error!("Feather Task Manager currently targets 64-bit Windows (x86_64-pc-windows-msvc).");
 
 mod actions;
-mod app_instance;
 mod i18n;
 mod performance;
 mod process_tree;
+mod registry;
 mod replacement;
 mod sampler;
 mod services;
@@ -72,26 +72,6 @@ fn main() {
         }
         return;
     }
-    let _running = match app_instance::track() {
-        Ok(running) => running,
-        Err(error) => {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR};
-            let message: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();
-            let title: Vec<u16> = "Feather Task Manager"
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-            unsafe {
-                MessageBoxW(
-                    std::ptr::null_mut(),
-                    message.as_ptr(),
-                    title.as_ptr(),
-                    MB_ICONERROR,
-                );
-            }
-            std::process::exit(1);
-        }
-    };
     ui::run();
 }
 

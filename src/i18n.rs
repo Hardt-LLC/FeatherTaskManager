@@ -7,8 +7,8 @@ use windows_sys::Win32::{
     Foundation::ERROR_SUCCESS,
     Globalization::GetUserDefaultUILanguage,
     System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY_CURRENT_USER,
-        KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
+        RegGetValueW, RegSetValueExW, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
+        RRF_RT_REG_SZ,
     },
 };
 
@@ -90,12 +90,17 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 fn preferred_language() -> Option<Language> {
+    preferred_language_at(PREFERENCES)
+}
+
+fn preferred_language_at(path: &str) -> Option<Language> {
+    let key = crate::registry::open(HKEY_CURRENT_USER, path, KEY_QUERY_VALUE).ok()??;
     let mut buffer = [0_u16; 8];
     let mut bytes = std::mem::size_of_val(&buffer) as u32;
     let result = unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
-            wide(PREFERENCES).as_ptr(),
+            key.0,
+            null(),
             wide("Language").as_ptr(),
             RRF_RT_REG_SZ,
             null_mut(),
@@ -141,27 +146,18 @@ pub fn initialize(args: &[String]) {
 }
 
 pub fn set_language(selected: Language) -> Result<(), String> {
-    let mut key = null_mut();
-    let result = unsafe {
-        RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            wide(PREFERENCES).as_ptr(),
-            0,
-            null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            null(),
-            &mut key,
-            null_mut(),
-        )
-    };
-    if result != ERROR_SUCCESS {
-        return Err(preference_error(result));
-    }
+    save_language_at(PREFERENCES, selected)?;
+    LANGUAGE.store(u8::from(selected == Language::English), Ordering::Relaxed);
+    Ok(())
+}
+
+fn save_language_at(path: &str, selected: Language) -> Result<(), String> {
+    let key = crate::registry::create(HKEY_CURRENT_USER, path, KEY_SET_VALUE)
+        .map_err(preference_error)?;
     let value = wide(selected.code());
     let result = unsafe {
         RegSetValueExW(
-            key,
+            key.0,
             wide("Language").as_ptr(),
             0,
             REG_SZ,
@@ -169,11 +165,9 @@ pub fn set_language(selected: Language) -> Result<(), String> {
             (value.len() * 2) as u32,
         )
     };
-    unsafe { RegCloseKey(key) };
     if result != ERROR_SUCCESS {
         return Err(preference_error(result));
     }
-    LANGUAGE.store(u8::from(selected == Language::English), Ordering::Relaxed);
     Ok(())
 }
 
@@ -191,6 +185,47 @@ fn preference_error(code: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferences_reject_leaf_and_ancestor_links_without_changing_target() {
+        let fixture = crate::registry::test_support::Fixture::new();
+        let target = fixture.key("UnrelatedTarget");
+        let _nested = fixture.key(r"UnrelatedTarget\Nested");
+        save_language_at(&fixture.path("UnrelatedTarget"), Language::English).unwrap();
+        save_language_at(&fixture.path(r"UnrelatedTarget\Nested"), Language::English).unwrap();
+        let _link = fixture.link("PreferencesLink", Some(&target));
+        let _unfinished = fixture.link("UnfinishedLink", None);
+        for path in [
+            "PreferencesLink",
+            r"PreferencesLink\Nested",
+            r"PreferencesLink\Missing",
+            "UnfinishedLink",
+        ] {
+            assert_eq!(preferred_language_at(&fixture.path(path)), None);
+            assert!(save_language_at(&fixture.path(path), Language::Korean).is_err());
+        }
+        assert_eq!(
+            preferred_language_at(&fixture.path("UnrelatedTarget")),
+            Some(Language::English)
+        );
+        assert_eq!(
+            preferred_language_at(&fixture.path(r"UnrelatedTarget\Nested")),
+            Some(Language::English)
+        );
+        assert!(crate::registry::open(
+            HKEY_CURRENT_USER,
+            &fixture.path(r"UnrelatedTarget\Missing"),
+            KEY_QUERY_VALUE
+        )
+        .unwrap()
+        .is_none());
+        save_language_at(&fixture.path(r"Regular\Preferences"), Language::Korean).unwrap();
+        assert_eq!(
+            preferred_language_at(&fixture.path(r"Regular\Preferences")),
+            Some(Language::Korean)
+        );
+    }
+
     #[test]
     fn command_line_language_is_explicit_and_ignores_ifeo_target_arguments() {
         let args = |values: &[&str]| values.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();

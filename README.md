@@ -18,7 +18,7 @@
 
 ## 설치 및 사용법
 
-**Windows 10/11 x64**에서 사용할 수 있습니다. [최신 릴리스](https://github.com/Hardt-LLC/FeatherTaskManager/releases/latest)에서 원하는 파일을 받으세요.
+**Windows 10 1607 이상 / Windows 11 x64**에서 사용할 수 있습니다. [최신 릴리스](https://github.com/Hardt-LLC/FeatherTaskManager/releases/latest)에서 원하는 파일을 받으세요.
 
 | 파일 | 용도 |
 | --- | --- |
@@ -37,7 +37,7 @@
 | `F5` | 새로고침 |
 | `Shift+Delete` | 선택한 프로세스 트리 종료 확인 |
 
-**Windows 작업 관리자 대체:** 설정에서 **Feather를 작업 관리자로 설정…**을 선택하고 UAC를 승인하세요. 이후 `Ctrl+Shift+Esc`나 `Ctrl+Alt+Delete → 작업 관리자`로 Feather를 실행할 수 있습니다. 원복은 **Windows 기본 작업 관리자로 복원…**에서 합니다. 설치된 파일을 수동 삭제하기 전에는 먼저 연결을 복원하세요.
+**Windows 작업 관리자 대체:** Setup으로 먼저 설치한 뒤, 설정에서 **Feather를 작업 관리자로 설정…**을 선택하고 UAC를 승인하세요. 이후 `Ctrl+Shift+Esc`나 `Ctrl+Alt+Delete → 작업 관리자`로 Feather를 실행할 수 있습니다. 원복은 **Windows 기본 작업 관리자로 복원…**에서 합니다. 설치된 파일을 수동 삭제하기 전에는 먼저 연결을 복원하세요.
 
 업데이트·제거 전에는 Feather 창을 모두 닫으세요. 자세한 내용은 [설치 안내](INSTALLER.md)와 [기능 안내](FEATURES-v2.md)를 참고하세요.
 

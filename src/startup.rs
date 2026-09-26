@@ -10,6 +10,7 @@
 //! scheduled tasks, policies, and startup impact measurements are out of scope.
 
 use crate::i18n::tr;
+use crate::registry::Key;
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -27,6 +28,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN32_NATIVE: &str = r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run";
 const APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved";
 const MAX_VALUE_BYTES: usize = 1024 * 1024;
 
@@ -97,13 +99,7 @@ struct FileIdentity {
     attributes: u32,
 }
 
-struct Key(HKEY);
-impl Drop for Key {
-    fn drop(&mut self) {
-        unsafe { RegCloseKey(self.0) };
-    }
-}
-
+#[cfg(test)]
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
@@ -121,47 +117,51 @@ fn win_error(context: &str, code: u32) -> String {
 }
 
 fn open_key(hive: Hive, path: &str, access: u32) -> Result<Option<Key>, String> {
-    let mut key = null_mut();
-    let code = unsafe { RegOpenKeyExW(hive.key(), wide(path).as_ptr(), 0, access, &mut key) };
-    match code {
-        ERROR_SUCCESS => Ok(Some(Key(key))),
-        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
-        _ => Err(win_error(
+    // This x64 app supports exactly the classic Run key in both Win32 views.
+    // NtOpenKey has no Win32 view mapping; use the known native Run32 location,
+    // then walk it without links. HKCU Run is shared between the two views.
+    // Do not generalize this to Software\Classes, which has different rules.
+    let path = if access & KEY_WOW64_32KEY != 0 && hive == Hive::Machine {
+        if path != RUN {
+            return Err(win_error(
+                tr(
+                    "지원하지 않는 레지스트리 보기입니다",
+                    "Unsupported registry view",
+                ),
+                ERROR_INVALID_PARAMETER,
+            ));
+        }
+        RUN32_NATIVE
+    } else {
+        path
+    };
+    let access = (access & !KEY_WOW64_32KEY) | KEY_WOW64_64KEY;
+    crate::registry::open(hive.key(), path, access).map_err(|code| {
+        win_error(
             tr(
                 "시작 앱 레지스트리를 열 수 없습니다",
                 "Cannot open the startup app registry",
             ),
             code,
-        )),
-    }
+        )
+    })
 }
 
 fn create_key(hive: Hive, path: &str) -> Result<Key, String> {
-    let mut key = null_mut();
-    let code = unsafe {
-        RegCreateKeyExW(
-            hive.key(),
-            wide(path).as_ptr(),
-            0,
-            null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
-            null(),
-            &mut key,
-            null_mut(),
-        )
-    };
-    if code != ERROR_SUCCESS {
-        Err(win_error(
+    crate::registry::create(
+        hive.key(),
+        path,
+        KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
+    )
+    .map_err(|code| {
+        win_error(
             tr(
                 "시작 앱 상태를 변경할 수 없습니다",
                 "Cannot change the startup app state",
             ),
             code,
-        ))
-    } else {
-        Ok(Key(key))
-    }
+        )
+    })
 }
 
 fn query_value(key: &Key, name: &[u16]) -> Result<Option<Value>, String> {
@@ -653,6 +653,100 @@ pub fn set_enabled(entry: &StartupEntry, enabled: bool) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::i18n::{with_language, Language};
+
+    #[test]
+    fn safe_startup_handles_match_both_win32_registry_views() {
+        let text = |key: &Key| {
+            let name = crate::registry::test_support::key_name(key);
+            String::from_utf16(
+                &name
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .to_lowercase()
+        };
+        for hive in [Hive::User, Hive::Machine] {
+            for view in [KEY_WOW64_32KEY, KEY_WOW64_64KEY] {
+                let mut handle = null_mut();
+                let status = unsafe {
+                    RegOpenKeyExW(
+                        hive.key(),
+                        wide(RUN).as_ptr(),
+                        0,
+                        KEY_QUERY_VALUE | view,
+                        &mut handle,
+                    )
+                };
+                let safe = open_key(hive, RUN, KEY_QUERY_VALUE | view).unwrap();
+                if matches!(status, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+                    assert!(safe.is_none());
+                } else {
+                    assert_eq!(status, ERROR_SUCCESS);
+                    let ordinary = Key(handle);
+                    assert_eq!(text(&safe.unwrap()), text(&ordinary));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn startup_toggle_rejects_leaf_and_ancestor_registry_links() {
+        let fixture = crate::registry::test_support::Fixture::new();
+        let source = fixture.key("RunFixture");
+        let target = fixture.key("UnrelatedTarget");
+        let nested = fixture.key(r"UnrelatedTarget\Nested");
+        let _link = fixture.link("ApprovalLink", Some(&target));
+        let _unfinished = fixture.link("UnfinishedLink", None);
+        let value_name = wide("HarmlessFixtureValue");
+        let command = Value {
+            kind: REG_SZ,
+            data: wide("not-a-program; fixture only")
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        };
+        write_value(&source, &value_name, &command).unwrap();
+        for path in [
+            "ApprovalLink",
+            r"ApprovalLink\Nested",
+            r"ApprovalLink\Missing",
+            "UnfinishedLink",
+        ] {
+            let entry = StartupEntry {
+                id: "security-fixture".into(),
+                name: "fixture".into(),
+                command: "fixture".into(),
+                location: "fixture".into(),
+                enabled: true,
+                manageable: true,
+                status: "Enabled".into(),
+                hive: Hive::User,
+                value_name: value_name.clone(),
+                approval_path: fixture.path(path),
+                approval: None,
+                source: Source::Registry {
+                    path: fixture.path("RunFixture"),
+                    view: KEY_WOW64_64KEY,
+                    value: command.clone(),
+                },
+            };
+            assert!(set_enabled(&entry, false).is_err());
+        }
+        assert_eq!(query_value(&target, &value_name).unwrap(), None);
+        assert_eq!(query_value(&nested, &value_name).unwrap(), None);
+        assert_eq!(query_value(&source, &value_name).unwrap(), Some(command));
+        assert!(open_key(
+            Hive::User,
+            &fixture.path(r"UnrelatedTarget\Missing"),
+            KEY_QUERY_VALUE
+        )
+        .unwrap()
+        .is_none());
+    }
 
     #[test]
     fn english_startup_status_scope_and_errors_are_localized() {

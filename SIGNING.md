@@ -2,7 +2,7 @@
 
 Releases use Azure **Artifact Signing** with the `Hardt-Cert` Public Trust profile. The expected certificate subject is `CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US`. The non-secret account metadata is in `installer/signing-metadata.example.json`; authentication secrets never belong in the repository or release ZIP.
 
-The release pipeline signs the portable executable **before** embedding it in Setup. Inno Setup then invokes the same signer for its uninstaller and final installer. Every signature must validate under Windows Authenticode, match the expected publisher, and have a timestamp. Missing credentials, signing errors, publisher mismatches, and invalid signatures stop the release. There is no unsigned release fallback.
+The release pipeline first checks the app's PE loader policy (System32-only static imports, ASLR, DEP and high-entropy VA), then signs the executable **before** embedding it in Setup. Inno Setup invokes the same signer for its uninstaller and final installer. Every signature must validate under Windows Authenticode, match the expected publisher, and have a timestamp. Failed checks stop the release. There is no unsigned release fallback.
 
 ## Local release
 
@@ -27,16 +27,18 @@ $env:FEATHER_SIGNING_SUBJECT = 'CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US'
 Create and push the matching tag after review, then publish with the prepared release notes:
 
 ```powershell
-./scripts/publish-release.ps1 -NotesFile ./releases/2026.9.1.md
+./scripts/publish-release.ps1 -NotesFile ./releases/2026.9.2.md
 ```
 
-Publishing requires the tag to exist remotely, verifies the hashes and signatures again, and refuses to overwrite an existing release. Only the three explicitly named versioned assets and their manifests are uploaded. Development installers and historic benchmark measurements are not release assets.
+Publishing requires clean tracked source at the exact local release tag, with that commit in `origin/main` history. Immediately before creating the release it resolves the target GitHub repository's tag, including annotated tags, and checks the remote commit matches the local source. It also checks hashes, signatures and the app loader policy, and refuses to overwrite a release. Only the three explicitly named versioned assets and their manifests are uploaded. Fetch current remote refs before publishing; tags should be protected against modification.
 
 ## GitHub Actions
 
-The `Signed Windows release` workflow runs manually against an existing version tag. Configure the repository or `release` environment secrets `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`. Environment protection can require approval before signing. Run once with `publish=false` to obtain verified artifacts; use `publish=true` to create the release. Signing occurs only on the selected trusted tag, never on pull-request code.
+Dispatch `Signed Windows release` from `main` against an existing version tag. Trusted inline workflow code checks the exact tag commit and main-branch ancestry **before** executing tagged scripts. The build job has read-only repository permission, checkout does not persist credentials, and Azure credentials are supplied only to the signing step after compilation. Publishing runs on a separate fresh runner with repository write permission and no Azure credentials; it downloads only the signed artifact from the same workflow run and checks the source again.
 
-No repository secret is created by the local scripts. For a future secretless workflow, configure a narrowly scoped GitHub OIDC federated identity for the `release` environment, grant it certificate-profile signing permission, and use the official `azure/login` action with `id-token: write`. After that login, set `FEATHER_SIGNING_CREDENTIAL_MODE=AzureCli` and remove the service-principal-secret preflight from the workflow. The signer supports this explicitly selected Azure CLI credential mode; it never silently falls back from one identity to another. See the [official Azure signing authentication examples](https://github.com/Azure/artifact-signing-action/blob/v2.0.0/README.md). The checked-in workflow currently uses environment credentials and is dispatch-only, so pushing a version tag does not start an unconfigured signing run.
+Before enabling hosted signing, configure the `release` environment with a **main-only deployment branch rule** and appropriate reviewers, then add `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` there. YAML alone cannot stop a repository writer from creating a different workflow that requests secrets. These repository settings are an administrator's prerequisite, not something the local release scripts configure. `publish=false` saves verified artifacts; `publish=true` also publishes. Local releases work without storing any credential in GitHub.
+
+For a future secretless workflow, configure a narrowly scoped GitHub OIDC federated identity for the `release` environment, grant it certificate-profile signing permission, and use the official `azure/login` action with `id-token: write`. After login, set `FEATHER_SIGNING_CREDENTIAL_MODE=AzureCli` and replace the signing step's secret environment. The signer supports this explicit Azure CLI mode; it never silently switches identity. See the [official Azure authentication examples](https://github.com/Azure/artifact-signing-action/blob/v2.0.0/README.md). The workflow is dispatch-only, so pushing a tag does not start an unconfigured signing run.
 
 The account endpoint and certificate profile must already exist and pass identity validation. These scripts do not provision paid Azure resources. A valid Authenticode signature identifies the publisher; it does not guarantee that Windows SmartScreen will suppress every reputation prompt.
 

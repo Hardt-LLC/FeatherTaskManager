@@ -1,0 +1,22 @@
+[
+  {
+    "Name": "FeatherTaskManager-2026.9.2-Portable-x64.exe",
+    "Status": "Valid",
+    "Subject": "CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US",
+    "Thumbprint": "68224B3BF5CF236AEEA0625C56DAFA9D289503BA",
+    "Timestamped": true,
+    "FileVersion": "2026.9.2.0",
+    "Bytes": 791792,
+    "Sha256": "39fae8df9ca64b2a620c45a10eb74bbe80fbe62b61784f4e02eb85302778a514"
+  },
+  {
+    "Name": "FeatherTaskManager-2026.9.2-Setup-x64.exe",
+    "Status": "Valid",
+    "Subject": "CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US",
+    "Thumbprint": "68224B3BF5CF236AEEA0625C56DAFA9D289503BA",
+    "Timestamped": true,
+    "FileVersion": "2026.9.2.0          ",
+    "Bytes": 2434472,
+    "Sha256": "4e5dbd210bc01022ac8d9661936929bc36583642d86295496d9db811bc5b512d"
+  }
+]

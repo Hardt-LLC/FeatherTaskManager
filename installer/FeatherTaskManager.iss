@@ -24,8 +24,7 @@ UsePreviousAppDir=no
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
-MinVersion=10.0
-AppMutex=Global\FeatherTaskManager.Running
+MinVersion=10.0.14393
 CloseApplications=no
 RestartApplications=no
 UninstallDisplayIcon={app}\{#AppExe}
@@ -93,7 +92,6 @@ type
   TByteArray = array of Byte;
 const
   IfeoPath = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe';
-  RunningMutex = 'Global\FeatherTaskManager.Running';
 
 function AppLanguage(Param: String): String;
 begin
@@ -117,10 +115,11 @@ function IsAppBusy: Boolean;
 var
   Handle: LongWord;
 begin
-  Result := CheckForMutexes(RunningMutex);
-  if Result or not FileExists(ExpandConstant('{app}\{#AppExe}')) then exit;
-  { Also protects upgrades from versions predating the application mutex. Opening
-    an image mapped by Windows for writing fails; no bytes are changed here. }
+  Result := False;
+  if not FileExists(ExpandConstant('{app}\{#AppExe}')) then exit;
+  { Trust the installed image's kernel-enforced sharing state, not a public named
+    object that any local user could create to block installation. Opening an
+    image mapped by Windows for writing fails; no bytes are changed here. }
   Handle := CreateFileW(ExpandConstant('{app}\{#AppExe}'), $40000000, 7, 0, 3, 0, 0);
   Result := Handle = $FFFFFFFF;
   if not Result then CloseHandle(Handle);

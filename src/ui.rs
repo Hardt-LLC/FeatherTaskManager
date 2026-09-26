@@ -1454,10 +1454,10 @@ unsafe fn settings_menu(p: *mut App) {
             let (title, prompt) = if enable {
                 (tr("Windows 작업 관리자 대체", "Replace Windows Task Manager"), tr(concat!(
                     "Feather를 Windows 작업 관리자로 설정할까요?\n\n",
-                    "Program Files의 Feather Task Manager 폴더에 앱을 설치하고, 이 PC의 모든 사용자에게 적용합니다. ",
+                    "설치 프로그램으로 먼저 설치한 Feather를 이 PC의 모든 사용자에게 연결합니다. ",
                     "Ctrl+Alt+Delete → 작업 관리자와 Ctrl+Shift+Esc로 Feather가 열립니다.\n\n",
                     "관리자 권한이 필요합니다. 설치된 파일을 삭제하기 전에 설정에서 Windows 기본 작업 관리자로 복원하세요."
-                ), "Use Feather as the Windows Task Manager?\n\nThe app will be installed in Program Files\\Feather Task Manager and will apply to all users on this PC. Ctrl+Alt+Delete → Task Manager and Ctrl+Shift+Esc will open Feather.\n\nAdministrator permission is required. Restore the default Windows Task Manager in Settings before deleting the installed files."))
+                ), "Use Feather as the Windows Task Manager?\n\nInstall Feather with Setup first. This setting connects the installed app for all users on this PC. Ctrl+Alt+Delete → Task Manager and Ctrl+Shift+Esc will open Feather.\n\nAdministrator permission is required. Restore the default Windows Task Manager in Settings before deleting the installed files."))
             } else {
                 (tr("Windows 작업 관리자 복원", "Restore Windows Task Manager"), tr(concat!(
                     "Windows 기본 작업 관리자로 되돌릴까요?\n\n",

@@ -1,30 +1,28 @@
 //! Explicit, reversible Task Manager registration. No registry polling or startup hooks.
 //!
 //! Windows' IFEO Debugger value redirects taskmgr.exe. The command always names a
-//! copy under the system's trusted Program Files folder, never a portable path.
+//! installed image under the system's trusted Program Files folder. Registration
+//! never copies or elevates an executable from a portable, user-writable path.
 
 use crate::i18n::tr;
 
 use std::{
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
-    io::{Read, Write},
     mem::size_of,
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
         fs::OpenOptionsExt,
-        io::{AsRawHandle, FromRawHandle},
+        io::AsRawHandle,
     },
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND,
-        ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, GENERIC_ALL, GENERIC_WRITE, HANDLE,
-        INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, GENERIC_ALL, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0,
     },
     Security::{
         AddAccessAllowedAceEx, CreateWellKnownSid, EqualSid, GetAce, GetKernelObjectSecurity,
@@ -37,13 +35,12 @@ use windows_sys::Win32::{
         SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED, WELL_KNOWN_SID_TYPE,
     },
     Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, GetFileInformationByHandle, MoveFileExW,
-        BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-        FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, MOVEFILE_REPLACE_EXISTING,
-        MOVEFILE_WRITE_THROUGH, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        CreateDirectoryW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, READ_CONTROL,
+        WRITE_DAC, WRITE_OWNER,
     },
     System::{
         Com::CoTaskMemFree,
@@ -334,12 +331,11 @@ pub fn status() -> Result<Status, String> {
 
 /// Called only by an explicit UI action, on the action worker rather than the UI thread.
 pub fn run_elevated(enable: bool) -> Result<(), String> {
-    let path = std::env::current_exe().map_err(|err| {
-        crate::trf!(
-            "현재 실행 파일을 찾을 수 없습니다: {err}",
-            "Cannot locate this executable: {err}"
-        )
-    })?;
+    let path = install_path()?;
+    // Pin every path component and the protected installed image until the
+    // elevated helper finishes. A portable EXE can be renamed while running;
+    // its current_exe() pathname is not a trusted source for an elevated launch.
+    let _installation = lock_existing_installation(&path).map_err(installation_required)?;
     let file = wide(path.as_os_str());
     let verb = wide("runas");
     let parameters = wide(format!(
@@ -422,18 +418,31 @@ pub fn run_elevated(enable: bool) -> Result<(), String> {
 /// Entry point for the UAC helper. Does not launch a UI or run on normal app startup.
 pub fn apply(enable: bool) -> Result<(), String> {
     let target = install_path()?;
-    let command = debugger_command(&target)?;
-    // Refuse a foreign replacement before even copying the application.
-    if let Some(key) = open_key(HKEY_LOCAL_MACHINE, IFEO_KEY, false, false)? {
+    apply_at(HKEY_LOCAL_MACHINE, IFEO_KEY, &target, enable)
+}
+
+fn apply_at(root: HKEY, registry_path: &str, target: &Path, enable: bool) -> Result<(), String> {
+    let command = debugger_command(target)?;
+    if let Some(key) = open_key(root, registry_path, false, false)? {
         ensure_owned_or_empty(&key, &command)?;
         if enable {
             ensure_no_filter(&key)?;
         }
     }
-    if enable {
-        install_executable(&target)?;
-    }
-    change_registration(HKEY_LOCAL_MACHINE, IFEO_KEY, &command, enable)
+    // Do not create a folder or copy current_exe(): the installer is the only
+    // mechanism that deploys the elevated launch target. Keep these locks through
+    // the registry write, including when this helper is invoked directly.
+    let _installation = enable
+        .then(|| lock_existing_installation(target).map_err(installation_required))
+        .transpose()?;
+    change_registration(root, registry_path, &command, enable)
+}
+
+fn installation_required(detail: String) -> String {
+    crate::trf!(
+        "작업 관리자 연결을 변경하려면 먼저 설치 파일로 Feather Task Manager를 설치하거나 복구하세요. 보호된 설치 파일을 확인할 수 없습니다: {detail}",
+        "Install or repair Feather Task Manager using the installer before changing the Task Manager association. The protected installed executable could not be verified: {detail}"
+    )
 }
 
 fn ensure_owned_or_empty(key: &Key, command: &str) -> Result<(), String> {
@@ -450,8 +459,8 @@ fn change_registration(root: HKEY, path: &str, command: &str, enable: bool) -> R
     let Some(key) = open_key(root, path, true, enable)? else {
         return Ok(());
     };
-    // Recheck with the writable handle after installation: another application may
-    // have changed this value while copying. Other values and subkeys are preserved.
+    // Recheck with the writable handle after validating the installed image:
+    // another application may have changed the value. Preserve unrelated settings.
     ensure_owned_or_empty(&key, command)?;
     if enable {
         ensure_no_filter(&key)?;
@@ -704,45 +713,11 @@ unsafe fn validate_security_descriptor(
     Ok(())
 }
 
-fn files_equal(left: &Path, right: &Path) -> Result<bool, String> {
-    let mut left = File::open(left).map_err(|err| {
-        crate::trf!(
-            "실행 파일을 읽을 수 없습니다: {err}",
-            "Cannot read the executable: {err}"
-        )
-    })?;
-    let mut right = File::open(right).map_err(|err| {
-        crate::trf!(
-            "설치된 실행 파일을 읽을 수 없습니다: {err}",
-            "Cannot read the installed executable: {err}"
-        )
-    })?;
-    if left.metadata().map_err(|err| err.to_string())?.len()
-        != right.metadata().map_err(|err| err.to_string())?.len()
-    {
-        return Ok(false);
-    }
-    let mut a = [0_u8; 16_384];
-    let mut b = [0_u8; 16_384];
-    loop {
-        let len = left.read(&mut a).map_err(|err| err.to_string())?;
-        if len == 0 {
-            return Ok(true);
-        }
-        right
-            .read_exact(&mut b[..len])
-            .map_err(|err| err.to_string())?;
-        if a[..len] != b[..len] {
-            return Ok(false);
-        }
-    }
-}
-
 fn open_protected_executable(path: &Path) -> Result<File, String> {
     let file = OpenOptions::new()
         .read(true)
         .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|err| {
@@ -820,150 +795,52 @@ pub fn prepare_install_directory() -> Result<(), String> {
     lock_install_directory(&install_path()?).map(|_| ())
 }
 
-/// Verify the installer's extracted executable and its parent before success.
+/// Verify the installer's extracted executable and its parents before success.
 pub fn validate_installation() -> Result<(), String> {
-    let target = install_path()?;
+    lock_existing_installation(&install_path()?).map(|_| ())
+}
+
+/// All handles are retained together: no directory component or executable may
+/// be renamed while an elevated launch or IFEO registration uses its pathname.
+struct InstallationLocks {
+    _ancestors: Vec<File>,
+    _executable: File,
+}
+
+fn lock_existing_installation(target: &Path) -> Result<InstallationLocks, String> {
+    let folder = target.parent().ok_or(tr(
+        "설치 폴더가 없습니다.",
+        "The installation folder is missing.",
+    ))?;
+    let program_files = folder.parent().ok_or(tr(
+        "Program Files 폴더가 없습니다.",
+        "The Program Files folder is missing.",
+    ))?;
     let mut locks = Vec::new();
-    for parent in target
-        .parent()
-        .ok_or(tr(
-            "설치 폴더가 없습니다.",
-            "The installation folder is missing.",
-        ))?
+    for ancestor in program_files
         .ancestors()
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
     {
-        locks.push(open_directory(parent)?);
+        locks.push(open_directory(ancestor)?);
     }
-    protected_directory(
-        locks.last().ok_or(tr(
-            "설치 폴더가 없습니다.",
-            "The installation folder is missing.",
-        ))?,
-        true,
-    )?;
-    open_protected_executable(&target)?;
-    Ok(())
-}
-
-fn install_executable(target: &Path) -> Result<(), String> {
-    let source = std::env::current_exe().map_err(|err| err.to_string())?;
-    if source
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("taskmgr.exe"))
-    {
-        return Err(tr("실행 파일 이름이 taskmgr.exe이면 Windows 실행 연결이 반복될 수 있습니다. FeatherTaskManager.exe로 이름을 복원하세요.", "Naming the executable taskmgr.exe can cause a Windows launch loop. Restore its name to FeatherTaskManager.exe.").into());
-    }
-    let folder = target.parent().ok_or(tr(
-        "설치 폴더가 없습니다.",
-        "The installation folder is missing.",
-    ))?;
-    let (locks, folder_lock) = lock_install_directory(target)?;
-    let mut security = DirectorySecurity::new()?;
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: (&mut security.descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-        bInheritHandle: 0,
-    };
-    if let Ok(metadata) = std::fs::symlink_metadata(target) {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
-            != 0
-        {
-            return Err(tr(
-                "설치할 실행 파일 위치에 링크 또는 폴더가 있어 중단했습니다.",
-                "Installation stopped because the executable destination is a link or a folder.",
-            )
-            .into());
-        }
-        // Matching bytes do not make a user-writable binary safe for global IFEO.
-        let _target_lock = open_protected_executable(target)?;
-        if files_equal(&source, target)? {
-            return Ok(());
-        }
-    }
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| err.to_string())?
-        .as_nanos();
-    let temporary = folder.join(format!(
-        "FeatherTaskManager-{}-{stamp}.tmp",
-        std::process::id()
-    ));
-    let mut temporary_created = false;
-    let result = (|| {
-        let mut input = File::open(&source).map_err(|err| {
-            crate::trf!(
-                "실행 파일을 읽을 수 없습니다: {err}",
-                "Cannot read the executable: {err}"
-            )
-        })?;
-        // Apply an explicit protected ACL to the file too: existing directory
-        // inheritance is never allowed to make the elevated launch target mutable.
-        let raw = unsafe {
-            CreateFileW(
-                wide(&temporary).as_ptr(),
-                GENERIC_WRITE | READ_CONTROL,
-                FILE_SHARE_READ,
-                &attributes,
-                CREATE_NEW,
-                0,
-                null_mut(),
-            )
-        };
-        if raw == INVALID_HANDLE_VALUE {
-            return Err(error(tr(
-                "설치 파일을 만들 수 없습니다",
-                "Cannot create the installation file",
-            )));
-        }
-        temporary_created = true;
-        let mut output = unsafe { File::from_raw_handle(raw) };
-        protected_directory(&output, true)?;
-        std::io::copy(&mut input, &mut output).map_err(|err| {
-            crate::trf!(
-                "실행 파일을 복사할 수 없습니다: {err}",
-                "Cannot copy the executable: {err}"
-            )
-        })?;
-        output.flush().map_err(|err| err.to_string())?;
-        output.sync_all().map_err(|err| err.to_string())?;
-        drop(output);
-        if unsafe {
-            MoveFileExW(
-                wide(&temporary).as_ptr(),
-                wide(target).as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(crate::trf!(
-                "{}. 설치된 Feather Task Manager가 실행 중이면 닫고 다시 시도하세요.",
-                "{}. If the installed Feather Task Manager is running, close it and try again.",
-                error(tr(
-                    "설치 파일을 교체할 수 없습니다",
-                    "Cannot replace the installation file"
-                ))
-            ));
-        }
-        open_protected_executable(target)?;
-        Ok(())
-    })();
-    if result.is_err() && temporary_created {
-        // Only this invocation's create_new staging file is ever removed.
-        let _ = std::fs::remove_file(&temporary);
-    }
-    drop(folder_lock);
-    drop(locks);
-    result
+    protected_directory(locks.last().unwrap(), false)?;
+    let folder_lock = open_directory(folder)?;
+    protected_directory(&folder_lock, true)?;
+    locks.push(folder_lock);
+    let executable = open_protected_executable(target)?;
+    Ok(InstallationLocks {
+        _ancestors: locks,
+        _executable: executable,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::i18n::{with_language, Language};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER, REG_BINARY};
 
     #[test]
@@ -1194,105 +1071,59 @@ mod tests {
         assert_eq!(read_value(&child, "FilterFullPath").unwrap(), Some(filter));
     }
 
-    /// Run explicitly from an already elevated test shell. This exercises file
-    /// installation beneath target/ only; it never touches IFEO or Program Files.
     #[test]
-    #[ignore = "requires an already elevated token; creates only a disposable target/test-install-* directory"]
-    fn disposable_installation_copies_secures_and_updates_the_binary() {
-        use windows_sys::Win32::{
-            Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
-            System::Threading::{GetCurrentProcess, OpenProcessToken},
-        };
-        let mut raw_token = null_mut();
-        assert_ne!(
-            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) },
-            0
-        );
-        let token = Process(raw_token);
-        let mut elevation = TOKEN_ELEVATION::default();
-        let mut size = 0;
-        assert_ne!(
-            unsafe {
-                GetTokenInformation(
-                    token.0,
-                    TokenElevation,
-                    (&mut elevation as *mut TOKEN_ELEVATION).cast(),
-                    size_of::<TOKEN_ELEVATION>() as u32,
-                    &mut size,
-                )
-            },
-            0
-        );
-        assert_ne!(
-            elevation.TokenIsElevated, 0,
-            "Run this ignored test only from an already elevated shell; it never requests UAC."
-        );
-
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap();
-        let base = workspace.join("target").canonicalize().unwrap();
-        assert!(base.is_absolute() && base.starts_with(&workspace));
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+    fn registration_rejects_portable_image_without_copying_or_changing_registry() {
+        let test = TestKey::new();
+        let key = open_key(HKEY_CURRENT_USER, &test.0, true, true)
             .unwrap()
-            .as_nanos();
-        let root = base.join(format!("test-install-{}-{stamp}", std::process::id()));
-        assert_eq!(root.parent(), Some(base.as_path()));
-        assert!(!root.exists());
+            .unwrap();
+        let unrelated = string_value("Keep this setting");
+        set(&key, "Unrelated", &unrelated);
+        // The test harness is deliberately outside a protected installation.
+        // Calling the same enable path as the elevated helper must not deploy it.
+        let portable = std::env::current_exe().unwrap();
+        assert!(with_language(Language::English, || {
+            apply_at(HKEY_CURRENT_USER, &test.0, &portable, true)
+        })
+        .unwrap_err()
+        .starts_with("Install or repair Feather Task Manager"));
+        assert!(read_value(&key, "Debugger").unwrap().is_none());
+        assert_eq!(read_value(&key, "Unrelated").unwrap(), Some(unrelated));
+    }
 
-        // All cleanup names are fixed, checked children of this test's fresh root.
-        // No recursive delete is used, so any unexpected contents are preserved.
-        struct Cleanup {
-            root: PathBuf,
-            base: PathBuf,
-        }
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                if self.root.is_absolute()
-                    && self.root.parent() == Some(self.base.as_path())
-                    && self
-                        .root
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with("test-install-"))
-                {
-                    let app = self.root.join(APP_FOLDER);
-                    let _ = std::fs::remove_file(app.join(APP_EXE));
-                    let _ = std::fs::remove_dir(app);
-                    let _ = std::fs::remove_dir(&self.root);
-                }
-            }
-        }
-        let mut security = DirectorySecurity::new().unwrap();
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: (&mut security.descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-            bInheritHandle: 0,
-        };
-        assert_ne!(
-            unsafe { CreateDirectoryW(wide(&root).as_ptr(), &attributes) },
-            0,
-            "Cannot create the disposable protected test folder: {}",
-            std::io::Error::last_os_error()
-        );
-        let cleanup = Cleanup {
-            root: root.clone(),
-            base,
-        };
-        let target = root.join(APP_FOLDER).join(APP_EXE);
-        let source = std::env::current_exe().unwrap();
-        install_executable(&target).unwrap();
-        assert!(files_equal(&source, &target).unwrap());
-        drop(open_protected_executable(&target).unwrap());
-        install_executable(&target).unwrap(); // Same bytes must be idempotent.
-        std::fs::write(&target, b"old disposable build").unwrap();
-        install_executable(&target).unwrap(); // Stage and replace a different build.
-        assert!(files_equal(&source, &target).unwrap());
-        drop(open_protected_executable(&target).unwrap());
-        drop(cleanup);
-        assert!(
-            !root.exists(),
-            "The disposable installation did not clean up fully."
-        );
+    #[test]
+    fn registration_with_missing_installation_does_not_create_directory_or_key() {
+        let test = TestKey::new();
+        let missing_folder = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("missing-installation-{}", std::process::id()));
+        assert!(!missing_folder.exists());
+        let missing = missing_folder.join(APP_EXE);
+        assert!(apply_at(HKEY_CURRENT_USER, &test.0, &missing, true).is_err());
+        assert!(!missing_folder.exists());
+        assert!(open_key(HKEY_CURRENT_USER, &test.0, false, false)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn recovery_removes_only_owned_registration_even_when_executable_is_missing() {
+        let test = TestKey::new();
+        let target = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("missing-recovery-{}", std::process::id()))
+            .join(APP_EXE);
+        assert!(!target.exists());
+        let key = open_key(HKEY_CURRENT_USER, &test.0, true, true)
+            .unwrap()
+            .unwrap();
+        let command = debugger_command(&target).unwrap();
+        set(&key, "Debugger", &string_value(&command));
+        apply_at(HKEY_CURRENT_USER, &test.0, &target, false).unwrap();
+        assert!(read_value(&key, "Debugger").unwrap().is_none());
+        let foreign = string_value("other-manager.exe");
+        set(&key, "Debugger", &foreign);
+        assert!(apply_at(HKEY_CURRENT_USER, &test.0, &target, false).is_err());
+        assert_eq!(read_value(&key, "Debugger").unwrap(), Some(foreign));
     }
 }

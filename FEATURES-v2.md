@@ -1,4 +1,4 @@
-# Feather Task Manager 2026.9.1 기능 및 수치 해석
+# Feather Task Manager 2026.9.2 기능 및 수치 해석
 
 0.2는 프로세스 중심의 첫 버전에 성능·시작 앱·서비스 화면을 추가합니다. Rust/Win32 구조를 유지하면서 네이티브 목록, 시스템 글꼴, 직접 그린 성능 그래프를 사용합니다.
 
@@ -74,7 +74,7 @@ Windows Service Control Manager에서 실행 중·중지된 Win32 서비스를 �
 
 ## Windows 작업 관리자 연결과 복원
 
-**설정 → Feather를 작업 관리자로 설정…**은 확인과 관리자 권한 승인을 거쳐 실행 파일을 Windows의 Program Files 알려진 폴더 아래 `Feather Task Manager\FeatherTaskManager.exe`에 설치합니다. 그런 다음 `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe`의 `Debugger`에 큰따옴표로 감싼 설치 경로와 `--task-manager`를 등록합니다. 이 연결은 이 PC의 모든 사용자에게 적용됩니다. 실행 파일 복사가 실패하면 연결을 새로 적용하지 않습니다.
+**설정 → Feather를 작업 관리자로 설정…**은 Setup으로 먼저 설치한 보호된 실행 파일을 Windows 작업 관리자로 연결합니다. `Program Files\Feather Task Manager\FeatherTaskManager.exe` 및 상위 경로의 소유자·쓰기 권한·재분석 지점을 검증하고 경로 핸들을 유지한 채 설치된 도우미를 관리자 권한으로 실행합니다. 포터블 파일을 관리자 권한으로 복사하는 기능은 2026.9.2에서 제거했습니다. 검증 후 `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe`의 `Debugger`에 큰따옴표로 감싼 설치 경로와 `--task-manager`를 등록하며 이 PC의 모든 사용자에게 적용합니다. 설치 파일이 없거나 신뢰할 수 없으면 연결을 변경하지 않습니다.
 
 다음 `taskmgr.exe` 실행부터 Feather가 열리므로 `Ctrl+Alt+Delete → 작업 관리자`와 `Ctrl+Shift+Esc`에도 적용됩니다. 기존 창은 유지되며 재부팅은 필요하지 않습니다. 보안 화면의 실제 실행 경로는 수동 확인 대상으로 남아 있습니다. 조직의 작업 관리자 차단 정책은 변경하지 않습니다.
 
@@ -82,7 +82,7 @@ Windows Service Control Manager에서 실행 중·중지된 Win32 서비스를 �
 
 **설정 → Windows 기본 작업 관리자로 복원…**은 Feather가 등록하는 정확한 명령인지 확인한 뒤 `Debugger` 값만 제거합니다. IFEO 키 전체나 다른 값은 삭제하지 않습니다. 복원 후 파일은 남아 있으며 수동으로 삭제할 수 있습니다. 연결된 실행 파일을 먼저 이동하거나 삭제하면 작업 관리자를 실행할 수 없으므로 삭제 전에 복원하세요.
 
-실행 파일이 남아 있으면 관리자 권한으로 `FeatherTaskManager.exe --restore-task-manager`를 실행할 수 있습니다. 파일을 삭제한 경우에는 배포 ZIP의 `Restore-WindowsTaskManager.ps1`을 관리자 권한의 64비트 PowerShell에서 실행합니다. 이 스크립트도 정확한 Feather 명령과 형식이 일치할 때만 `Debugger`를 제거합니다. 두 방법의 사용 예는 [README.md](README.md)에 있습니다. 외부 관리자 도구와 동시에 같은 레지스트리 설정을 변경하지 마세요.
+실행 파일이 남아 있으면 관리자 권한으로 `FeatherTaskManager.exe --restore-task-manager`를 실행할 수 있습니다. 파일을 삭제한 경우에는 배포 ZIP의 `Restore-WindowsTaskManager.ps1`을 관리자 권한의 64비트 PowerShell에서 실행합니다. 이 스크립트도 정확한 Feather 명령과 형식이 일치할 때만 `Debugger`를 제거합니다. 복구 절차는 [설치 안내](INSTALLER.md)를 참고하세요. 외부 관리자 도구와 동시에 같은 레지스트리 설정을 변경하지 마세요.
 
 ## 검증 범위
 
@@ -105,4 +105,4 @@ Windows Service Control Manager에서 실행 중·중지된 Win32 서비스를 �
 - [Microsoft: WOW64에서 공유되는 레지스트리 키](https://learn.microsoft.com/en-us/windows/win32/winprog64/shared-registry-keys)
 - [Microsoft: Windows 단축키](https://support.microsoft.com/en-us/windows/keyboard-shortcuts-in-windows-dcc61a57-8ff0-cffe-9796-cb9706c75eec), [작업 관리자 차단 정책](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-ctrlaltdel#disabletaskmgr)
 
-프로세스 수집은 NT API와 x64 구조에 의존하며 향후 Windows 변경에 대응이 필요할 수 있습니다. 배포 대상은 Windows 10/11 x64이며 x86·ARM64 네이티브 빌드와 모든 Windows 빌드의 호환성을 보장하지 않습니다.
+프로세스 수집은 NT API와 x64 구조에 의존하며 향후 Windows 변경에 대응이 필요할 수 있습니다. 배포 대상은 Windows 10 1607 이상 및 Windows 11 x64이며 x86·ARM64 네이티브 빌드와 모든 Windows 빌드의 호환성을 보장하지 않습니다.

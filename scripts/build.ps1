@@ -15,7 +15,7 @@ try {
     $null = New-Item -ItemType Directory -Path $distPath -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'target\release\FeatherTaskManager.exe') -Destination $distPath -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'scripts\Restore-WindowsTaskManager.ps1') -Destination $distPath -Force
-    foreach ($name in @('README.md', 'README.en.md', 'INSTALLER.md', 'SIGNING.md', 'FEATURES-v2.md', 'BENCHMARK.md', 'VALIDATION.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html')) {
+    foreach ($name in @('README.md', 'README.en.md', 'INSTALLER.md', 'SIGNING.md', 'SECURITY.md', 'FEATURES-v2.md', 'BENCHMARK.md', 'VALIDATION.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html')) {
         Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $distPath -Force
     }
     $designPath = Join-Path $distPath 'design-system\feather-task'

@@ -10,6 +10,7 @@ if (-not $env:FEATHER_SIGNING_METADATA -or -not $env:FEATHER_SIGNING_SUBJECT) {
 $dist = Join-Path $projectRoot 'dist'
 $binary = Join-Path $dist 'FeatherTaskManager.exe'
 $version = & (Join-Path $PSScriptRoot 'version.ps1') -BinaryPath $binary
+& (Join-Path $PSScriptRoot 'test-loader-policy.ps1') -FilePath $binary | Out-Host
 # Sign the app before it is embedded. Inno then signs both Setup and Uninstall
 # through exactly the same signer, including verification after every call.
 & (Join-Path $PSScriptRoot 'sign-artifact.ps1') -FilePath $binary | Out-Host
@@ -18,7 +19,7 @@ $portableName = "FeatherTaskManager-$($version.Version)-Portable-x64.exe"
 $setupName = "FeatherTaskManager-$($version.Version)-Setup-x64.exe"
 $zipName = "FeatherTaskManager-$($version.Version)-Portable-x64.zip"
 Copy-Item -LiteralPath $binary -Destination (Join-Path $dist $portableName) -Force
-$archiveNames = @('FeatherTaskManager.exe', 'Restore-WindowsTaskManager.ps1', 'README.md', 'README.en.md', 'INSTALLER.md', 'FEATURES-v2.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html')
+$archiveNames = @('FeatherTaskManager.exe', 'Restore-WindowsTaskManager.ps1', 'README.md', 'README.en.md', 'INSTALLER.md', 'SECURITY.md', 'FEATURES-v2.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html')
 Compress-Archive -LiteralPath ($archiveNames | ForEach-Object { Join-Path $dist $_ }) -DestinationPath (Join-Path $dist $zipName) -Force
 $assets = @($portableName, $setupName, $zipName)
 $entries = foreach ($name in $assets) {
