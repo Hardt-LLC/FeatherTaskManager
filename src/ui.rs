@@ -3,7 +3,8 @@
 use crate::trf as tf;
 use crate::{
     i18n::{language, set_language, tr, Language},
-    performance::{PerfSampler, PerfSnapshot},
+    netetw::{NetworkMonitor, ProcessNetworkSample},
+    performance::{PerfSampler, PerfSnapshot, ProcessGpu, ProcessGpuTracker},
     process_tree::{Identity as ProcessIdentity, Row as TreeRow, TerminationPlan, Tree},
     sampler::{Process, Sampler, Snapshot},
     services::Service,
@@ -32,9 +33,31 @@ use windows_sys::Win32::{
         WindowsAndMessaging::*,
     },
 };
+mod anim;
 mod capture;
+mod controls;
+mod fonts;
+mod frame;
+mod gfx;
+// Raster nav/logo masks from before the vector icons (`widgets::icon`)
+// matched the reference; unused, kept until the artwork pipeline is retired.
+#[allow(dead_code)]
 mod icons;
+mod interactions;
+mod layout;
+mod nuclear;
 mod paint;
+mod popup;
+mod preferences;
+mod scroll;
+mod shell;
+mod table;
+mod telemetry;
+mod theme;
+mod widgets;
+use preferences::Preferences;
+use telemetry::{PerfHistory, PerfTarget, ProcessTelemetry};
+use theme::colors;
 const SNAPSHOT_READY: u32 = WM_APP + 1;
 const JOB_READY: u32 = WM_APP + 2;
 const SEARCH: usize = 101;
@@ -52,19 +75,32 @@ const VIEW_MODE: usize = 112;
 const END_TREE: usize = 113;
 const LANGUAGE_KOREAN: usize = 114;
 const LANGUAGE_ENGLISH: usize = 115;
+const RUN_TASK: usize = 116;
+const EXTRA: usize = 117;
+const FILTER: usize = 118;
+const COPY: usize = 119;
+const CORES: usize = 120;
+const RESOURCE_MONITOR: usize = 121;
+const EXPAND_ALL: usize = 122;
+const PERF_COMPONENT: usize = 123;
+/// Icon-only "⋯" page-head button that opens the page's extra actions menu.
+const MORE: usize = 124;
+/// "Nuclear Zombie": the memory cleanup and zombie-process panel (`nuclear.rs`).
+const NUCLEAR: usize = 125;
+const THEME_LIGHT: usize = 130;
+const THEME_DARK: usize = 131;
+const THEME_SYSTEM: usize = 132;
+const PREF_LANGUAGE: usize = 133;
+const PREF_RATE: usize = 134;
+const PREF_START: usize = 135;
+const PREF_TOP: usize = 136;
+const PREF_TRAY: usize = 137;
+const PREF_REPLACE: usize = 138;
 const NAV: usize = 300;
+/// One-shot timer of the main window: prefetch the Services / Startup lists.
+const PREFETCH_TIMER: usize = 0xFE01;
 const APP_ICON: *const u16 = 101usize as *const u16;
-const SIDEBAR: i32 = 196;
-const BG: u32 = rgb(245, 247, 250);
-const SURFACE: u32 = rgb(255, 255, 255);
-const INK: u32 = rgb(23, 35, 58);
-const MUTED: u32 = rgb(89, 102, 123);
-const BLUE: u32 = rgb(37, 99, 235);
-const BORDER: u32 = rgb(220, 227, 237);
-const RAIL: u32 = rgb(21, 32, 54);
-const DANGER: u32 = rgb(180, 35, 50);
-const GREEN: u32 = rgb(21, 122, 82);
-const SELECTED: u32 = rgb(234, 241, 255);
+#[cfg(test)]
 const fn rgb(r: u32, g: u32, b: u32) -> u32 {
     r | g << 8 | b << 16
 }
@@ -77,6 +113,7 @@ enum Page {
     Performance = 1,
     Startup = 2,
     Services = 3,
+    Settings = 4,
 }
 impl Page {
     fn title(self) -> &'static str {
@@ -85,10 +122,16 @@ impl Page {
             Self::Performance => tr("성능", "Performance"),
             Self::Startup => tr("시작 앱", "Startup apps"),
             Self::Services => tr("서비스", "Services"),
+            Self::Settings => tr("설정", "Settings"),
         }
     }
+    #[allow(dead_code)]
     fn subtitle(self) -> &'static str {
         match self {
+            Self::Settings => tr(
+                "화면, 갱신 및 창 동작을 설정합니다.",
+                "Customize appearance, updates and window behavior.",
+            ),
             Self::Processes => tr(
                 "리소스 사용량을 한눈에 확인하고, 필요한 작업에 집중하세요.",
                 "See resource usage at a glance and manage running tasks.",
@@ -112,10 +155,12 @@ impl Page {
             1 => Self::Performance,
             2 => Self::Startup,
             3 => Self::Services,
+            4 => Self::Settings,
             _ => Self::Processes,
         }
     }
 }
+#[allow(dead_code)] // Aggregate readiness regression fixture; device graphs use PerfHistory.
 struct HistoryPoint {
     at: Instant,
     cpu: f64,
@@ -136,25 +181,99 @@ struct MonitorSample {
     at: Instant,
     snapshot: Result<Snapshot, String>,
     performance: Option<Result<PerfSnapshot, String>>,
+    /// GPU use per `(pid, created)` of `snapshot`'s processes, joined with
+    /// this iteration's performance sample (`ProcessGpuTracker`); empty when
+    /// no performance sample was taken.
+    process_gpu: std::collections::HashMap<(u32, u64), ProcessGpu>,
+    /// Network rates per `(pid, created)` and their availability
+    /// (`NetworkMonitor`, elevated only).
+    process_network: ProcessNetworkSample,
+}
+/// A grouped app row's values summed over its processes: CPU %, working
+/// set, I/O rate (NaN when none measured), network bytes/s and GPU % (None
+/// when no process of the app has a measured value; GPU capped at 100 %).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct GroupTotal {
+    cpu: f64,
+    memory: u64,
+    io: f64,
+    network: Option<f64>,
+    gpu: Option<f64>,
+}
+impl GroupTotal {
+    /// Sum `processes` (an app's root and members).
+    fn of<'a>(processes: impl IntoIterator<Item = &'a Process>) -> Self {
+        let mut total = Self {
+            io: f64::NAN,
+            ..Self::default()
+        };
+        let add = |sum: Option<f64>, value: Option<f64>| match (sum, value) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+        for process in processes {
+            total.cpu += process.cpu_percent;
+            total.memory += process.working_set;
+            if process.io_bytes_per_sec.is_finite() {
+                total.io =
+                    if total.io.is_finite() { total.io } else { 0.0 } + process.io_bytes_per_sec;
+            }
+            total.network = add(total.network, process.network_bytes_per_sec);
+            total.gpu = add(total.gpu, process.gpu_percent);
+        }
+        total.gpu = total.gpu.map(|v| v.min(100.0));
+        total
+    }
+    fn apply(&self, process: &mut Process) {
+        process.cpu_percent = self.cpu;
+        process.working_set = self.memory;
+        process.io_bytes_per_sec = self.io;
+        process.network_bytes_per_sec = self.network;
+        process.gpu_percent = self.gpu;
+    }
+}
+/// The per-process network availability of the latest sample.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct NetworkState {
+    measured: bool,
+    /// Why per-process network is unavailable (from `netetw`), if known.
+    reason: Option<String>,
 }
 enum Action {
     End(u32, u64),
+    Priority(u32, u64, crate::actions::Priority),
+    Efficiency(u32, u64, bool),
+    /// Service key and display name (the toast names the service).
+    Restart(String, String),
+    SystemTool(crate::actions::SystemTool),
+    RunTask(String),
     EndTree(TerminationPlan),
     Reveal(u32, u64),
     Toggle(Box<StartupEntry>, bool),
-    Start(String),
-    Stop(String),
+    Start(String, String),
+    Stop(String, String),
     Elevate,
     ReplaceTaskManager(bool, Page),
 }
 enum Job {
+    ProcessDetails(u32, u64),
+    ServiceDetails(String),
     Startup,
     Services,
     Action(Action),
+    /// A Nuclear Zombie run (`memclean::run`): progress and the report go
+    /// to the panel's own channel, announced with `nuclear::CLEANUP_READY`.
+    Cleanup(
+        crate::memclean::CleanupOptions,
+        Sender<nuclear::CleanupEvent>,
+    ),
     Stop,
 }
 enum JobResult {
+    ProcessDetails(u32, u64, Result<crate::actions::ProcessSettings, String>),
+    ServiceDetails(String, Result<crate::services::ServiceDetails, String>),
     Startup(Result<Vec<StartupEntry>, String>),
+    Publishers(std::collections::HashMap<String, String>),
     Services(Result<Vec<Service>, String>),
     Action {
         result: Result<(), String>,
@@ -171,7 +290,14 @@ enum ErrorSource {
     Action,
 }
 struct App {
-    icons: icons::IconCache,
+    persist_preferences: bool,
+    palette: HWND,
+    prefs: Preferences,
+    preference_controls: Vec<HWND>,
+    tray_visible: bool,
+    replacement_active: bool,
+    show_telemetry: bool,
+    show_details: bool,
     hwnd: HWND,
     list: HWND,
     search: HWND,
@@ -184,15 +310,29 @@ struct App {
     refresh: HWND,
     view_mode: HWND,
     end_tree: HWND,
+    run_task: HWND,
+    extra: HWND,
+    filter_control: HWND,
+    copy: HWND,
+    cores: HWND,
+    resource_monitor: HWND,
+    expand_all: HWND,
+    more: HWND,
+    /// Processes head: opens the Nuclear Zombie panel (it took the place of
+    /// Efficiency mode, which stays in the ⋯ and context menus).
+    nuclear: HWND,
+    perf_list: HWND,
     nav: [HWND; 4],
-    font: HFONT,
-    small: HFONT,
-    heading: HFONT,
-    metric: HFONT,
-    bold: HFONT,
+    /// Every font role at the window's DPI and language (`fonts.rs`).
+    fonts: fonts::Fonts,
+    /// Cached frame for flicker-free WM_PAINT (`gfx.rs`).
+    back: gfx::BackBuffer,
+    /// Main-window animation driver; keys are `(control id, anim::part::*)`.
+    anim: anim::AnimHost<(usize, u32)>,
+    /// Custom frame: caption buttons, hit testing, DWM (`frame.rs`).
+    frame: frame::Frame,
     big_icon: HICON,
     small_icon: HICON,
-    row_images: HIMAGELIST,
     bg: HBRUSH,
     surface: HBRUSH,
     dpi: i32,
@@ -200,16 +340,47 @@ struct App {
     snapshot: Option<Snapshot>,
     performance: Option<PerfSnapshot>,
     performance_error: Option<String>,
+    /// Per-process network availability of the latest sample (None before
+    /// the first one).
+    network_state: Option<NetworkState>,
     history: VecDeque<HistoryPoint>,
+    telemetry: ProcessTelemetry,
+    perf_history: PerfHistory,
+    perf_target: PerfTarget,
+    perf_targets: Vec<PerfTarget>,
+    core_graphs: bool,
+    category: usize,
+    process_settings: Option<crate::actions::ProcessSettings>,
+    process_detail_identity: Option<(u32, u64)>,
+    service_details: Option<crate::services::ServiceDetails>,
+    service_detail_name: Option<String>,
+    service_detail_error: Option<String>,
     startup: Vec<StartupEntry>,
+    startup_publishers: std::collections::HashMap<String, String>,
     services: Vec<Service>,
     rows: Vec<usize>,
+    group_mode: bool,
+    group_headers: std::collections::HashMap<usize, String>,
+    window_pids: HashSet<u32>,
+    last_window_scan: Option<Instant>,
     tree_mode: bool,
     tree_rows: Vec<TreeRow>,
     collapsed: HashSet<ProcessIdentity>,
+    /// App groups the user opened (the grouped view starts collapsed).
+    expanded_groups: HashSet<ProcessIdentity>,
+    /// Grouped view: whether a process's executable is inside the Windows
+    /// directory ("Windows processes"; None = unreadable), read once per
+    /// process.
+    windows_images: std::collections::HashMap<ProcessIdentity, Option<bool>>,
+    /// Grouped view: an app row's summed values over the app's processes,
+    /// keyed by the app root's snapshot index.
+    group_totals: std::collections::HashMap<usize, GroupTotal>,
     filter: String,
     sort: usize,
     descending: bool,
+    /// The user picked the sort column. Startup and Services show a sort
+    /// arrow only then (the reference's headers there show none).
+    sort_chosen: bool,
     paused: bool,
     minimized: bool,
     topmost: bool,
@@ -220,6 +391,11 @@ struct App {
     hover: usize,
     startup_loading: bool,
     startup_refresh_pending: bool,
+    /// A startup switch the user just flipped: (entry id, requested state).
+    /// The switch shows the requested state at once (it slides on click, like
+    /// the reference) until the reloaded list confirms it; a failed change
+    /// clears it and the switch slides back.
+    startup_pending: Option<(String, bool)>,
     services_loading: bool,
     startup_loaded: bool,
     services_loaded: bool,
@@ -241,7 +417,14 @@ impl App {
         results: Receiver<JobResult>,
     ) -> Self {
         Self {
-            icons: icons::IconCache::default(),
+            persist_preferences: false,
+            palette: null_mut(),
+            prefs: Preferences::default(),
+            preference_controls: Vec::new(),
+            tray_visible: false,
+            replacement_active: false,
+            show_telemetry: false,
+            show_details: false,
             hwnd: null_mut(),
             list: null_mut(),
             search: null_mut(),
@@ -254,32 +437,61 @@ impl App {
             refresh: null_mut(),
             view_mode: null_mut(),
             end_tree: null_mut(),
+            run_task: null_mut(),
+            extra: null_mut(),
+            filter_control: null_mut(),
+            copy: null_mut(),
+            cores: null_mut(),
+            resource_monitor: null_mut(),
+            expand_all: null_mut(),
+            more: null_mut(),
+            nuclear: null_mut(),
+            perf_list: null_mut(),
             nav: [null_mut(); 4],
-            font: null_mut(),
-            small: null_mut(),
-            heading: null_mut(),
-            metric: null_mut(),
-            bold: null_mut(),
+            fonts: fonts::Fonts::empty(),
+            back: gfx::BackBuffer::new(),
+            anim: anim::AnimHost::new(anim::ANIM_TIMER_ID),
+            frame: frame::Frame::new(),
             big_icon: null_mut(),
             small_icon: null_mut(),
-            row_images: 0,
-            bg: CreateSolidBrush(BG),
-            surface: CreateSolidBrush(SURFACE),
+            bg: CreateSolidBrush(colors().bg),
+            surface: CreateSolidBrush(colors().surface),
             dpi: 96,
             page: Page::Processes,
             snapshot: None,
             performance: None,
             performance_error: None,
+            network_state: None,
             history: VecDeque::with_capacity(120),
+            telemetry: ProcessTelemetry::default(),
+            perf_history: PerfHistory::default(),
+            perf_target: PerfTarget::Cpu,
+            perf_targets: vec![PerfTarget::Cpu, PerfTarget::Memory],
+            core_graphs: false,
+            category: 0,
+            process_settings: None,
+            process_detail_identity: None,
+            service_details: None,
+            service_detail_name: None,
+            service_detail_error: None,
             startup: Vec::new(),
+            startup_publishers: std::collections::HashMap::new(),
             services: Vec::new(),
             rows: Vec::new(),
+            group_mode: false,
+            group_headers: std::collections::HashMap::new(),
+            window_pids: HashSet::new(),
+            last_window_scan: None,
             tree_mode: false,
             tree_rows: Vec::new(),
             collapsed: HashSet::new(),
+            expanded_groups: HashSet::new(),
+            windows_images: std::collections::HashMap::new(),
+            group_totals: std::collections::HashMap::new(),
             filter: String::new(),
             sort: 3,
             descending: true,
+            sort_chosen: false,
             paused: false,
             minimized: false,
             topmost: false,
@@ -290,6 +502,7 @@ impl App {
             hover: 0,
             startup_loading: false,
             startup_refresh_pending: false,
+            startup_pending: None,
             services_loading: false,
             startup_loaded: false,
             services_loaded: false,
@@ -324,9 +537,11 @@ impl App {
     }
 }
 unsafe fn init_controls() {
+    // GDI+ must be running before any window paints (idempotent).
+    gfx::startup();
     InitCommonControlsEx(&INITCOMMONCONTROLSEX {
         dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+        dwICC: ICC_STANDARD_CLASSES,
     });
 }
 unsafe fn create_window(p: *mut App, class: &[u16], width: i32, height: i32) -> HWND {
@@ -367,13 +582,22 @@ pub fn run() {
         let (jobs, work) = mpsc::channel();
         let (complete, results) = mpsc::channel();
         let p = Box::into_raw(Box::new(App::new(rx, tx, jobs, results)));
+        (*p).persist_preferences = true;
+        (*p).group_mode = true;
+        (*p).prefs = Preferences::load();
+        (*p).interval = (*p).prefs.rate;
+        (*p).topmost = (*p).prefs.topmost;
+        (*p).prefs.apply_theme();
         let dpi = GetDpiForSystem().max(96) as i32;
         let class = wide("FeatherTaskManagerWindow");
+        // The window is its client plus the invisible resize borders (the
+        // custom frame has no caption): the reference's 1200 × 820 window.
+        let (width, height) = frame::outer_size(dpi as u32, 1200 * dpi / 96, 820 * dpi / 96, 0);
         let hwnd = create_window(
             p,
             &class,
-            (1200 * dpi / 96).min(GetSystemMetrics(SM_CXSCREEN).saturating_sub(32)),
-            (820 * dpi / 96).min(GetSystemMetrics(SM_CYSCREEN).saturating_sub(64)),
+            width.min(GetSystemMetrics(SM_CXSCREEN).saturating_sub(32)),
+            height.min(GetSystemMetrics(SM_CYSCREEN).saturating_sub(64)),
         );
         if hwnd.is_null() {
             MessageBoxW(
@@ -415,11 +639,35 @@ pub fn run() {
             );
         }
         let args: Vec<String> = std::env::args().collect();
-        switch_page(p, initial_page(&args));
+        let requested = if args.iter().any(|a| a == "--page" || a == "--task-manager") {
+            initial_page(&args)
+        } else {
+            Page::from_index((*p).prefs.default_page as usize)
+        };
+        switch_page(p, requested);
+        interactions::apply_theme(p);
+        interactions::sync_settings(p);
+        if (*p).topmost {
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        configure(p);
+        // Load the Services and Startup lists in the background shortly
+        // after launch, so their first visit shows rows at once instead of
+        // "Loading the list…".
+        SetTimer(hwnd, PREFETCH_TIMER, 1500, None);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            controls::observe_input(&msg);
             if keyboard(p, &msg) {
                 continue;
             }
@@ -430,6 +678,8 @@ pub fn run() {
         }
         dispose(p);
         UnregisterClassW(class.as_ptr(), GetModuleHandleW(null()));
+        gfx::buffered_paint_shutdown();
+        gfx::shutdown();
     }
 }
 fn initial_page(args: &[String]) -> Page {
@@ -452,12 +702,21 @@ fn initial_page(args: &[String]) -> Page {
 fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<MonitorSample>) {
     let mut sampler = Sampler::new();
     let mut perf: Option<PerfSampler> = None;
+    // One GPU attribution tracker and one network trace for the monitor's
+    // lifetime; the trace (an ETW session, elevated only) ends when this
+    // thread returns on Stop.
+    let mut gpu_tracker = ProcessGpuTracker::default();
+    let mut network = NetworkMonitor::new();
     let mut performance = false;
     let mut interval = 1000;
     let mut paused = false;
     let mut refresh = true;
+    // When the last sample was taken: the next one is due one interval
+    // later, whatever commands arrive in between.
+    let mut last: Option<Instant> = None;
     loop {
         if refresh {
+            last = Some(Instant::now());
             if sampler.is_err() {
                 sampler = Sampler::new();
             }
@@ -474,6 +733,8 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                                 at: Instant::now(),
                                 snapshot,
                                 performance: Some(Err(e)),
+                                process_gpu: Default::default(),
+                                process_network: Default::default(),
                             };
                             if snapshots.try_send(value).is_ok() {
                                 unsafe {
@@ -489,11 +750,26 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
             } else {
                 None
             };
+            // Join both per-process maps with this iteration's process list
+            // (keyed by pid and creation time, so a reused PID never
+            // inherits a value).
+            let (process_gpu, process_network) = match &snapshot {
+                Ok(s) => (
+                    gpu_tracker.join(
+                        &s.processes,
+                        perf_result.as_ref().and_then(|r| r.as_ref().ok()),
+                    ),
+                    network.sample(&s.processes),
+                ),
+                Err(_) => Default::default(),
+            };
             if snapshots
                 .try_send(MonitorSample {
                     at: Instant::now(),
                     snapshot,
                     performance: perf_result,
+                    process_gpu,
+                    process_network,
                 })
                 .is_ok()
             {
@@ -507,7 +783,8 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 .recv()
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
         } else {
-            commands.recv_timeout(Duration::from_millis(interval))
+            let period = Duration::from_millis(interval);
+            commands.recv_timeout(last.map_or(period, |at| period.saturating_sub(at.elapsed())))
         };
         match result {
             Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -517,23 +794,95 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 performance: requested,
             }) => {
                 interval = i;
+                if p && !paused {
+                    // Bytes counted while paused are not shown: the first
+                    // sample after resuming starts a fresh interval (every
+                    // process reads "—" once, like GPU after a pause).
+                    let _ = network.sample(&[]);
+                }
                 paused = p;
                 if performance != requested || paused {
                     perf = None;
                 }
                 performance = requested;
-                refresh = !paused;
+                // A sample only milliseconds after the previous one measures
+                // CPU over a sliver of time: a needle at the start of every
+                // chart (the app configures itself twice while starting). A
+                // recent sample stands; the next comes on schedule, and a
+                // newly requested performance sampler is primed now (its
+                // first collection has no rates anyway).
+                let recent = last.is_some_and(|at| {
+                    at.elapsed() < Duration::from_millis((interval / 2).max(100))
+                });
+                refresh = !paused && !recent;
+                if !paused && recent && performance && perf.is_none() {
+                    if let Ok(mut sampler) = PerfSampler::new() {
+                        let _ = sampler.sample();
+                        perf = Some(sampler);
+                    }
+                }
             }
             Ok(Command::Refresh) => refresh = true,
             Err(mpsc::RecvTimeoutError::Timeout) => refresh = true,
         }
     }
 }
+/// A service's name for a notice: its display name, else its key.
+fn service_label<'a>(name: &'a str, display: &'a str) -> &'a str {
+    if display.trim().is_empty() {
+        name
+    } else {
+        display
+    }
+}
+/// The toast after a startup app was switched on or off.
+fn startup_notice(name: &str, enabled: bool) -> String {
+    if enabled {
+        tf!(
+            "{}: 다음 로그인부터 실행됩니다",
+            "{} will launch at startup",
+            name
+        )
+    } else {
+        tf!(
+            "{}: 다음 로그인부터 실행되지 않습니다",
+            "{} won\u{2019}t launch at startup",
+            name
+        )
+    }
+}
 fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
     while let Ok(job) = jobs.recv() {
+        let job = match job {
+            Job::Cleanup(options, events) => {
+                nuclear::run_job(hwnd, options, &events);
+                continue;
+            }
+            job => job,
+        };
         let result = match job {
             Job::Stop => break,
-            Job::Startup => JobResult::Startup(crate::startup::list()),
+            Job::Cleanup(..) => unreachable!(),
+            Job::ProcessDetails(pid, created) => JobResult::ProcessDetails(
+                pid,
+                created,
+                crate::actions::process_settings(pid, created),
+            ),
+            Job::ServiceDetails(name) => {
+                let result = crate::services::details(&name);
+                JobResult::ServiceDetails(name, result)
+            }
+            Job::Startup => {
+                let result = crate::startup::list();
+                if let Ok(entries) = &result {
+                    let publishers = entries
+                        .iter()
+                        .filter_map(|e| crate::startup::publisher(e).map(|v| (e.id.clone(), v)))
+                        .collect();
+                    let _ = complete.send(JobResult::Publishers(publishers));
+                }
+                JobResult::Startup(result)
+            }
             Job::Services => JobResult::Services(crate::services::list()),
             Job::Action(action) => {
                 if let Action::EndTree(plan) = action {
@@ -559,41 +908,72 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
                 }
                 let (result, page, notice) = match action {
                     Action::EndTree(_) => unreachable!(),
+                    Action::Priority(pid, created, priority) => (
+                        crate::actions::set_priority(pid, created, priority),
+                        Page::Processes,
+                        tr("우선순위를 변경했습니다.", "Updated process priority.").into(),
+                    ),
+                    Action::Efficiency(pid, created, enabled) => (
+                        crate::actions::set_efficiency(pid, created, enabled),
+                        Page::Processes,
+                        tr("효율 모드를 변경했습니다.", "Updated efficiency mode.").into(),
+                    ),
+                    Action::Restart(name, display) => (
+                        crate::services::restart(&name),
+                        Page::Services,
+                        tf!(
+                            "{} 서비스를 다시 시작했습니다.",
+                            "Restarted {}",
+                            service_label(&name, &display)
+                        ),
+                    ),
+                    Action::SystemTool(tool) => (
+                        crate::actions::launch_system_tool(tool),
+                        Page::Performance,
+                        tr("Windows 도구를 열었습니다.", "Opened the Windows tool.").into(),
+                    ),
+                    Action::RunTask(path) => (
+                        crate::actions::launch_task(&path),
+                        Page::Processes,
+                        tr("새 작업을 실행했습니다.", "Started the new task.").into(),
+                    ),
                     Action::End(pid, created) => (
                         crate::actions::terminate(pid, created),
                         Page::Processes,
                         tr(
                             "종료 요청을 보냈습니다.",
                             "The process termination request was sent.",
-                        ),
+                        )
+                        .into(),
                     ),
                     Action::Reveal(pid, created) => (
                         crate::actions::reveal_executable(pid, created),
                         Page::Processes,
-                        tr("파일 위치를 열었습니다.", "Opened the file location."),
+                        tr("파일 위치를 열었습니다.", "Opened the file location.").into(),
                     ),
                     Action::Toggle(entry, enabled) => (
                         crate::startup::set_enabled(&entry, enabled),
                         Page::Startup,
-                        tr(
-                            "시작 앱 설정을 변경했습니다.",
-                            "Updated the startup app setting.",
-                        ),
+                        // Sent only after the change succeeded, naming the app
+                        // and the outcome like the reference's toast.
+                        startup_notice(&entry.name, enabled),
                     ),
-                    Action::Start(name) => (
+                    Action::Start(name, display) => (
                         crate::services::start(&name),
                         Page::Services,
-                        tr(
-                            "서비스 시작 요청을 보냈습니다.",
-                            "The service start request was sent.",
+                        tf!(
+                            "{} 서비스 시작 요청을 보냈습니다.",
+                            "Start request sent: {}",
+                            service_label(&name, &display)
                         ),
                     ),
-                    Action::Stop(name) => (
+                    Action::Stop(name, display) => (
                         crate::services::stop(&name),
                         Page::Services,
-                        tr(
-                            "서비스 중지 요청을 보냈습니다.",
-                            "The service stop request was sent.",
+                        tf!(
+                            "{} 서비스 중지 요청을 보냈습니다.",
+                            "Stop request sent: {}",
+                            service_label(&name, &display)
                         ),
                     ),
                     Action::Elevate => (
@@ -602,25 +982,27 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
                         tr(
                             "관리자 권한 창을 열었습니다.",
                             "Opened an administrator window.",
-                        ),
+                        )
+                        .into(),
                     ),
                     Action::ReplaceTaskManager(enable, page) => (
                         crate::replacement::run_elevated(enable),
                         page,
                         if enable {
-                            tr("Feather를 Windows 작업 관리자로 설정했습니다. 다음 실행부터 적용됩니다.", "Feather is now the Windows Task Manager. The change applies next time you open it.")
+                            tr("Feather를 Windows 작업 관리자로 설정했습니다. 다음 실행부터 적용됩니다.", "Feather is now the Windows Task Manager. The change applies next time you open it.").into()
                         } else {
                             tr(
                                 "Windows 기본 작업 관리자로 복원했습니다.",
                                 "Restored the default Windows Task Manager.",
                             )
+                            .into()
                         },
                     ),
                 };
                 JobResult::Action {
                     result,
                     page,
-                    notice: notice.into(),
+                    notice,
                 }
             }
         };
@@ -633,6 +1015,8 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
     }
 }
 unsafe fn dispose(p: *mut App) {
+    shell::destroy_palette(p);
+    shell::remove_tray(p);
     let app = Box::from_raw(p);
     let _ = app.tx.send(Command::Stop);
     let _ = app.jobs.send(Job::Stop);
@@ -641,32 +1025,33 @@ unsafe fn dispose(p: *mut App) {
             DestroyIcon(icon);
         }
     }
-    for object in [
-        app.font,
-        app.small,
-        app.heading,
-        app.metric,
-        app.bold,
-        app.bg,
-        app.surface,
-    ] {
+    // Fonts, the back buffer and the animation timer are released by their owners.
+    for object in [app.bg, app.surface] {
         if !object.is_null() {
             DeleteObject(object);
         }
     }
-    if app.row_images != 0 {
-        ImageList_Destroy(app.row_images);
-    }
 }
 unsafe fn keyboard(p: *mut App, msg: &MSG) -> bool {
+    if shell::palette_key(p, msg) {
+        return true;
+    }
     if msg.message != WM_KEYDOWN {
         return false;
     }
     let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
     let key = msg.wParam as u16;
+    if ctrl && key == b'K' as u16 {
+        shell::open_palette(p);
+        return true;
+    }
     let id = if ctrl && (b'1' as u16..=b'4' as u16).contains(&key) {
         NAV + (key - b'1' as u16) as usize
-    } else if ctrl && key == b'F' as u16 && (*p).page != Page::Performance {
+    } else if ctrl
+        && key == b'F' as u16
+        && (*p).page != Page::Performance
+        && (*p).page != Page::Settings
+    {
         SetFocus((*p).search);
         SendMessageW((*p).search, EM_SETSEL, 0, -1);
         return true;
@@ -683,13 +1068,17 @@ unsafe fn keyboard(p: *mut App, msg: &MSG) -> bool {
         }
     } else if matches!(key, VK_LEFT | VK_RIGHT)
         && msg.hwnd == (*p).list
-        && (*p).tree_mode
+        && ((*p).tree_mode || grouped_view(p))
         && (*p).page == Page::Processes
     {
         toggle_selected_branch(p, Some(key == VK_RIGHT));
         return true;
     } else if key == VK_SPACE && msg.hwnd == (*p).list {
-        PAUSE
+        if (*p).page == Page::Startup {
+            PRIMARY
+        } else {
+            PAUSE
+        }
     } else if ctrl && key == b'L' as u16 && (*p).page == Page::Processes {
         SECONDARY
     } else {
@@ -711,11 +1100,36 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     if p.is_null() {
         return DefWindowProcW(hwnd, msg, w, l);
     }
+    static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if msg != 0
+        && msg
+            == *TASKBAR_CREATED
+                .get_or_init(|| unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) })
+    {
+        shell::taskbar_created(p);
+        return 0;
+    }
+    if let Some(result) = frame::handle(p, hwnd, msg, w, l) {
+        return result;
+    }
     match msg {
         WM_CREATE => {
             (*p).dpi = GetDpiForWindow(hwnd).max(96) as i32;
+            (*p).anim.attach(hwnd);
             update_window_icons(p);
             create_controls(p);
+            frame::attach(p);
+            0
+        }
+        WM_SETTINGCHANGE => {
+            anim::refresh_reduced_motion();
+            if (*p).prefs.theme == 0 {
+                interactions::apply_theme(p);
+            }
+            0
+        }
+        shell::TRAY_MESSAGE => {
+            shell::tray_message(p, l);
             0
         }
         WM_SIZE => {
@@ -723,6 +1137,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             if minimized != (*p).minimized {
                 (*p).minimized = minimized;
                 configure(p);
+                if minimized && (*p).prefs.tray {
+                    shell::minimize_to_tray(p);
+                }
             }
             if !minimized {
                 layout(p);
@@ -731,8 +1148,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_GETMINMAXINFO => {
             let m = &mut *(l as *mut MINMAXINFO);
-            m.ptMinTrackSize.x = scale(p, 980);
-            m.ptMinTrackSize.y = scale(p, 660);
+            m.ptMinTrackSize = frame::min_track_size(p);
             0
         }
         WM_DPICHANGED => {
@@ -749,7 +1165,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 r.bottom - r.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            resize_columns(p);
             layout(p);
             0
         }
@@ -766,6 +1181,23 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             drain_jobs(p);
             0
         }
+        // A cleanup run finished after its panel was closed.
+        nuclear::CLEANUP_READY => {
+            nuclear::background_event(p);
+            0
+        }
+        WM_CONTEXTMENU if w as HWND == (*p).list => {
+            // Apps / Shift+F10 open the menu at the selected row.
+            match table::keyboard_menu_anchor((*p).list, l) {
+                Some(anchor) => interactions::extra_menu_below(p, anchor),
+                None => interactions::extra_menu(p),
+            }
+            0
+        }
+        WM_CONTEXTMENU if w as HWND == (*p).settings => {
+            settings_menu(p);
+            0
+        }
         WM_DRAWITEM => {
             paint::draw_button(p, &*(l as *const DRAWITEMSTRUCT));
             1
@@ -774,26 +1206,58 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             paint::paint(p);
             0
         }
+        WM_TIMER if w == PREFETCH_TIMER => {
+            KillTimer(hwnd, PREFETCH_TIMER);
+            for (page, loaded) in [
+                (Page::Services, (*p).services_loaded),
+                (Page::Startup, (*p).startup_loaded),
+            ] {
+                if !loaded && !(*p).modal {
+                    request_list(p, page);
+                }
+            }
+            0
+        }
+        WM_TIMER => {
+            if (*p).anim.on_timer(w) {
+                0
+            } else {
+                DefWindowProcW(hwnd, msg, w, l)
+            }
+        }
         WM_PRINTCLIENT => {
             paint::paint_to(p, w as HDC);
             0
         }
         WM_ERASEBKGND => 1,
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
-            SetBkColor(w as HDC, SURFACE);
-            SetTextColor(w as HDC, INK);
+            SetBkColor(w as HDC, colors().surface);
+            SetTextColor(w as HDC, colors().fg);
+            (*p).surface as isize
+        }
+        // A disabled edit asks for static colors; the search input keeps the
+        // search box's surface so it never shows as a plain rectangle.
+        WM_CTLCOLORSTATIC if l as HWND == (*p).search => {
+            SetBkColor(w as HDC, colors().surface);
+            SetTextColor(w as HDC, colors().muted);
             (*p).surface as isize
         }
         WM_CTLCOLORSTATIC => {
-            SetBkColor(w as HDC, BG);
-            SetTextColor(w as HDC, INK);
+            SetBkColor(w as HDC, colors().bg);
+            SetTextColor(w as HDC, colors().fg);
             (*p).bg as isize
+        }
+        // Popups anchored to the window (dropdowns, toast) do not follow it.
+        WM_MOVE => {
+            controls::owner_moved(p);
+            0
         }
         WM_CLOSE => {
             DestroyWindow(hwnd);
             0
         }
         WM_DESTROY => {
+            (*p).anim.stop();
             let _ = (*p).tx.send(Command::Stop);
             let _ = (*p).jobs.send(Job::Stop);
             PostQuitMessage(0);
@@ -836,6 +1300,69 @@ unsafe fn update_window_icons(p: *mut App) {
 unsafe fn redraw(p: *mut App) {
     InvalidateRect((*p).hwnd, null(), 0);
 }
+/// Stop the main window and every child from painting (`WM_SETREDRAW`)
+/// while a page switch or a theme change rebuilds them; [`present_all`]
+/// puts the result on screen. Hidden windows (tests, previews) are left
+/// alone: re-enabling redraw would give them WS_VISIBLE. Returns whether
+/// painting was suspended.
+unsafe fn suspend_painting(p: *mut App) -> bool {
+    let hwnd = (*p).hwnd;
+    if hwnd.is_null() || IsWindowVisible(hwnd) == 0 {
+        return false;
+    }
+    SendMessageW(hwnd, WM_SETREDRAW, 0, 0);
+    true
+}
+/// Resume painting after [`suspend_painting`] and present the whole new
+/// frame at once: the main window and the table compose into their back
+/// buffers first, then — right after a DWM composition, so the copies land
+/// in one frame — both are copied to the screen back to back and the small
+/// child controls paint synchronously. No presented frame mixes the old
+/// page (or theme) with the new one.
+unsafe fn present_all(p: *mut App, suspended: bool) {
+    let hwnd = (*p).hwnd;
+    if !suspended {
+        RedrawWindow(
+            hwnd,
+            null(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME,
+        );
+        return;
+    }
+    SendMessageW(hwnd, WM_SETREDRAW, 1, 0);
+    let main = paint::render_back(p);
+    let table = table::render_back((*p).list);
+    windows_sys::Win32::Graphics::Dwm::DwmFlush();
+    let mut client: RECT = zeroed();
+    GetClientRect(hwnd, &mut client);
+    let dc = GetDC(hwnd);
+    if main && !dc.is_null() {
+        (*p).back.present(dc, &client);
+        ValidateRect(hwnd, null());
+    } else {
+        InvalidateRect(hwnd, null(), 0);
+    }
+    if !dc.is_null() {
+        ReleaseDC(hwnd, dc);
+    }
+    if table {
+        table::present_back((*p).list);
+    }
+    let mut child = GetWindow(hwnd, GW_CHILD);
+    while !child.is_null() {
+        if (child != (*p).list || !table) && IsWindowVisible(child) != 0 {
+            RedrawWindow(
+                child,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+        }
+        child = GetWindow(child, GW_HWNDNEXT);
+    }
+    UpdateWindow(hwnd);
+}
 unsafe fn create_control(p: *mut App, class: &str, label: &str, style: u32, id: usize) -> HWND {
     CreateWindowExW(
         0,
@@ -876,17 +1403,43 @@ unsafe extern "system" fn button_subclass(
                 dwHoverTime: 0,
             };
             TrackMouseEvent(&mut e);
+            // Hover backgrounds cross-fade in (spec section 6); the driver
+            // repaints only this button while the fade runs.
+            (*p).anim.register((id, anim::part::HOVER), hwnd, None);
+            (*p).anim.set_target(
+                (id, anim::part::HOVER),
+                1.0,
+                anim::motion::HOVER_IN,
+                anim::Easing::EaseOut,
+            );
             InvalidateRect(hwnd, null(), 0);
         }
         WM_MOUSELEAVE => {
             if (*p).hover == id {
                 (*p).hover = 0;
             }
+            (*p).anim.set_target(
+                (id, anim::part::HOVER),
+                0.0,
+                anim::motion::HOVER_OUT,
+                anim::Easing::EaseOut,
+            );
             InvalidateRect(hwnd, null(), 0);
         }
-        WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE => {
+        // The face is painted completely (buffered) in WM_DRAWITEM.
+        WM_ERASEBKGND => return 1,
+        // `button { cursor: pointer }` (a disabled button never gets here:
+        // its parent shows the arrow).
+        WM_SETCURSOR if w as HWND == hwnd && IsWindowEnabled(hwnd) != 0 => {
+            return widgets::set_pointer(true);
+        }
+        // `:focus-visible`: a click never shows the keyboard focus ring.
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => controls::pointer_pressed(hwnd),
+        WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE | WM_UPDATEUISTATE => {
+            controls::focus_changed(p, hwnd);
             InvalidateRect(hwnd, null(), 0);
         }
+        WM_WINDOWPOSCHANGED if GetFocus() == hwnd => controls::focus_changed(p, hwnd),
         WM_NCDESTROY => {
             RemoveWindowSubclass(hwnd, Some(button_subclass), id);
         }
@@ -900,270 +1453,613 @@ unsafe fn create_controls(p: *mut App) {
     }
     (*p).search = create_control(p, "Edit", "", WS_TABSTOP | ES_AUTOHSCROLL as u32, SEARCH);
     (*p).pause = button(p, tr("일시정지", "Pause"), PAUSE);
-    (*p).rate = create_control(
-        p,
-        "ComboBox",
-        tr("갱신 간격", "Refresh interval"),
-        WS_TABSTOP | CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
-        RATE,
-    );
-    for label in [
-        tr("0.5초", "0.5 s"),
-        tr("1초", "1 s"),
-        tr("2초", "2 s"),
-        tr("5초", "5 s"),
-    ] {
+    (*p).rate = controls::select(p, tr("새로 고침 간격", "Refresh interval"), RATE);
+    for label in rate_labels() {
         SendMessageW((*p).rate, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
     }
-    SendMessageW((*p).rate, CB_SETCURSEL, 1, 0);
+    SendMessageW((*p).rate, CB_SETCURSEL, 3, 0);
     (*p).top = button(p, tr("항상 위에 표시", "Always on top"), TOP);
     (*p).settings = button(p, tr("설정", "Settings"), SETTINGS);
     (*p).primary = button(p, tr("작업 끝내기", "End task"), PRIMARY);
     (*p).secondary = button(p, tr("파일 위치 열기", "Open file location"), SECONDARY);
     (*p).refresh = button(p, tr("새로고침", "Refresh"), REFRESH);
-    (*p).view_mode = create_control(
-        p,
-        "ComboBox",
-        tr("프로세스 표시 방식", "Process view"),
-        WS_TABSTOP | CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
-        VIEW_MODE,
-    );
+    (*p).view_mode = controls::select(p, tr("프로세스 표시 방식", "Process view"), VIEW_MODE);
     (*p).end_tree = button(p, tr("트리 전체 종료", "End process tree"), END_TREE);
     populate_view_modes(p);
-    (*p).list = create_control(
+    (*p).run_task = button(p, tr("새 작업 실행", "Run new task"), RUN_TASK);
+    (*p).extra = button(p, tr("더 보기", "More actions"), EXTRA);
+    (*p).copy = button(p, tr("정보 복사", "Copy info"), COPY);
+    (*p).cores = button(p, tr("코어별 보기", "Logical CPUs"), CORES);
+    (*p).resource_monitor = button(p, tr("리소스 모니터", "Resource Monitor"), RESOURCE_MONITOR);
+    (*p).expand_all = button(p, tr("모두 펼치기", "Expand all"), EXPAND_ALL);
+    // Painted as the 32 × 32 "⋯" icon button; the text names it for
+    // accessibility tools.
+    (*p).more = button(p, tr("추가 작업", "More actions"), MORE);
+    // The same name in both languages (the user's choice); the panel's
+    // subtitle says what it does.
+    (*p).nuclear = button(p, "Nuclear Zombie", NUCLEAR);
+    (*p).filter_control = controls::select(p, tr("상태 필터", "Status filter"), FILTER);
+    // Custom virtual list / table controls (table.rs): device cards and the
+    // processes / startup / services table, with overlay scrollbars.
+    (*p).perf_list = table::create_devices(
         p,
-        "SysListView32",
-        tr("프로세스 목록", "Process list"),
-        WS_TABSTOP
-            | LVS_REPORT
-            | LVS_OWNERDATA
-            | LVS_SINGLESEL
-            | LVS_SHOWSELALWAYS
-            | LVS_SHAREIMAGELISTS,
-        200,
+        PERF_COMPONENT,
+        tr("하드웨어 구성 요소", "Hardware components"),
     );
-    SendMessageW(
-        (*p).list,
-        LVM_SETEXTENDEDLISTVIEWSTYLE,
-        0,
-        (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize,
+    (*p).list = table::create_table(p, 200, tr("프로세스 목록", "Process list"));
+    SetWindowSubclass(
+        (*p).search,
+        Some(interactions::search_subclass),
+        1,
+        p as usize,
     );
-    SendMessageW((*p).list, LVM_SETBKCOLOR, 0, SURFACE as isize);
-    SendMessageW((*p).list, LVM_SETTEXTBKCOLOR, 0, SURFACE as isize);
-    SendMessageW((*p).list, LVM_SETTEXTCOLOR, 0, INK as isize);
-    SendMessageW((*p).list, CCM_SETUNICODEFORMAT, 1, 0);
-    SetWindowTheme((*p).list, wide("Explorer").as_ptr(), null());
+    interactions::create_settings_controls(p);
     create_fonts(p);
     setup_columns(p);
     update_buttons(p);
     layout(p);
+    controls::init_focus_cues(p);
+}
+/// The refresh-rate choices (status bar and Settings), localized.
+fn rate_labels() -> [&'static str; 6] {
+    [
+        tr("일시정지", "Paused"),
+        tr("0.25초", "0.25 s"),
+        tr("0.5초", "0.5 s"),
+        tr("1초", "1 s"),
+        tr("2초", "2 s"),
+        tr("5초", "5 s"),
+    ]
 }
 unsafe fn create_fonts(p: *mut App) {
-    let old = [(*p).font, (*p).small, (*p).heading, (*p).metric, (*p).bold];
-    let dpi = (*p).dpi;
-    let make = |pixels: i32, weight: i32, family: &str| {
-        CreateFontW(
-            -pixels * dpi / 96,
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            CLIP_DEFAULT_PRECIS as u32,
-            CLEARTYPE_QUALITY as u32,
-            DEFAULT_PITCH as u32,
-            wide(family).as_ptr(),
-        )
-    };
-    let family = tr("Malgun Gothic", "Segoe UI");
-    (*p).font = make(14, 400, family);
-    (*p).small = make(12, 400, family);
-    (*p).heading = make(28, 700, family);
-    (*p).metric = make(28, 600, "Segoe UI");
-    (*p).bold = make(14, 700, family);
-    for h in [
-        (*p).list,
+    shell::destroy_palette(p);
+    let fonts = fonts::Fonts::new((*p).dpi, language());
+    // Body text (14 px) for the table, the search input and the nav rail;
+    // selects use the 12 px role; every other control the 13 px UI role.
+    let (body, ui, small) = (fonts.body, fonts.ui, fonts.small);
+    let selects = [(*p).rate, (*p).view_mode, (*p).filter_control];
+    for h in [(*p).list, (*p).search].into_iter().chain((*p).nav) {
+        SendMessageW(h, WM_SETFONT, body as usize, 1);
+    }
+    // The search text starts exactly at the search box's 34 px text inset
+    // (where the placeholder is painted); WM_SETFONT resets the margins.
+    SendMessageW(
         (*p).search,
+        EM_SETMARGINS,
+        (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
+        0,
+    );
+    for h in [
         (*p).pause,
-        (*p).rate,
         (*p).top,
         (*p).settings,
         (*p).primary,
         (*p).secondary,
         (*p).refresh,
-        (*p).view_mode,
         (*p).end_tree,
+        (*p).run_task,
+        (*p).extra,
+        (*p).copy,
+        (*p).cores,
+        (*p).resource_monitor,
+        (*p).expand_all,
+        (*p).more,
+        (*p).nuclear,
+        (*p).perf_list,
     ]
     .into_iter()
-    .chain((*p).nav)
+    .chain(selects)
+    .chain((*p).preference_controls.iter().copied())
     {
-        SendMessageW(h, WM_SETFONT, (*p).font as usize, 1);
+        let select = selects.contains(&h)
+            || matches!(
+                GetDlgCtrlID(h) as usize,
+                PREF_LANGUAGE | PREF_RATE | PREF_START
+            );
+        SendMessageW(h, WM_SETFONT, if select { small } else { ui } as usize, 1);
     }
-    let images = ImageList_Create(1, scale(p, 32), ILC_COLOR32, 1, 0);
-    SendMessageW((*p).list, LVM_SETIMAGELIST, LVSIL_SMALL as usize, images);
-    if (*p).row_images != 0 {
-        ImageList_Destroy((*p).row_images);
-    }
-    (*p).row_images = images;
-    for obj in old {
-        if !obj.is_null() {
-            DeleteObject(obj);
-        }
-    }
+    // Controls now reference the new handles; the old set is deleted here.
+    drop(std::mem::replace(&mut (*p).fonts, fonts));
+    frame::refresh_search_font(p);
 }
+/// Table columns per page: (label, CSS px width — 0 = flexible, numeric).
+/// Widths follow the reference's `<colgroup>`s: Processes PID 80 (where the
+/// reference has a Status column) / 92 / 112 / 100 / 120 / 80 — the metric
+/// columns sit exactly where the reference puts them — Startup 200 / 120 /
+/// 120, Services 180 / 80 / flexible description / 110 / 170.
 fn columns(page: Page) -> Vec<(&'static str, i32, bool)> {
     match page {
         Page::Processes => vec![
-            (tr("프로세스", "Processes"), 250, false),
-            ("PID", 76, true),
-            ("CPU", 80, true),
+            (tr("이름", "Name"), 0, false),
+            ("PID", 80, true),
+            ("CPU", 92, true),
             (tr("메모리", "Memory"), 112, true),
-            (tr("전용 메모리", "Private memory"), 120, true),
-            (tr("I/O / 초", "I/O / sec"), 110, true),
-            (tr("스레드", "Threads"), 70, true),
-            (tr("핸들", "Handles"), 70, true),
+            (tr("전체 I/O", "All I/O"), 100, true),
+            (tr("네트워크", "Network"), 120, true),
+            ("GPU", 80, true),
         ],
         Page::Startup => vec![
-            (tr("앱 이름", "App name"), 230, false),
-            (tr("상태", "Status"), 180, false),
-            (tr("위치", "Location"), 200, false),
-            (tr("실행 명령", "Command"), 420, false),
+            (tr("이름", "Name"), 0, false),
+            (tr("게시자¹", "Publisher¹"), 200, false),
+            (tr("시작 영향", "Startup impact"), 120, false),
+            (tr("사용", "Enabled"), 120, false),
         ],
         Page::Services => vec![
-            (tr("서비스 이름", "Service name"), 220, false),
-            (tr("표시 이름", "Display name"), 330, false),
-            (tr("상태", "Status"), 120, false),
+            (tr("이름", "Name"), 180, false),
             ("PID", 80, true),
-            (tr("시작 유형", "Startup type"), 120, false),
+            (tr("표시 이름", "Display name"), 0, false),
+            (tr("상태", "Status"), 110, false),
+            (tr("시작 유형", "Startup type"), 170, false),
         ],
-        Page::Performance => vec![],
+        Page::Performance | Page::Settings => vec![],
+    }
+}
+/// The columns the table shows now: the page's, minus Services' Startup type
+/// while the details panel is open (the panel repeats it, and the Display
+/// name column gets the room — the reference drops `.col-group` the same way
+/// when space runs out).
+unsafe fn shown_columns(p: *mut App) -> Vec<table::Column> {
+    let page = (*p).page;
+    let mut all = columns(page);
+    if page == Page::Services && view_split(p, &current_layout(p)).2.is_some() {
+        all.truncate(4);
+    }
+    all.iter()
+        .enumerate()
+        .map(|(i, &(name, width, numeric))| table::Column {
+            label: name.into(),
+            width: width as f32,
+            flex: width == 0,
+            // Numbers and the startup switch (`th.r`) are right-aligned.
+            right: numeric || (page == Page::Startup && i == 3),
+        })
+        .collect()
+}
+/// Re-apply [`shown_columns`] when they changed (the details panel opened
+/// or closed, or the window crossed its minimum width).
+unsafe fn sync_columns(p: *mut App) {
+    let columns = shown_columns(p);
+    if table::column_count((*p).list) != columns.len() {
+        table::set_columns((*p).list, columns);
     }
 }
 unsafe fn setup_columns(p: *mut App) {
-    while SendMessageW((*p).list, LVM_DELETECOLUMN, 0, 0) != 0 {}
-    for (i, &(name, width, numeric)) in columns((*p).page).iter().enumerate() {
-        let mut text = wide(name);
-        let column = LVCOLUMNW {
-            mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM,
-            fmt: if numeric { LVCFMT_RIGHT } else { LVCFMT_LEFT },
-            cx: scale(
-                p,
-                if i == 0 && (*p).page == Page::Processes && (*p).tree_mode {
-                    320
-                } else {
-                    width
-                },
-            ),
-            pszText: text.as_mut_ptr(),
-            iSubItem: i as i32,
-            ..zeroed()
-        };
-        SendMessageW(
-            (*p).list,
-            LVM_INSERTCOLUMNW,
-            i,
-            &column as *const _ as isize,
-        );
-    }
-    let cue = match (*p).page {
-        Page::Processes => tr("이름 또는 PID 검색 · Ctrl+F", "Search name or PID · Ctrl+F"),
-        Page::Startup => tr("앱 이름 또는 실행 명령 검색", "Search app name or command"),
-        Page::Services => tr(
-            "서비스 이름, 표시 이름 또는 PID 검색",
-            "Search service name or PID",
-        ),
-        Page::Performance => "",
-    };
-    SendMessageW((*p).search, EM_SETCUEBANNER, 1, wide(cue).as_ptr() as isize);
+    table::set_columns((*p).list, shown_columns(p));
+    // The placeholder is painted by the search subclass in the design's
+    // muted color, focused or not; the cue banner (never drawn: wParam 0
+    // and the subclass paints over the empty input) names it for
+    // assistive technology.
+    let cue = paint::search_placeholder((*p).page);
+    SendMessageW((*p).search, EM_SETCUEBANNER, 0, wide(cue).as_ptr() as isize);
     SetWindowTextW(
         (*p).list,
         wide(&tf!("{} 목록", "{} list", (*p).page.title())).as_ptr(),
     );
+    interactions::populate_filters(p);
     update_sort_header(p);
 }
-unsafe fn resize_columns(p: *mut App) {
-    for (i, &(_, width, _)) in columns((*p).page).iter().enumerate() {
-        let width = if i == 0 && (*p).page == Page::Processes && (*p).tree_mode {
-            320
-        } else {
-            width
-        };
-        SendMessageW((*p).list, LVM_SETCOLUMNWIDTH, i, scale(p, width) as isize);
-    }
-}
-unsafe fn layout(p: *mut App) {
+/// The geometry of the current client area and page (see `layout.rs`).
+unsafe fn current_layout(p: *mut App) -> layout::Layout {
     let mut r: RECT = zeroed();
     GetClientRect((*p).hwnd, &mut r);
-    let s = |v| scale(p, v);
-    let mv = |h, x, y, w: i32, ht: i32| {
-        MoveWindow(h, x, y, w.max(1), ht.max(1), 1);
-    };
-    for i in 0..4 {
-        mv((*p).nav[i], s(12), s(126 + 52 * i as i32), s(172), s(44));
+    layout::Layout::new(r.right, r.bottom, (*p).dpi, (*p).page)
+}
+/// One entry of the page head's right-aligned action row (DESIGN_SPEC §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadItem {
+    /// A child control (button, select or the "⋯" more button).
+    Control(HWND),
+    /// Muted 12 px text painted by the page head (Startup's sign-in note).
+    Note(&'static str),
+}
+fn startup_note() -> &'static str {
+    tr(
+        "다음 로그인부터 적용됩니다",
+        "Changes apply next time you sign in",
+    )
+}
+/// The page head's actions in visual order. Everything else that used to sit
+/// in the rail is reachable through ⋯ menus, the palette, shortcuts, the
+/// status bar or Settings.
+unsafe fn head_items(p: *mut App) -> Vec<HeadItem> {
+    let c = HeadItem::Control;
+    match (*p).page {
+        Page::Processes => {
+            let mut items = vec![c((*p).view_mode)];
+            if (*p).tree_mode {
+                items.push(c((*p).expand_all));
+            }
+            items.extend([c((*p).nuclear), c((*p).primary), c((*p).more)]);
+            items
+        }
+        Page::Performance => vec![c((*p).cores), c((*p).copy), c((*p).resource_monitor)],
+        Page::Startup => vec![
+            HeadItem::Note(startup_note()),
+            c((*p).filter_control),
+            c((*p).more),
+        ],
+        Page::Services => vec![
+            c((*p).filter_control),
+            c((*p).primary),
+            c((*p).secondary),
+            c((*p).extra),
+            c((*p).more),
+        ],
+        Page::Settings => Vec::new(),
     }
-    mv((*p).top, s(12), r.bottom - s(134), s(172), s(36));
-    mv((*p).settings, s(12), r.bottom - s(90), s(172), s(36));
-    mv((*p).view_mode, r.right - s(356), s(36), s(164), s(180));
-    let x = s(220);
-    mv((*p).search, x + s(42), s(215), r.right - x - s(356), s(26));
-    mv((*p).rate, r.right - s(280), s(213), s(68), s(220));
-    mv((*p).pause, r.right - s(200), s(209), s(84), s(36));
-    mv((*p).refresh, r.right - s(104), s(209), s(80), s(36));
-    mv((*p).list, x, s(267), r.right - x - s(24), r.bottom - s(367));
-    mv(
-        (*p).primary,
-        r.right - s(144),
-        r.bottom - s(75),
-        s(120),
-        s(36),
-    );
-    mv(
-        (*p).secondary,
-        r.right - s(304),
-        r.bottom - s(75),
-        s(148),
-        s(36),
-    );
-    mv(
-        (*p).end_tree,
-        r.right - s(464),
-        r.bottom - s(75),
-        s(148),
-        s(36),
-    );
-    for h in [(*p).view_mode, (*p).end_tree] {
-        ShowWindow(
-            h,
-            if (*p).page == Page::Processes {
-                SW_SHOW
+}
+unsafe fn text_width(dc: HDC, font: HFONT, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let old = SelectObject(dc, font);
+    // Hangul is measured in its fallback face, as `fonts::draw_text` draws it.
+    let size = fonts::str_extent(dc, text);
+    SelectObject(dc, old);
+    size.cx
+}
+/// The font's line (cell) height in device px.
+unsafe fn line_height(dc: HDC, font: HFONT) -> i32 {
+    let old = SelectObject(dc, font);
+    let mut metrics: TEXTMETRICW = zeroed();
+    GetTextMetricsW(dc, &mut metrics);
+    SelectObject(dc, old);
+    metrics.tmHeight
+}
+/// Owner-draw selects (combo boxes painted as `.select`).
+unsafe fn is_select(p: *mut App, h: HWND) -> bool {
+    h == (*p).rate
+        || h == (*p).view_mode
+        || h == (*p).filter_control
+        || matches!(
+            GetDlgCtrlID(h) as usize,
+            PREF_LANGUAGE | PREF_RATE | PREF_START
+        )
+}
+/// A `<select>`'s intrinsic width: its widest option plus padding and arrow.
+unsafe fn select_width(p: *mut App, dc: HDC, h: HWND, font: HFONT) -> i32 {
+    let count = SendMessageW(h, CB_GETCOUNT, 0, 0).clamp(0, 64);
+    let widest = (0..count)
+        .map(|i| text_width(dc, font, &paint::combo_text(h, i)))
+        .max()
+        .unwrap_or(0);
+    widest + gfx::pxi((*p).dpi, layout::SELECT_EXTRA)
+}
+/// A `.btn`'s intrinsic width: label + 14 px padding each side + borders.
+unsafe fn button_width(p: *mut App, dc: HDC, h: HWND, font: HFONT) -> i32 {
+    let hair = gfx::hairline((*p).dpi) as i32;
+    text_width(dc, font, &paint::window_text(h))
+        + 2 * gfx::pxi((*p).dpi, layout::BUTTON_PAD_X)
+        + 2 * hair
+}
+unsafe fn head_item_size(p: *mut App, dc: HDC, item: HeadItem) -> (i32, i32) {
+    let f = &(*p).fonts;
+    let d = |v: f32| gfx::pxi((*p).dpi, v);
+    match item {
+        HeadItem::Note(text) => (text_width(dc, f.small, text), line_height(dc, f.small)),
+        // The icon button is as tall as the head's controls (28 × 28 next
+        // to Startup's filter, 32 × 32 elsewhere).
+        HeadItem::Control(h) if h == (*p).more => {
+            let size = d(layout::head_content((*p).page).min(layout::BUTTON_HEIGHT));
+            (size, size)
+        }
+        HeadItem::Control(h) if is_select(p, h) => {
+            (select_width(p, dc, h, f.small), d(layout::SELECT_HEIGHT))
+        }
+        // Label plus the 14 px trefoil and its 6 px gap.
+        HeadItem::Control(h) if h == (*p).nuclear => (
+            button_width(p, dc, h, f.ui) + d(paint::NUCLEAR_ICON + paint::NUCLEAR_GAP),
+            d(layout::BUTTON_HEIGHT),
+        ),
+        HeadItem::Control(h) => {
+            let font = if paint::button_style(p, GetDlgCtrlID(h) as usize)
+                == widgets::ButtonStyle::Primary
+            {
+                f.ui_strong
             } else {
-                SW_HIDE
-            },
-        );
+                f.ui
+            };
+            (button_width(p, dc, h, font), d(layout::BUTTON_HEIGHT))
+        }
     }
-    let table = (*p).page != Page::Performance;
-    for h in [(*p).list, (*p).search, (*p).primary] {
-        ShowWindow(h, if table { SW_SHOW } else { SW_HIDE });
+}
+/// The page head's actions with their rectangles (client px), measured with
+/// the window's fonts on `dc`. Painting and control placement share this.
+unsafe fn head_layout(p: *mut App, l: &layout::Layout, dc: HDC) -> Vec<(HeadItem, RECT)> {
+    let items = head_items(p);
+    let mut sizes: Vec<_> = items
+        .iter()
+        .map(|&item| head_item_size(p, dc, item))
+        .collect();
+    // The Nuclear Zombie trefoil is decoration: where the head has no room
+    // for the page's (short) honesty note, the button drops it and keeps
+    // its label (the 980 px minimum window).
+    let nuclear = HeadItem::Control((*p).nuclear);
+    if let Some(i) = items.iter().position(|&item| item == nuclear) {
+        let first = l
+            .head_actions(&sizes)
+            .first()
+            .map_or(l.head_inner.right, |r| r.left);
+        if l.head_inner.left + paint::head_text_width(p, dc) > first - l.px(layout::HEAD_GAP) {
+            sizes[i].0 -= l.px(paint::NUCLEAR_ICON + paint::NUCLEAR_GAP);
+        }
     }
-    ShowWindow(
-        (*p).secondary,
-        if matches!((*p).page, Page::Processes | Page::Services) {
-            SW_SHOW
+    items.into_iter().zip(l.head_actions(&sizes)).collect()
+}
+/// Move `h` to `r` (client px) only when it is elsewhere, so frequent
+/// relayouts (label changes on every sample) cost nothing when stable.
+unsafe fn place(p: *mut App, h: HWND, r: RECT) {
+    let (w, height) = (r.right - r.left, r.bottom - r.top);
+    let mut current: RECT = zeroed();
+    GetWindowRect(h, &mut current);
+    MapWindowPoints(
+        null_mut(),
+        (*p).hwnd,
+        (&mut current as *mut RECT).cast::<POINT>(),
+        2,
+    );
+    let same = current.left == r.left
+        && current.top == r.top
+        && current.right - current.left == w
+        && current.bottom - current.top == height;
+    if !same {
+        MoveWindow(h, r.left, r.top, w.max(1), height.max(1), 1);
+    }
+}
+/// Position the page head's action controls (labels change with the
+/// selection, e.g. "Efficiency mode" ↔ "Exit efficiency mode").
+unsafe fn place_head(p: *mut App, l: &layout::Layout) {
+    let dc = GetDC((*p).hwnd);
+    if dc.is_null() {
+        return;
+    }
+    let items = head_layout(p, l, dc);
+    ReleaseDC((*p).hwnd, dc);
+    for (item, r) in items {
+        if let HeadItem::Control(h) = item {
+            place(p, h, r);
+        }
+    }
+}
+/// Controls shown on each page. The rail holds only the four pages and
+/// Settings; Refresh, Pause, Run new task, Always on top and the old
+/// "More actions" button stay as (hidden) command targets reachable from
+/// F5 / Space / the status-bar rate select / ⋯ menus / the palette / Settings.
+unsafe fn visible_controls(p: *mut App) -> Vec<(HWND, bool)> {
+    let page = (*p).page;
+    let list_page = matches!(page, Page::Processes | Page::Startup | Page::Services);
+    let drawer = page == Page::Processes && (*p).show_telemetry;
+    vec![
+        ((*p).view_mode, page == Page::Processes),
+        ((*p).expand_all, page == Page::Processes && (*p).tree_mode),
+        ((*p).end_tree, drawer),
+        (
+            (*p).filter_control,
+            matches!(page, Page::Startup | Page::Services),
+        ),
+        ((*p).list, list_page),
+        (
+            (*p).primary,
+            matches!(page, Page::Processes | Page::Services),
+        ),
+        ((*p).secondary, page == Page::Services),
+        // Processes: Efficiency mode lives in the ⋯ / context menus (its
+        // button is only the Services page's Restart).
+        ((*p).extra, page == Page::Services),
+        ((*p).nuclear, page == Page::Processes),
+        ((*p).more, list_page),
+        ((*p).perf_list, page == Page::Performance),
+        ((*p).copy, page == Page::Performance),
+        ((*p).cores, page == Page::Performance),
+        ((*p).resource_monitor, page == Page::Performance),
+        ((*p).top, false),
+        ((*p).run_task, false),
+        ((*p).refresh, false),
+        ((*p).pause, false),
+    ]
+}
+unsafe fn layout(p: *mut App) {
+    SendMessageW(
+        (*p).view_mode,
+        CB_SETCURSEL,
+        if (*p).group_mode {
+            2
         } else {
-            SW_HIDE
+            (*p).tree_mode as usize
+        },
+        0,
+    );
+    let l = current_layout(p);
+    for i in 0..4 {
+        place(p, (*p).nav[i], l.nav[i]);
+    }
+    place(p, (*p).settings, l.nav_settings);
+    place_nav_indicator(p, &l, false);
+    // The search input sits in the title strip's search box text area.
+    let dc = GetDC((*p).hwnd);
+    if !dc.is_null() {
+        let edit = l.search_edit(line_height(dc, frame::search_font(p)));
+        let rate = l.rate(select_width(p, dc, (*p).rate, (*p).fonts.mono_small));
+        ReleaseDC((*p).hwnd, dc);
+        place(p, (*p).search, edit);
+        place(p, (*p).rate, rate);
+    }
+    place_head(p, &l);
+    place(p, (*p).perf_list, l.perf_device_list());
+    // The table fills the content rect exactly; the optional telemetry drawer
+    // and service details panel take its bottom 180 / right 290 px. Painting
+    // uses the same rectangles (`view_split`).
+    let (table, drawer, _) = view_split(p, &l);
+    place(p, (*p).list, table);
+    sync_columns(p);
+    // "End process tree" sits in the telemetry drawer's title row, clear of
+    // its three charts.
+    let drawer = drawer.unwrap_or(RECT {
+        top: l.content.bottom,
+        ..l.content
+    });
+    place(
+        p,
+        (*p).end_tree,
+        RECT {
+            left: drawer.right - l.px(180.0),
+            top: drawer.top + l.px(8.0),
+            right: drawer.right - l.px(24.0),
+            bottom: drawer.top + l.px(40.0),
         },
     );
+    for (h, show) in visible_controls(p) {
+        let visible = GetWindowLongW(h, GWL_STYLE) as u32 & WS_VISIBLE != 0;
+        if visible != show {
+            ShowWindow(h, if show { SW_SHOW } else { SW_HIDE });
+        }
+    }
+    EnableWindow(
+        (*p).search,
+        (!matches!((*p).page, Page::Performance | Page::Settings)) as i32,
+    );
+    interactions::layout_settings(p, &l);
+    order_tabs(p);
     redraw(p);
 }
+/// The nav indicator's edges for `page` (client px): the item rect inset
+/// 12 px top and bottom, i.e. the reference's 3 × 16 bar.
+fn nav_indicator_target(l: &layout::Layout, page: Page) -> (f32, f32) {
+    let item = if page == Page::Settings {
+        l.nav_settings
+    } else {
+        l.nav[(page as usize).min(3)]
+    };
+    (
+        (item.top + l.px(12.0)) as f32,
+        (item.bottom - l.px(12.0)) as f32,
+    )
+}
+/// Move the nav indicator to the current page. `slide`: it slides and
+/// stretches (motion::NAV, the leading edge eases out and the trailing edge
+/// follows); otherwise it jumps (first layout, resize, DPI) unless a slide
+/// is running, which then continues toward the (re-laid-out) target. Every
+/// frame repaints the rail and the nav buttons under it.
+unsafe fn place_nav_indicator(p: *mut App, l: &layout::Layout, slide: bool) {
+    place_nav_indicator_at(p, l, slide, Instant::now());
+}
+/// [`place_nav_indicator`] with an explicit clock (deterministic tests).
+unsafe fn place_nav_indicator_at(p: *mut App, l: &layout::Layout, slide: bool, now: Instant) {
+    let top_key = (anim::NAV_ID, anim::part::NAV_TOP);
+    let bottom_key = (anim::NAV_ID, anim::part::NAV_BOTTOM);
+    let (top, bottom) = nav_indicator_target(l, (*p).page);
+    let host = &mut (*p).anim;
+    // Each frame paints the rail and the nav buttons in one synchronous
+    // pass, so the bar never tears across them.
+    for key in [top_key, bottom_key] {
+        host.register_children_sync(key, (*p).hwnd, Some(l.rail));
+    }
+    let known = host.anim.target(top_key).is_some();
+    let moving = host.anim.is_key_animating(top_key) || host.anim.is_key_animating(bottom_key);
+    // Each item's background cross-fades with the slide. Targets are set
+    // here, with the page change, so paint code only reads them.
+    let items = [
+        (NAV, (*p).nav[0]),
+        (NAV + 1, (*p).nav[1]),
+        (NAV + 2, (*p).nav[2]),
+        (NAV + 3, (*p).nav[3]),
+        (SETTINGS, (*p).settings),
+    ];
+    for (id, hwnd) in items {
+        let key = (id, anim::part::SELECTED);
+        let current = if id == SETTINGS {
+            (*p).page == Page::Settings
+        } else {
+            id - NAV == (*p).page as usize
+        };
+        let target = current as u8 as f32;
+        host.register(key, hwnd, None);
+        if slide && known {
+            host.set_target_at(key, target, anim::motion::NAV, anim::Easing::EaseOut, now);
+        } else if host.anim.target(key) != Some(target) {
+            host.set(key, target);
+        }
+    }
+    if !known || !(slide || moving) {
+        host.set(top_key, top);
+        host.set(bottom_key, bottom);
+        return;
+    }
+    let down = top > host.value(top_key);
+    let lead = anim::Easing::EaseOut;
+    let trail = anim::Easing::Bezier(0.6, 0.0, 0.2, 1.0);
+    let (top_easing, bottom_easing) = if down { (trail, lead) } else { (lead, trail) };
+    host.set_target_at(top_key, top, anim::motion::NAV, top_easing, now);
+    host.set_target_at(bottom_key, bottom, anim::motion::NAV, bottom_easing, now);
+}
+/// The page's table rect and its optional companions: the processes
+/// telemetry drawer (bottom) and the services details panel (right), from
+/// `layout::Layout::{drawer, details}`. Control placement and painting share it.
+unsafe fn view_split(p: *mut App, l: &layout::Layout) -> (RECT, Option<RECT>, Option<RECT>) {
+    match (*p).page {
+        Page::Processes => {
+            let (table, drawer) = l.drawer((*p).show_telemetry);
+            (table, drawer, None)
+        }
+        Page::Services => {
+            let (table, details) = l.details((*p).show_details);
+            (table, None, details)
+        }
+        _ => (l.content, None, None),
+    }
+}
+/// Keyboard (Tab) order follows the visual order: the rail, the search box,
+/// the page head's actions left to right, the page's view, the settings
+/// controls, then the status bar's rate select. IsDialogMessage walks the
+/// children in z-order, so restack them (no visual effect: none overlap).
+unsafe fn tab_order(p: *mut App) -> Vec<HWND> {
+    let mut order: Vec<HWND> = (*p).nav.to_vec();
+    order.extend([(*p).settings, (*p).search]);
+    order.extend(head_items(p).into_iter().filter_map(|item| match item {
+        HeadItem::Control(h) => Some(h),
+        HeadItem::Note(_) => None,
+    }));
+    order.extend([(*p).list, (*p).perf_list, (*p).end_tree]);
+    for id in [
+        THEME_LIGHT,
+        THEME_DARK,
+        THEME_SYSTEM,
+        PREF_LANGUAGE,
+        PREF_RATE,
+        PREF_START,
+        PREF_TOP,
+        PREF_TRAY,
+        PREF_REPLACE,
+    ] {
+        order.push(GetDlgItem((*p).hwnd, id as i32));
+    }
+    order.push((*p).rate);
+    order.retain(|h| !h.is_null());
+    order
+}
+unsafe fn order_tabs(p: *mut App) {
+    let mut previous = HWND_TOP;
+    for h in tab_order(p) {
+        SetWindowPos(
+            h,
+            previous,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER,
+        );
+        previous = h;
+    }
+}
 unsafe fn configure(p: *mut App) {
+    if (*p).paused || (*p).minimized || (*p).modal {
+        (*p).perf_history.gap(Instant::now());
+    }
     let _ = (*p).tx.send(Command::Configure {
         interval: (*p).interval,
         paused: (*p).paused || (*p).minimized || (*p).modal,
-        performance: (*p).page == Page::Performance,
+        performance: matches!((*p).page, Page::Performance | Page::Processes),
     });
 }
 unsafe fn request_list(p: *mut App, page: Page) {
@@ -1201,15 +2097,29 @@ unsafe fn switch_page(p: *mut App, page: Page) {
     if (*p).page == page || (*p).modal {
         return;
     }
+    // Atomic: the head, its relabelled buttons, the search placeholder and
+    // the table appear together (`present_all`).
+    let suspended = suspend_painting(p);
+    let previous = (*p).page;
     (*p).updating = true;
     SendMessageW((*p).list, LVM_SETITEMCOUNT, 0, 0);
     (*p).rows.clear();
     (*p).page = page;
+    place_nav_indicator(p, &current_layout(p), true);
+    if page == Page::Settings {
+        (*p).replacement_active = matches!(
+            crate::replacement::status(),
+            Ok(crate::replacement::Status::Active)
+        );
+        interactions::sync_settings(p);
+    }
     (*p).filter.clear();
     (*p).clear_error();
     (*p).notice.clear();
+    (*p).category = 0;
     (*p).sort = if page == Page::Processes { 3 } else { 0 };
     (*p).descending = page == Page::Processes;
+    (*p).sort_chosen = false;
     SetWindowTextW((*p).search, wide("").as_ptr());
     setup_columns(p);
     rebuild(p, None);
@@ -1220,18 +2130,38 @@ unsafe fn switch_page(p: *mut App, page: Page) {
     match page {
         Page::Startup if !(*p).startup_loaded => request_list(p, page),
         Page::Services => request_list(p, page),
-        Page::Performance => {
+        // Coming from Processes the performance sampler kept running: its
+        // data is current. From other pages it stopped, and old values are
+        // not shown until the next sample.
+        Page::Performance if previous != Page::Processes => {
             (*p).performance = None;
             (*p).performance_error = None;
         }
         _ => {}
     }
     configure(p);
-    redraw(p);
+    present_all(p, suspended);
+    // The nav slide starts with the first frame of the new page, not before
+    // the work above (which would eat most of its 180 ms).
+    let now = Instant::now();
+    for key in [
+        (anim::NAV_ID, anim::part::NAV_TOP),
+        (anim::NAV_ID, anim::part::NAV_BOTTOM),
+        (NAV, anim::part::SELECTED),
+        (NAV + 1, anim::part::SELECTED),
+        (NAV + 2, anim::part::SELECTED),
+        (NAV + 3, anim::part::SELECTED),
+        (SETTINGS, anim::part::SELECTED),
+    ] {
+        (*p).anim.rebase(key, now);
+    }
 }
 unsafe fn command(p: *mut App, id: usize, notification: u32) {
-    if (NAV..NAV + 4).contains(&id) {
+    if (NAV..NAV + 5).contains(&id) {
         switch_page(p, Page::from_index(id - NAV));
+        return;
+    }
+    if interactions::command(p, id, notification) {
         return;
     }
     match id {
@@ -1245,17 +2175,16 @@ unsafe fn command(p: *mut App, id: usize, notification: u32) {
             redraw(p);
         }
         RATE if notification == CBN_SELCHANGE => {
-            let i = SendMessageW((*p).rate, CB_GETCURSEL, 0, 0) as usize;
-            (*p).interval = [500, 1000, 2000, 5000].get(i).copied().unwrap_or(1000);
-            configure(p);
-            redraw(p);
+            interactions::rate_changed(p, (*p).rate);
         }
         VIEW_MODE if notification == CBN_SELCHANGE => {
-            let tree_mode = SendMessageW((*p).view_mode, CB_GETCURSEL, 0, 0) == 1;
-            set_tree_mode(p, tree_mode);
+            let mode = SendMessageW((*p).view_mode, CB_GETCURSEL, 0, 0);
+            (*p).group_mode = mode == 2;
+            set_tree_mode(p, mode == 1);
         }
         PAUSE => {
             (*p).paused = !(*p).paused;
+            interactions::sync_settings(p);
             SetWindowTextW(
                 (*p).pause,
                 wide(if (*p).paused {
@@ -1288,14 +2217,18 @@ unsafe fn command(p: *mut App, id: usize, notification: u32) {
         REFRESH if !(*p).modal => {
             (*p).clear_error();
             (*p).notice.clear();
+            (*p).process_detail_identity = None;
+            (*p).service_detail_name = None;
+            interactions::selection_changed(p);
             let _ = (*p).tx.send(Command::Refresh);
             request_list(p, (*p).page);
             redraw(p);
         }
-        PRIMARY if IsWindowEnabled((*p).primary) != 0 => primary_action(p),
-        END_TREE if IsWindowEnabled((*p).end_tree) != 0 => end_tree_action(p),
-        SECONDARY if IsWindowEnabled((*p).secondary) != 0 => secondary_action(p),
-        SETTINGS if !(*p).busy && !(*p).modal => settings_menu(p),
+        PRIMARY if IsWindowEnabled((*p).primary) != 0 && !(*p).modal => primary_action(p),
+        END_TREE if IsWindowEnabled((*p).end_tree) != 0 && !(*p).modal => end_tree_action(p),
+        SECONDARY if IsWindowEnabled((*p).secondary) != 0 && !(*p).modal => secondary_action(p),
+        SETTINGS if !(*p).modal => switch_page(p, Page::Settings),
+        NUCLEAR if !(*p).busy && !(*p).modal => nuclear::open(p),
         _ => {}
     }
 }
@@ -1420,14 +2353,8 @@ unsafe fn settings_menu(p: *mut App) {
     configure(p);
     let mut bounds: RECT = zeroed();
     GetWindowRect((*p).settings, &mut bounds);
-    let command = TrackPopupMenuEx(
-        menu,
-        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
-        bounds.left,
-        bounds.top,
-        (*p).hwnd,
-        null(),
-    ) as usize;
+    // The layered menu above the Settings item (below it without room).
+    let command = popup::track_menu(p, menu, popup::Anchor::Above { r: bounds });
     DestroyMenu(menu);
     (*p).modal = false;
     configure(p);
@@ -1464,7 +2391,7 @@ unsafe fn settings_menu(p: *mut App) {
                     "관리자 권한이 필요하며 이 PC의 모든 사용자에게 적용합니다. Feather 앱은 설치된 폴더에 그대로 남습니다."
                 ), "Restore the default Windows Task Manager?\n\nAdministrator permission is required and this applies to all users on this PC. Feather will remain in its installation folder."))
             };
-            if confirm(p, title, prompt) {
+            if confirm_with(p, title, prompt, None, false) {
                 begin_action(p, Action::ReplaceTaskManager(enable, (*p).page));
             }
         }
@@ -1476,6 +2403,7 @@ unsafe fn populate_view_modes(p: *mut App) {
     for value in [
         tr("목록 보기", "List view"),
         tr("프로세스 트리", "Process tree"),
+        tr("앱별 그룹", "App groups"),
     ] {
         SendMessageW(
             (*p).view_mode,
@@ -1484,7 +2412,16 @@ unsafe fn populate_view_modes(p: *mut App) {
             wide(value).as_ptr() as isize,
         );
     }
-    SendMessageW((*p).view_mode, CB_SETCURSEL, (*p).tree_mode as usize, 0);
+    SendMessageW(
+        (*p).view_mode,
+        CB_SETCURSEL,
+        if (*p).group_mode {
+            2
+        } else {
+            (*p).tree_mode as usize
+        },
+        0,
+    );
 }
 unsafe fn refresh_language(p: *mut App) {
     let identity = selected_identity(p);
@@ -1514,20 +2451,7 @@ unsafe fn refresh_language(p: *mut App) {
     ] {
         SetWindowTextW(handle, wide(value).as_ptr());
     }
-    SendMessageW((*p).rate, CB_RESETCONTENT, 0, 0);
-    for value in [
-        tr("0.5초", "0.5 s"),
-        tr("1초", "1 s"),
-        tr("2초", "2 s"),
-        tr("5초", "5 s"),
-    ] {
-        SendMessageW((*p).rate, CB_ADDSTRING, 0, wide(value).as_ptr() as isize);
-    }
-    let interval = [500, 1000, 2000, 5000]
-        .iter()
-        .position(|&i| i == (*p).interval)
-        .unwrap_or(1);
-    SendMessageW((*p).rate, CB_SETCURSEL, interval, 0);
+    interactions::populate_settings(p);
     populate_view_modes(p);
     (*p).notice.clear();
     create_fonts(p);
@@ -1546,18 +2470,28 @@ unsafe fn refresh_language(p: *mut App) {
 unsafe fn set_tree_mode(p: *mut App, enabled: bool) {
     let identity = selected_identity(p);
     (*p).tree_mode = enabled;
-    SendMessageW((*p).view_mode, CB_SETCURSEL, enabled as usize, 0);
+    if enabled {
+        (*p).group_mode = false;
+    }
     SendMessageW(
-        (*p).list,
-        LVM_SETCOLUMNWIDTH,
+        (*p).view_mode,
+        CB_SETCURSEL,
+        if (*p).group_mode { 2 } else { enabled as usize },
         0,
-        scale(p, if enabled { 320 } else { 250 }) as isize,
     );
     rebuild(p, identity);
-    redraw(p);
+    // The page head changes with the mode (Expand all shows only in tree
+    // mode): re-run the layout so visibility, placement and tab order agree.
+    layout(p);
 }
+/// The grouped view ("App groups") is showing (it has app rows).
+unsafe fn grouped_view(p: *mut App) -> bool {
+    (*p).page == Page::Processes && (*p).group_mode && !(*p).tree_mode
+}
+/// Expand / collapse (None: toggle) the selected tree parent or app row.
 unsafe fn toggle_selected_branch(p: *mut App, expand: Option<bool>) {
-    if (*p).page != Page::Processes || !(*p).tree_mode || !(&(*p).filter).is_empty() {
+    let grouped = grouped_view(p);
+    if (*p).page != Page::Processes || !((*p).tree_mode || grouped) || !(&(*p).filter).is_empty() {
         return;
     }
     let selected = SendMessageW(
@@ -1625,10 +2559,20 @@ unsafe fn toggle_selected_branch(p: *mut App, expand: Option<bool>) {
     };
     let id = ProcessIdentity::from(process);
     let expand = expand.unwrap_or(!row.expanded);
-    if expand {
-        (*p).collapsed.remove(&id);
-    } else {
-        (*p).collapsed.insert(id);
+    // Tree rows start expanded (the collapsed set), app groups collapsed.
+    match (grouped, expand) {
+        (true, true) => {
+            (*p).expanded_groups.insert(id);
+        }
+        (true, false) => {
+            (*p).expanded_groups.remove(&id);
+        }
+        (false, true) => {
+            (*p).collapsed.remove(&id);
+        }
+        (false, false) => {
+            (*p).collapsed.insert(id);
+        }
     }
     rebuild(p, Some(Identity::Process(id.pid, id.created)));
     redraw(p);
@@ -1654,7 +2598,14 @@ unsafe fn end_tree_action(p: *mut App) {
         "{} (PID {}) 및 하위 프로세스, 총 {}개를 종료할까요?\n\n현재 목록에서 확인된 트리 전체가 대상이며 숨겨진 하위 항목도 포함됩니다. 이 확인창을 연 뒤 새로 생성된 프로세스는 포함하지 않습니다.\n\n저장하지 않은 작업이 사라질 수 있습니다.",
         "End {} (PID {}) and its descendants, {} processes in total?\n\nThis includes the entire captured tree, including hidden children. Processes created after this confirmation opened are not included.\n\nUnsaved work may be lost.",
         plan.root_name, plan.root.pid, plan.len());
-    if confirm(p, tr("트리 전체 종료", "End process tree"), &prompt) {
+    let warn = selected_process(p).and_then(|s| controls::windows_process_warning(&s));
+    if confirm_with(
+        p,
+        tr("트리 전체 종료", "End process tree"),
+        &prompt,
+        warn,
+        true,
+    ) {
         begin_action(p, Action::EndTree(plan));
     }
 }
@@ -1691,7 +2642,7 @@ unsafe fn identity_at(p: *mut App, row: usize) -> Option<Identity> {
         Page::Services => (&(*p).services)
             .get(row)
             .map(|s| Identity::Service(s.name.clone())),
-        Page::Performance => None,
+        Page::Performance | Page::Settings => None,
     }
 }
 unsafe fn selected_identity(p: *mut App) -> Option<Identity> {
@@ -1712,9 +2663,10 @@ unsafe fn total_rows(p: *mut App) -> usize {
         Page::Processes => (*p).snapshot.as_ref().map_or(0, |s| s.processes.len()),
         Page::Startup => (*p).startup.len(),
         Page::Services => (*p).services.len(),
-        Page::Performance => 0,
+        Page::Performance | Page::Settings => 0,
     }
 }
+#[allow(dead_code)]
 unsafe fn selected_detail(p: *mut App) -> String {
     if (*p).busy {
         return tr("요청을 처리하는 중…", "Processing your request…").into();
@@ -1770,11 +2722,70 @@ unsafe fn selected_detail(p: *mut App) -> String {
                 )
             })
             .unwrap_or_default(),
-        Page::Performance => String::new(),
+        Page::Performance | Page::Settings => String::new(),
     }
 }
 unsafe fn update_buttons(p: *mut App) {
-    let ready = !(*p).busy && !(*p).modal;
+    let focus = GetFocus();
+    update_button_states(p);
+    // Disabling the focused button (a row deselected, an action running)
+    // leaves the thread without keyboard focus; hand it on. During a modal
+    // popup the popup owns the keyboard and the caller restores focus.
+    if !(*p).modal && !focus.is_null() {
+        restore_focus(p, focus);
+    }
+}
+/// Give keyboard focus back after a modal popup or a disabled control:
+/// `previous` when it can still take focus, else the page's table, else the
+/// main window, so Tab and the arrow keys keep working. The layered popups
+/// never deactivate the window (unlike MessageBox), so nothing else would
+/// restore it. Does nothing while a control has focus (the main window
+/// itself only holds it for a modal popup, see [`park_focus`]) or when the
+/// main window is not the thread's active window (the user switched away).
+unsafe fn restore_focus(p: *mut App, previous: HWND) {
+    let hwnd = (*p).hwnd;
+    let focus = GetFocus();
+    if hwnd.is_null()
+        || GetActiveWindow() != hwnd
+        || !(focus.is_null() || focus == hwnd && previous != hwnd)
+    {
+        return;
+    }
+    let usable = |h: HWND| {
+        !h.is_null()
+            && IsWindow(h) != 0
+            && (h == hwnd || IsChild(hwnd, h) != 0)
+            && (h == hwnd || GetWindowLongW(h, GWL_STYLE) as u32 & WS_VISIBLE != 0)
+            && IsWindowEnabled(h) != 0
+    };
+    let target = if usable(previous) {
+        previous
+    } else if usable((*p).list) {
+        (*p).list
+    } else {
+        hwnd
+    };
+    if target != focus {
+        SetFocus(target);
+    }
+}
+/// While a layered modal popup runs, keep the keyboard focus on the main
+/// window when disabling its opener dropped it: keys then arrive as plain
+/// WM_KEYDOWN (with no focus at all every key is a WM_SYSKEYDOWN, so F4
+/// alone would act like Alt+F4). [`restore_focus`] hands it back after.
+unsafe fn park_focus(p: *mut App) {
+    let hwnd = (*p).hwnd;
+    if !hwnd.is_null() && GetFocus().is_null() && GetActiveWindow() == hwnd {
+        SetFocus(hwnd);
+    }
+}
+unsafe fn update_button_states(p: *mut App) {
+    // Actions are unavailable while one runs (busy) or a modal popup is
+    // open, but only `busy` shows it: under the dialog's scrim or a menu the
+    // page keeps its look, like the reference's page, and never restyles
+    // on the way in or out. The modal loops block every input, and the
+    // commands check `modal` as well.
+    let ready = !(*p).busy;
     let mut primary = false;
     let mut secondary = false;
     let mut label = tr("작업 끝내기", "End task");
@@ -1804,42 +2815,113 @@ unsafe fn update_buttons(p: *mut App) {
                 secondary = s.state == SERVICE_RUNNING && !(*p).services_loading;
             }
         }
-        Page::Performance => {}
+        Page::Performance | Page::Settings => {}
     }
     SetWindowTextW((*p).primary, wide(label).as_ptr());
     SetWindowTextW((*p).secondary, wide(second).as_ptr());
     EnableWindow((*p).primary, (ready && primary) as i32);
     let tree_allowed = (*p).page == Page::Processes && primary && captured_tree_plan(p).is_ok();
     EnableWindow((*p).end_tree, (ready && tree_allowed) as i32);
-    EnableWindow((*p).view_mode, (!(*p).modal) as i32);
+    EnableWindow((*p).view_mode, 1);
     EnableWindow((*p).secondary, (ready && secondary) as i32);
-    EnableWindow((*p).settings, ready as i32);
+    // Settings is a nav item like the others (never dimmed; the command
+    // waits for a modal popup to close).
+    EnableWindow((*p).settings, 1);
+    let extra_ready = if (*p).page == Page::Processes {
+        primary
+            && (*p)
+                .process_settings
+                .as_ref()
+                .and_then(|s| s.efficiency)
+                .is_some()
+    } else {
+        secondary
+    };
+    EnableWindow((*p).extra, (ready && extra_ready) as i32);
+    SetWindowTextW(
+        (*p).extra,
+        wide(if (*p).page == Page::Services {
+            tr("다시 시작", "Restart")
+        } else if (*p)
+            .process_settings
+            .as_ref()
+            .is_some_and(|s| s.efficiency == Some(true))
+        {
+            tr("효율 모드 해제", "Exit efficiency mode")
+        } else {
+            tr("효율 모드", "Efficiency mode")
+        })
+        .as_ptr(),
+    );
+    EnableWindow((*p).run_task, ready as i32);
+    EnableWindow((*p).nuclear, ready as i32);
     let loading = ((*p).page == Page::Startup && (*p).startup_loading)
         || ((*p).page == Page::Services && (*p).services_loading);
-    EnableWindow((*p).refresh, (!loading && !(*p).modal) as i32);
+    EnableWindow((*p).refresh, (!loading) as i32);
+    // The ⋯ menu waits for a running action (its command checks), without
+    // dimming the button for the moment a toggle or a request takes.
+    EnableWindow((*p).more, 1);
+    // Labels above may have changed width; the head row re-flows like CSS.
+    if !(*p).hwnd.is_null() {
+        place_head(p, &current_layout(p));
+    }
 }
+/// Ask before a destructive action (the layered confirm dialog; `title`
+/// names the danger button, the prompt's first question is the heading).
 unsafe fn confirm(p: *mut App, title: &str, prompt: &str) -> bool {
+    confirm_with(p, title, prompt, None, true)
+}
+/// [`confirm`] with an optional warn line and the action's style (danger
+/// for destructive actions, primary otherwise). Modal like MessageBox:
+/// sampling pauses and queued notifications are re-posted afterwards.
+unsafe fn confirm_with(
+    p: *mut App,
+    title: &str,
+    prompt: &str,
+    warn: Option<&str>,
+    danger: bool,
+) -> bool {
+    // update_buttons disables the button that opened the dialog (End task,
+    // Stop, ⋯, Settings), which drops the keyboard focus; restore it after.
+    let focus = GetFocus();
     (*p).modal = true;
     update_buttons(p);
+    park_focus(p);
     configure(p);
-    let answer = MessageBoxW(
-        (*p).hwnd,
-        wide(prompt).as_ptr(),
-        wide(title).as_ptr(),
-        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-    );
+    let answer = controls::confirm(p, title, prompt, warn, danger);
     (*p).modal = false;
     configure(p);
     PostMessageW((*p).hwnd, SNAPSHOT_READY, 0, 0);
     PostMessageW((*p).hwnd, JOB_READY, 0, 0);
     update_buttons(p);
-    answer == IDYES
+    restore_focus(p, focus);
+    answer
+}
+/// Confirm ending one process identity, then run the termination job: the
+/// selected row's End task, and the Nuclear Zombie panel's per-holder End
+/// task (`detail` = an extra paragraph, e.g. how many exited processes it
+/// holds open). The warn line appears for Windows processes.
+unsafe fn end_task_flow(p: *mut App, name: &str, pid: u32, created: u64, detail: Option<&str>) {
+    let warn = controls::windows_image_warning(pid, created);
+    let mut prompt = tf!(
+        "{} (PID {}) 프로세스를 종료할까요?\n\n저장하지 않은 작업은 사라질 수 있습니다.",
+        "End {} (PID {})?\n\nUnsaved work may be lost.",
+        name,
+        pid
+    );
+    if let Some(detail) = detail.filter(|d| !d.trim().is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(detail);
+    }
+    if confirm_with(p, tr("작업 끝내기", "End task"), &prompt, warn, true) {
+        begin_action(p, Action::End(pid, created));
+    }
 }
 unsafe fn primary_action(p: *mut App) {
     match (*p).page {
         Page::Processes => {
             if let Some(s) = selected_process(p) {
-                if confirm(p,tr("작업 끝내기", "End task"),&tf!("{} (PID {}) 프로세스를 종료할까요?\n\n저장하지 않은 작업은 사라질 수 있습니다.", "End {} (PID {})?\n\nUnsaved work may be lost.",s.name,s.pid)){begin_action(p,Action::End(s.pid,s.created));}
+                end_task_flow(p, &s.name, s.pid, s.created, None);
             }
         }
         Page::Startup => {
@@ -1848,7 +2930,7 @@ unsafe fn primary_action(p: *mut App) {
                 .cloned()
             {
                 let enabled = !s.enabled;
-                begin_action(p, Action::Toggle(Box::new(s), enabled));
+                toggle_startup(p, s, enabled);
             }
         }
         Page::Services => {
@@ -1856,10 +2938,20 @@ unsafe fn primary_action(p: *mut App) {
                 .and_then(|r| (&(*p).services).get(r))
                 .cloned()
             {
-                begin_action(p, Action::Start(s.name));
+                begin_action(p, Action::Start(s.name, s.display_name));
             }
         }
-        Page::Performance => {}
+        Page::Performance | Page::Settings => {}
+    }
+}
+/// Switch a startup entry on or off: the switch slides at once (optimistic,
+/// [`App::startup_pending`]) while the registry change runs.
+unsafe fn toggle_startup(p: *mut App, entry: StartupEntry, enabled: bool) {
+    let id = entry.id.clone();
+    begin_action(p, Action::Toggle(Box::new(entry), enabled));
+    if (*p).busy {
+        (*p).startup_pending = Some((id, enabled));
+        InvalidateRect((*p).list, null(), 0);
     }
 }
 unsafe fn secondary_action(p: *mut App) {
@@ -1874,7 +2966,7 @@ unsafe fn secondary_action(p: *mut App) {
                 .and_then(|r| (&(*p).services).get(r))
                 .cloned()
             {
-                if confirm(p,tr("서비스 중지", "Stop service"),&tf!("{} 서비스를 중지할까요?\n\n이 서비스를 사용하는 Windows 기능이나 앱에 영향을 줄 수 있습니다.\n서비스 이름: {}", "Stop {}?\n\nThis may affect Windows features or apps using this service.\nService name: {}",s.display_name,s.name)){begin_action(p,Action::Stop(s.name));}
+                if confirm(p,tr("서비스 중지", "Stop service"),&tf!("{} 서비스를 중지할까요?\n\n이 서비스를 사용하는 Windows 기능이나 앱에 영향을 줄 수 있습니다.\n서비스 이름: {}", "Stop {}?\n\nThis may affect Windows features or apps using this service.\nService name: {}",s.display_name,s.name)){begin_action(p,Action::Stop(s.name,s.display_name));}
             }
         }
         _ => {}
@@ -1901,6 +2993,22 @@ unsafe fn begin_action(p: *mut App, action: Action) {
     update_buttons(p);
     redraw(p);
 }
+/// Copy the monitor's per-`(pid, created)` GPU and network values onto the
+/// snapshot's processes; a process without a measured value keeps `None`.
+fn join_process_samples(
+    snapshot: &mut Snapshot,
+    gpu: &std::collections::HashMap<(u32, u64), ProcessGpu>,
+    network: &ProcessNetworkSample,
+) {
+    for process in &mut snapshot.processes {
+        let id = (process.pid, process.created);
+        process.gpu_percent = gpu.get(&id).and_then(|g| g.percent);
+        process.network_bytes_per_sec = network
+            .measured
+            .then(|| network.by_id.get(&id).map(|n| n.total_bytes_per_sec))
+            .flatten();
+    }
+}
 unsafe fn drain_snapshot(p: *mut App) {
     if (*p).modal {
         return;
@@ -1909,6 +3017,7 @@ unsafe fn drain_snapshot(p: *mut App) {
         return;
     };
     let identity = selected_identity(p);
+    let fresh_performance = matches!(&sample.performance, Some(Ok(_)));
     if let Some(performance) = sample.performance {
         match performance {
             Ok(s) => {
@@ -1922,14 +3031,19 @@ unsafe fn drain_snapshot(p: *mut App) {
         }
     }
     match sample.snapshot {
-        Ok(snapshot) => {
+        Ok(mut snapshot) => {
             (*p).recover_error(ErrorSource::Monitor);
+            join_process_samples(&mut snapshot, &sample.process_gpu, &sample.process_network);
+            (*p).network_state = Some(NetworkState {
+                measured: sample.process_network.measured,
+                reason: sample.process_network.reason.clone(),
+            });
             let memory = if snapshot.memory_total == 0 {
                 f64::NAN
             } else {
                 snapshot.memory_used as f64 / snapshot.memory_total as f64 * 100.0
             };
-            let (disk, network) = if (*p).page == Page::Performance {
+            let (disk, network) = if matches!((*p).page, Page::Performance | Page::Processes) {
                 (*p).performance
                     .as_ref()
                     .map(|s| {
@@ -1967,7 +3081,23 @@ unsafe fn drain_snapshot(p: *mut App) {
                 }
                 (*p).last_sample = Some(sample.at);
             }
+            (*p).telemetry.record(&snapshot, sample.at);
+            if fresh_performance {
+                if let Some(perf) = &(*p).performance {
+                    (*p).perf_history.record(perf, &snapshot, sample.at);
+                    interactions::refresh_components(p);
+                }
+            } else {
+                (*p).perf_history.gap(sample.at);
+            }
+            let count = snapshot.processes.len();
+            let recount = (*p).snapshot.as_ref().map(|s| s.processes.len()) != Some(count);
             (*p).snapshot = Some(snapshot);
+            if recount {
+                // The Processes nav item (an owner-draw child that `redraw`
+                // does not reach) shows the process count.
+                InvalidateRect((*p).nav[0], null(), 0);
+            }
             if (*p).page == Page::Processes {
                 rebuild(p, identity);
             }
@@ -1991,6 +3121,25 @@ unsafe fn drain_jobs(p: *mut App) {
     while let Ok(result) = (*p).results.try_recv() {
         let identity = selected_identity(p);
         match result {
+            JobResult::ProcessDetails(pid, created, result) => {
+                if (*p).process_detail_identity == Some((pid, created)) {
+                    (*p).process_settings = result.ok();
+                }
+            }
+            JobResult::ServiceDetails(name, result) => {
+                if (*p).service_detail_name.as_ref() == Some(&name) {
+                    match result {
+                        Ok(details) => {
+                            (*p).service_details = Some(details);
+                            (*p).service_detail_error = None;
+                        }
+                        Err(e) => (*p).service_detail_error = Some(e),
+                    }
+                }
+            }
+            JobResult::Publishers(values) => {
+                (*p).startup_publishers = values;
+            }
             JobResult::Startup(result) => {
                 (*p).startup_loading = false;
                 if (*p).startup_refresh_pending {
@@ -2000,6 +3149,8 @@ unsafe fn drain_jobs(p: *mut App) {
                     }
                     continue;
                 }
+                // The reloaded list is the truth now (the switch follows it).
+                (*p).startup_pending = None;
                 match result {
                     Ok(s) => {
                         (*p).startup = s;
@@ -2020,6 +3171,12 @@ unsafe fn drain_jobs(p: *mut App) {
                 (*p).services_loading = false;
                 match result {
                     Ok(s) => {
+                        if let Some(detail) = &mut (*p).service_details {
+                            if let Some(service) = s.iter().find(|s| s.name == detail.name) {
+                                detail.state = service.state;
+                                detail.pid = service.pid;
+                            }
+                        }
                         (*p).services = s;
                         (*p).services_loaded = true;
                         (*p).recover_error(ErrorSource::Services);
@@ -2042,12 +3199,23 @@ unsafe fn drain_jobs(p: *mut App) {
                 (*p).busy = false;
                 match result {
                     Ok(()) => {
-                        (*p).notice = notice;
+                        (*p).replacement_active = matches!(
+                            crate::replacement::status(),
+                            Ok(crate::replacement::Status::Active)
+                        );
+                        (*p).process_detail_identity = None;
+                        (*p).service_detail_name = None;
+                        interactions::selection_changed(p);
+                        controls::notify_success(p, notice);
                         (*p).clear_error();
                         request_list(p, page);
                         let _ = (*p).tx.send(Command::Refresh);
                     }
-                    Err(e) => (*p).set_error(ErrorSource::Action, e),
+                    Err(e) => {
+                        // A switch flipped optimistically slides back.
+                        (*p).startup_pending = None;
+                        (*p).set_error(ErrorSource::Action, e)
+                    }
                 }
             }
         }
@@ -2056,25 +3224,39 @@ unsafe fn drain_jobs(p: *mut App) {
     InvalidateRect((*p).list, null(), 0);
     redraw(p);
 }
+fn option_cmp(a: Option<f64>, b: Option<f64>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.total_cmp(&b),
+        (a, b) => a.is_some().cmp(&b.is_some()),
+    }
+}
 fn compare(a: &Process, b: &Process, col: usize) -> Ordering {
     match col {
         0 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         1 => a.pid.cmp(&b.pid),
         2 => a.cpu_percent.total_cmp(&b.cpu_percent),
         3 => a.working_set.cmp(&b.working_set),
-        4 => a.private_bytes.cmp(&b.private_bytes),
-        5 => a.io_bytes_per_sec.total_cmp(&b.io_bytes_per_sec),
-        6 => a.threads.cmp(&b.threads),
-        7 => a.handles.cmp(&b.handles),
+        4 => a.io_bytes_per_sec.total_cmp(&b.io_bytes_per_sec),
+        // Unmeasured ("—") ranks below every measured value.
+        5 => option_cmp(a.network_bytes_per_sec, b.network_bytes_per_sec),
+        6 => option_cmp(a.gpu_percent, b.gpu_percent),
         _ => Ordering::Equal,
     }
 }
 unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
     (*p).updating = true;
+    (*p).group_headers.clear();
     let filter = &(*p).filter;
     (*p).rows = (0..total_rows(p))
         .filter(|&row| {
-            if filter.is_empty() || ((*p).page == Page::Processes && (*p).tree_mode) {
+            if !interactions::category_matches(p, row) {
+                return false;
+            }
+            // Tree and grouped views filter while building their rows
+            // (a match keeps its ancestors / its app).
+            if filter.is_empty()
+                || ((*p).page == Page::Processes && ((*p).tree_mode || (*p).group_mode))
+            {
                 return true;
             }
             match (*p).page {
@@ -2085,8 +3267,13 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
                     .is_some_and(|s| {
                         s.name.to_lowercase().contains(filter) || s.pid.to_string().contains(filter)
                     }),
+                // Name, publisher (the visible column), command, location.
                 Page::Startup => (&(*p).startup).get(row).is_some_and(|s| {
                     s.name.to_lowercase().contains(filter)
+                        || (*p)
+                            .startup_publishers
+                            .get(&s.id)
+                            .is_some_and(|v| v.to_lowercase().contains(filter))
                         || s.command.to_lowercase().contains(filter)
                         || s.location.to_lowercase().contains(filter)
                 }),
@@ -2095,7 +3282,7 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
                         || s.display_name.to_lowercase().contains(filter)
                         || s.pid.to_string().contains(filter)
                 }),
-                Page::Performance => false,
+                Page::Performance | Page::Settings => false,
             }
         })
         .collect();
@@ -2112,9 +3299,20 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
                 let a = &(&(*p).startup)[a];
                 let b = &(&(*p).startup)[b];
                 match col {
-                    1 => a.status.cmp(&b.status),
-                    2 => a.location.cmp(&b.location),
-                    3 => a.command.cmp(&b.command),
+                    // Case-insensitive; entries without a publisher ("—")
+                    // stay last in both directions.
+                    1 => {
+                        let publisher = |e: &StartupEntry| {
+                            (*p).startup_publishers.get(&e.id).map(|v| v.to_lowercase())
+                        };
+                        match (publisher(a), publisher(b)) {
+                            (Some(x), Some(y)) => x.cmp(&y),
+                            (Some(_), None) => return Ordering::Less,
+                            (None, Some(_)) => return Ordering::Greater,
+                            (None, None) => Ordering::Equal,
+                        }
+                    }
+                    3 => a.enabled.cmp(&b.enabled),
                     _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 }
             }
@@ -2122,21 +3320,38 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
                 let a = &(&(*p).services)[a];
                 let b = &(&(*p).services)[b];
                 match col {
-                    1 => a
+                    1 => a.pid.cmp(&b.pid),
+                    2 => a
                         .display_name
                         .to_lowercase()
                         .cmp(&b.display_name.to_lowercase()),
-                    2 => a.state.cmp(&b.state),
-                    3 => a.pid.cmp(&b.pid),
+                    3 => a.state.cmp(&b.state),
                     4 => a.start_type.cmp(&b.start_type),
                     _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 }
             }
-            Page::Performance => Ordering::Equal,
+            Page::Performance | Page::Settings => Ordering::Equal,
         };
         (if desc { result.reverse() } else { result }).then(a.cmp(&b))
     });
     (*p).tree_rows.clear();
+    (*p).group_totals.clear();
+    let matches = (*p)
+        .snapshot
+        .as_ref()
+        .filter(|_| !filter.is_empty() && (*p).page == Page::Processes)
+        .map(|snapshot| {
+            snapshot
+                .processes
+                .iter()
+                .enumerate()
+                .filter(|(_, process)| {
+                    process.name.to_lowercase().contains(filter)
+                        || process.pid.to_string().contains(filter)
+                })
+                .map(|(index, _)| index)
+                .collect::<HashSet<_>>()
+        });
     if (*p).page == Page::Processes && (*p).tree_mode {
         if let Some(snapshot) = (*p).snapshot.as_ref() {
             let identities = snapshot
@@ -2146,26 +3361,12 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
                 .collect::<HashSet<_>>();
             (*p).collapsed
                 .retain(|identity| identities.contains(identity));
-            let matches = if filter.is_empty() {
-                None
-            } else {
-                Some(
-                    snapshot
-                        .processes
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, process)| {
-                            process.name.to_lowercase().contains(filter)
-                                || process.pid.to_string().contains(filter)
-                        })
-                        .map(|(index, _)| index)
-                        .collect::<HashSet<_>>(),
-                )
-            };
             (*p).tree_rows =
                 Tree::new(&snapshot.processes).rows(&(*p).rows, &(*p).collapsed, matches.as_ref());
             (*p).rows = (*p).tree_rows.iter().map(|row| row.index).collect();
         }
+    } else if (*p).page == Page::Processes && (*p).group_mode {
+        interactions::group_rows(p, matches.as_ref());
     }
     let clear = LVITEMW {
         stateMask: LVIS_SELECTED | LVIS_FOCUSED,
@@ -2203,27 +3404,13 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
         }
     }
     (*p).updating = false;
+    interactions::selection_changed(p);
     update_buttons(p);
     InvalidateRect((*p).list, null(), 0);
 }
+/// The table header paints the sort arrow from `(*p).sort / descending`.
 unsafe fn update_sort_header(p: *mut App) {
-    let header = SendMessageW((*p).list, LVM_GETHEADER, 0, 0) as HWND;
-    for i in 0..columns((*p).page).len() {
-        let mut h = HDITEMW {
-            mask: HDI_FORMAT,
-            ..zeroed()
-        };
-        SendMessageW(header, HDM_GETITEMW, i, &mut h as *mut _ as isize);
-        h.fmt &= !(HDF_SORTUP | HDF_SORTDOWN);
-        if i == (*p).sort {
-            h.fmt |= if (*p).descending {
-                HDF_SORTDOWN
-            } else {
-                HDF_SORTUP
-            };
-        }
-        SendMessageW(header, HDM_SETITEMW, i, &h as *const _ as isize);
-    }
+    table::invalidate_header((*p).list);
 }
 unsafe fn empty_message(p: *mut App) -> String {
     if let Some(e) = &(*p).error {
@@ -2238,7 +3425,14 @@ unsafe fn empty_message(p: *mut App) -> String {
     {
         return tr("목록을 불러오는 중…", "Loading the list…").into();
     }
-    if !(&(*p).filter).is_empty() {
+    if !(&(*p).filter).is_empty() && (*p).page == Page::Startup {
+        // Startup entries have no PID; the search matches these fields.
+        tr(
+            "검색 결과가 없습니다.\n다른 이름, 게시자 또는 명령으로 검색해 보세요.",
+            "No matching results.\nTry a different name, publisher or command.",
+        )
+        .into()
+    } else if !(&(*p).filter).is_empty() {
         tr(
             "검색 결과가 없습니다.\n다른 이름이나 PID로 검색해 보세요.",
             "No matching results.\nTry a different name or PID.",
@@ -2260,44 +3454,18 @@ unsafe fn notify(p: *mut App, l: LPARAM) -> LRESULT {
         return 0;
     }
     match hdr.code {
-        LVN_GETDISPINFOW => {
-            let info = &mut *(l as *mut NMLVDISPINFOW);
-            if info.item.mask & LVIF_TEXT != 0
-                && info.item.iItem >= 0
-                && !info.item.pszText.is_null()
-                && info.item.cchTextMax > 0
-            {
-                let value = (&(*p).rows)
-                    .get(info.item.iItem as usize)
-                    .map(|&r| cell_at(p, r, info.item.iSubItem))
-                    .unwrap_or_default();
-                let mut n = 0;
-                for ch in value.encode_utf16().take(info.item.cchTextMax as usize - 1) {
-                    *info.item.pszText.add(n) = ch;
-                    n += 1;
-                }
-                *info.item.pszText.add(n) = 0;
-            }
-            0
-        }
-        LVN_GETEMPTYMARKUP => {
-            let empty = &mut *(l as *mut NMLVEMPTYMARKUP);
-            empty.dwFlags = EMF_CENTERED;
-            let value = empty_message(p);
-            let cap = empty.szMarkup.len() - 1;
-            for (i, ch) in value.encode_utf16().take(cap).enumerate() {
-                empty.szMarkup[i] = ch;
-                empty.szMarkup[i + 1] = 0;
-            }
-            1
-        }
         LVN_COLUMNCLICK => {
             let col = (*(l as *const NMLISTVIEW)).iSubItem;
             if col < 0 || col as usize >= columns((*p).page).len() {
                 return 0;
             }
+            // No startup-impact measurement exists: nothing to sort by.
+            if (*p).page == Page::Startup && col == 2 {
+                return 0;
+            }
             let identity = selected_identity(p);
             let col = col as usize;
+            (*p).sort_chosen = true;
             if col == (*p).sort {
                 (*p).descending = !(*p).descending;
             } else {
@@ -2312,17 +3480,32 @@ unsafe fn notify(p: *mut App, l: LPARAM) -> LRESULT {
         LVN_ITEMCHANGED => {
             if !(*p).updating {
                 (*p).notice.clear();
+                interactions::selection_changed(p);
                 update_buttons(p);
                 redraw(p);
             }
             0
         }
-        NM_DBLCLK => {
+        // Double click and Enter run the row's default action.
+        NM_DBLCLK | NM_RETURN => {
             if (*p).page == Page::Processes {
-                if (*p).tree_mode {
-                    let click = &*(l as *const NMITEMACTIVATE);
-                    // A first click on the glyph already toggled the branch.
-                    if !branch_glyph_hit(p, click) {
+                // An app row of the grouped view opens and closes like a
+                // tree parent; other rows open the file location.
+                let parent = selected_row(p).is_some()
+                    && SendMessageW(
+                        (*p).list,
+                        LVM_GETNEXTITEM,
+                        usize::MAX,
+                        LVNI_SELECTED as isize,
+                    )
+                    .try_into()
+                    .ok()
+                    .and_then(|row: usize| (&(*p).tree_rows).get(row).copied())
+                    .is_some_and(|row| row.has_children);
+                if (*p).tree_mode || (grouped_view(p) && parent) {
+                    // A first click on the chevron already toggled the branch.
+                    if hdr.code == NM_RETURN || !branch_glyph_hit(p, &*(l as *const NMITEMACTIVATE))
+                    {
                         toggle_selected_branch(p, None);
                     }
                 } else {
@@ -2331,111 +3514,52 @@ unsafe fn notify(p: *mut App, l: LPARAM) -> LRESULT {
             }
             0
         }
-        NM_CLICK if (*p).page == Page::Processes && (*p).tree_mode => {
+        NM_CLICK if (*p).page == Page::Startup => {
+            interactions::startup_click(p, &*(l as *const NMITEMACTIVATE));
+            0
+        }
+        NM_CLICK if (*p).page == Page::Processes && ((*p).tree_mode || grouped_view(p)) => {
             let click = &*(l as *const NMITEMACTIVATE);
             if branch_glyph_hit(p, click) {
                 toggle_selected_branch(p, None);
             }
             0
         }
-        NM_CUSTOMDRAW => {
-            let draw = &mut *(l as *mut NMLVCUSTOMDRAW);
-            match draw.nmcd.dwDrawStage {
-                CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW as isize,
-                CDDS_ITEMPREPAINT => {
-                    draw.clrText = INK;
-                    // Virtual list custom-draw state may report CDIS_SELECTED
-                    // for unselected rows; ask the actual ListView selection.
-                    draw.clrTextBk = if SendMessageW(
-                        (*p).list,
-                        LVM_GETITEMSTATE,
-                        draw.nmcd.dwItemSpec,
-                        LVIS_SELECTED as isize,
-                    ) != 0
-                    {
-                        SELECTED
-                    } else if draw.nmcd.dwItemSpec.is_multiple_of(2) {
-                        SURFACE
-                    } else {
-                        rgb(250, 251, 253)
-                    };
-                    if (*p).page == Page::Processes && (*p).tree_mode {
-                        CDRF_NOTIFYSUBITEMDRAW as isize
-                    } else {
-                        CDRF_DODEFAULT as isize
-                    }
-                }
-                stage
-                    if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM
-                        && draw.iSubItem == 0
-                        && (*p).page == Page::Processes
-                        && (*p).tree_mode =>
-                {
-                    let row_index = draw.nmcd.dwItemSpec;
-                    if let Some(row) = (&(*p).tree_rows).get(row_index) {
-                        let value = cell_at(p, row.index, 0);
-                        let mut bounds = RECT {
-                            left: LVIR_BOUNDS as i32,
-                            ..zeroed()
-                        };
-                        SendMessageW(
-                            (*p).list,
-                            LVM_GETITEMRECT,
-                            row_index,
-                            &mut bounds as *mut _ as isize,
-                        );
-                        bounds.right =
-                            bounds.left + SendMessageW((*p).list, LVM_GETCOLUMNWIDTH, 0, 0) as i32;
-                        paint::tree_cell(p, draw.nmcd.hdc, bounds, row, &value, draw.clrTextBk);
-                        CDRF_SKIPDEFAULT as isize
-                    } else {
-                        CDRF_DODEFAULT as isize
-                    }
-                }
-                _ => CDRF_DODEFAULT as isize,
-            }
-        }
         _ => 0,
     }
 }
+/// The click landed on the row's tree chevron (the table's own geometry).
 unsafe fn branch_glyph_hit(p: *mut App, click: &NMITEMACTIVATE) -> bool {
-    if click.iItem < 0 || click.iSubItem != 0 {
-        return false;
+    click.iItem >= 0
+        && table::part_at((*p).list, click.ptAction)
+            == Some((click.iItem as usize, table::Part::Chevron))
+}
+/// The process at snapshot index `index` as the table shows it: a grouped
+/// app row carries its app's summed CPU, memory and I/O
+/// (`(*p).group_totals`), every other row the process's own values.
+unsafe fn shown_process(p: *mut App, index: usize) -> Option<Process> {
+    let mut process = (*p).snapshot.as_ref()?.processes.get(index)?.clone();
+    if let Some(total) = (*p).group_totals.get(&index) {
+        total.apply(&mut process);
     }
-    let Some(row) = (&(*p).tree_rows).get(click.iItem as usize) else {
-        return false;
-    };
-    if !row.has_children {
-        return false;
-    }
-    let mut bounds = RECT {
-        left: LVIR_BOUNDS as i32,
-        ..zeroed()
-    };
-    SendMessageW(
-        (*p).list,
-        LVM_GETITEMRECT,
-        click.iItem as usize,
-        &mut bounds as *mut _ as isize,
-    );
-    let left = bounds.left + scale(p, 8 + row.depth.min(12) as i32 * 18);
-    click.ptAction.x >= left && click.ptAction.x <= left + scale(p, 18)
+    Some(process)
 }
 unsafe fn cell_at(p: *mut App, row: usize, col: i32) -> String {
     match (*p).page {
-        Page::Processes => (*p)
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.processes.get(row))
-            .map(|s| cell(s, col))
+        Page::Processes => shown_process(p, row)
+            .map(|s| cell(&s, col))
             .unwrap_or_default(),
         Page::Startup => (&(*p).startup)
             .get(row)
             .map(|s| match col {
                 0 => s.name.clone(),
-                1 => s.status.clone(),
-                2 => s.location.clone(),
-                3 => s.command.clone(),
+                1 => (*p)
+                    .startup_publishers
+                    .get(&s.id)
+                    .cloned()
+                    .unwrap_or_else(|| "—".into()),
+                2 => tr("측정 안 됨", "Not measured").into(),
+                3 => s.status.clone(),
                 _ => String::new(),
             })
             .unwrap_or_default(),
@@ -2443,20 +3567,20 @@ unsafe fn cell_at(p: *mut App, row: usize, col: i32) -> String {
             .get(row)
             .map(|s| match col {
                 0 => s.name.clone(),
-                1 => s.display_name.clone(),
-                2 => crate::services::state_label(s.state).into(),
-                3 => {
+                1 => {
                     if s.pid == 0 {
                         "—".into()
                     } else {
                         s.pid.to_string()
                     }
                 }
+                2 => s.display_name.clone(),
+                3 => crate::services::state_label(s.state).into(),
                 4 => crate::services::start_type_label(s.start_type).into(),
                 _ => String::new(),
             })
             .unwrap_or_default(),
-        Page::Performance => String::new(),
+        Page::Performance | Page::Settings => String::new(),
     }
 }
 fn cell(p: &Process, col: i32) -> String {
@@ -2464,12 +3588,72 @@ fn cell(p: &Process, col: i32) -> String {
         0 => p.name.clone(),
         1 => p.pid.to_string(),
         2 => format!("{:.1}%", p.cpu_percent),
-        3 => format!("{:.1} MB", p.working_set as f64 / 1048576.0),
-        4 => format!("{:.1} MB", p.private_bytes as f64 / 1048576.0),
-        5 => rate(p.io_bytes_per_sec),
-        6 => p.threads.to_string(),
-        7 => p.handles.to_string(),
+        3 => format!("{} MB", thousands(p.working_set as f64 / 1048576.0)),
+        4 => format!("{}/s", rate(p.io_bytes_per_sec)),
+        5 => p.network_bytes_per_sec.map_or_else(|| "—".into(), mbps),
+        6 => p
+            .gpu_percent
+            .map_or_else(|| "—".into(), |v| format!("{v:.1}%")),
         _ => String::new(),
+    }
+}
+/// One decimal with thousands separators, like the reference's
+/// `toLocaleString('en-US', { minimumFractionDigits: 1 })` ("1,410.4").
+fn thousands(value: f64) -> String {
+    let text = format!("{value:.1}");
+    let (whole, fraction) = text.split_once('.').unwrap_or((&text, "0"));
+    let (sign, digits) = match whole.strip_prefix('-') {
+        Some(digits) => ("-", digits),
+        None => ("", whole),
+    };
+    format!("{sign}{}.{fraction}", group_digits(digits))
+}
+/// A count with thousands separators, like the reference's
+/// `toLocaleString('en-US')` ("13,837").
+fn grouped(value: impl std::fmt::Display) -> String {
+    group_digits(&value.to_string())
+}
+fn group_digits(digits: &str) -> String {
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    grouped
+}
+/// A GPU the Performance page lists: not a software renderer (Microsoft
+/// Basic Render Driver) or an indirect (virtual) display adapter, which
+/// Windows Task Manager does not list either.
+fn listed_gpu(gpu: &crate::performance::GpuStats) -> bool {
+    !gpu.is_software()
+        && !gpu
+            .adapter
+            .as_ref()
+            .is_some_and(|adapter| adapter.is_indirect_display())
+}
+/// A network adapter the Performance page lists: present and connected
+/// (Task Manager hides the others).
+fn listed_network(nic: &crate::performance::NetworkStats) -> bool {
+    nic.present && nic.connected
+}
+/// System GPU utilization: the busiest listed adapter.
+fn system_gpu_percent(perf: &PerfSnapshot) -> Option<f64> {
+    perf.gpus
+        .iter()
+        .filter(|gpu| listed_gpu(gpu))
+        .filter_map(|gpu| gpu.percent)
+        .fold(None, |max: Option<f64>, v| {
+            Some(max.map_or(v, |m| m.max(v)))
+        })
+}
+/// Bytes per second as megabits per second, one decimal ("6.8 Mbps").
+fn mbps(bytes_per_sec: f64) -> String {
+    if bytes_per_sec.is_finite() {
+        format!("{:.1} Mbps", bytes_per_sec * 8.0 / 1e6)
+    } else {
+        "—".into()
     }
 }
 fn rate(bytes: f64) -> String {
@@ -2482,6 +3666,170 @@ fn rate(bytes: f64) -> String {
     } else {
         format!("{bytes:.0} B")
     }
+}
+
+/// Resize `hwnd` so its client area is exactly `width` × `height` device px,
+/// whatever its frame (native caption now, custom frame later): the frame's
+/// actual size is measured instead of assumed.
+unsafe fn fit_client(hwnd: HWND, width: i32, height: i32) {
+    for _ in 0..3 {
+        let mut client: RECT = zeroed();
+        GetClientRect(hwnd, &mut client);
+        if client.right == width && client.bottom == height {
+            return;
+        }
+        let mut window: RECT = zeroed();
+        GetWindowRect(hwnd, &mut window);
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            0,
+            0,
+            window.right - window.left + width - client.right,
+            window.bottom - window.top + height - client.bottom,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Preview captures of layout states that need interaction: a selected
+/// process (enabled head actions) with the ⋯ button hovered, the process
+/// telemetry drawer and the service details panel inside the content rect.
+unsafe fn save_layout_states(p: *mut App, dir: &std::path::Path) -> Result<(), String> {
+    let select_first = |p: *mut App| {
+        if let Some(row) = (0..(*p).rows.len()).find(|i| !(*p).group_headers.contains_key(i)) {
+            let item = LVITEMW {
+                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                state: LVIS_SELECTED | LVIS_FOCUSED,
+                ..zeroed()
+            };
+            SendMessageW((*p).list, LVM_SETITEMSTATE, row, &item as *const _ as isize);
+        }
+        update_buttons(p);
+    };
+    // The nav indicator a third of the way from Processes to Services
+    // (motion::NAV): stretched across the rail gaps and the nav buttons,
+    // the old item's background fading out and the new one's in.
+    switch_page(p, Page::Processes);
+    switch_page(p, Page::Services);
+    (*p).services_loading = false;
+    rebuild(p, None);
+    {
+        let l = current_layout(p);
+        let from = nav_indicator_target(&l, Page::Processes);
+        let to = nav_indicator_target(&l, Page::Services);
+        let lead = anim::Easing::EaseOut.apply(0.33);
+        let trail = anim::Easing::Bezier(0.6, 0.0, 0.2, 1.0).apply(0.33);
+        (*p).anim.set(
+            (anim::NAV_ID, anim::part::NAV_TOP),
+            from.0 + (to.0 - from.0) * trail,
+        );
+        (*p).anim.set(
+            (anim::NAV_ID, anim::part::NAV_BOTTOM),
+            from.1 + (to.1 - from.1) * lead,
+        );
+        (*p).anim.set((NAV, anim::part::SELECTED), 1.0 - lead);
+        (*p).anim.set((NAV + 3, anim::part::SELECTED), lead);
+        capture::save_client(p, &dir.join("nav-slide.bmp"))?;
+    }
+    switch_page(p, Page::Processes);
+    rebuild(p, None);
+    select_first(p);
+    (*p).anim.set((MORE, anim::part::HOVER), 1.0);
+    layout(p);
+    capture::save_client(p, &dir.join("processes-selected.bmp"))?;
+    (*p).anim.set((MORE, anim::part::HOVER), 0.0);
+    (*p).show_telemetry = true;
+    layout(p);
+    capture::save_client(p, &dir.join("process-telemetry.bmp"))?;
+    (*p).show_telemetry = false;
+    layout(p);
+    // Typed search text inside the title-strip search box.
+    SetWindowTextW((*p).search, wide("svc").as_ptr());
+    capture::save_client(p, &dir.join("processes-search.bmp"))?;
+    SetWindowTextW((*p).search, wide("").as_ptr());
+    switch_page(p, Page::Services);
+    (*p).services_loading = false;
+    rebuild(p, None);
+    select_first(p);
+    (*p).show_details = true;
+    layout(p);
+    // What the list already knows while the details query runs ...
+    capture::save_client(p, &dir.join("service-details.bmp"))?;
+    // ... and the answer: the first running service's real details.
+    let running = (*p).rows.iter().position(|&i| {
+        (&(*p).services)
+            .get(i)
+            .is_some_and(|s| s.state == SERVICE_RUNNING)
+    });
+    if let Some(row) = running {
+        let item = LVITEMW {
+            stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+            state: LVIS_SELECTED | LVIS_FOCUSED,
+            ..zeroed()
+        };
+        SendMessageW((*p).list, LVM_SETITEMSTATE, row, &item as *const _ as isize);
+        update_buttons(p);
+        if let Some(name) = (*p).service_detail_name.clone() {
+            (*p).service_details = crate::services::details(&name).ok();
+        }
+        for (theme, name) in [(1, "light"), (2, "dark")] {
+            (*p).prefs.theme = theme;
+            interactions::apply_theme(p);
+            capture::save_client(p, &dir.join(format!("service-details-loaded-{name}.bmp")))?;
+        }
+    }
+    (*p).show_details = false;
+    layout(p);
+    // The Logical CPUs view (captions above the small multiples).
+    let performance = (*p).performance.clone();
+    switch_page(p, Page::Performance);
+    (*p).performance = performance;
+    for (theme, name) in [(1, "light"), (2, "dark")] {
+        (*p).prefs.theme = theme;
+        interactions::apply_theme(p);
+        (*p).core_graphs = true;
+        redraw(p);
+        capture::save_client(p, &dir.join(format!("cores-{name}.bmp")))?;
+        (*p).core_graphs = false;
+    }
+    (*p).prefs.theme = 1;
+    interactions::apply_theme(p);
+    // One capture per device kind (its first listed device): the model
+    // line, card subs and hardware specs (`perf-<kind>.bmp`).
+    interactions::refresh_components(p);
+    let first = |kind: fn(&PerfTarget) -> bool| (&(*p).perf_targets).iter().position(kind);
+    for (index, name) in [
+        (first(|t| matches!(t, PerfTarget::Cpu)), "cpu"),
+        (first(|t| matches!(t, PerfTarget::Memory)), "memory"),
+        (first(|t| matches!(t, PerfTarget::Disk(_))), "disk"),
+        (first(|t| matches!(t, PerfTarget::Network(_))), "network"),
+        (first(|t| matches!(t, PerfTarget::Gpu(_))), "gpu"),
+    ] {
+        let Some(index) = index else {
+            continue;
+        };
+        (*p).perf_target = (&(*p).perf_targets)[index].clone();
+        SendMessageW((*p).perf_list, LB_SETCURSEL, index, 0);
+        redraw(p);
+        capture::save_client(p, &dir.join(format!("perf-{name}.bmp")))?;
+    }
+    (*p).perf_target = PerfTarget::Cpu;
+    SendMessageW((*p).perf_list, LB_SETCURSEL, 0, 0);
+    // Processes sorted by GPU, busiest first (the flat list).
+    switch_page(p, Page::Processes);
+    let (group_mode, sort, descending) = ((*p).group_mode, (*p).sort, (*p).descending);
+    (*p).group_mode = false;
+    (*p).sort = 6;
+    (*p).descending = true;
+    rebuild(p, None);
+    layout(p);
+    update_buttons(p);
+    capture::save_client(p, &dir.join("processes-gpu.bmp"))?;
+    ((*p).group_mode, (*p).sort, (*p).descending) = (group_mode, sort, descending);
+    rebuild(p, None);
+    redraw(p);
+    Ok(())
 }
 
 /// Render this application's own hidden native client, using read-only live data.
@@ -2501,6 +3849,8 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
             dispose(p);
             return Err("Preview window creation failed".into());
         }
+        // Client 1200 × 820 compares 1:1 with the reference window renders.
+        fit_client(hwnd, 1200, 820);
         let result = (|| {
             (*p).startup = crate::startup::list()?;
             (*p).startup_loaded = true;
@@ -2510,25 +3860,55 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
             let mut perf = PerfSampler::new()?;
             switch_page(p, Page::Performance);
             // Populate a complete one-minute trace with measured values.
-            for i in 0..61 {
+            // Development iterations may shorten it; release previews keep 61 x 1 s.
+            let env_u64 = |name: &str, default: u64| {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(default)
+            };
+            let samples = env_u64("FEATHER_PREVIEW_SAMPLES", 61).clamp(2, 61);
+            let interval = env_u64("FEATHER_PREVIEW_INTERVAL_MS", 1000).clamp(50, 1000);
+            // The monitor's per-process joins, as the running app does.
+            let mut gpu_tracker = ProcessGpuTracker::default();
+            let mut network = NetworkMonitor::new();
+            for i in 0..samples {
                 if i > 0 {
-                    std::thread::sleep(Duration::from_secs(1));
+                    std::thread::sleep(Duration::from_millis(interval));
                 }
+                let snapshot = sampler.sample();
+                let performance = perf.sample();
+                let (process_gpu, process_network) = match &snapshot {
+                    Ok(s) => (
+                        gpu_tracker.join(&s.processes, performance.as_ref().ok()),
+                        network.sample(&s.processes),
+                    ),
+                    Err(_) => Default::default(),
+                };
                 snapshots
                     .send(MonitorSample {
                         at: Instant::now(),
-                        snapshot: sampler.sample(),
-                        performance: Some(perf.sample()),
+                        snapshot,
+                        performance: Some(performance),
+                        process_gpu,
+                        process_network,
                     })
                     .map_err(|e| e.to_string())?;
                 drain_snapshot(p);
             }
+            (*p).group_mode = true;
             let performance = (*p).performance.clone();
+            (*p).startup_publishers = (*p)
+                .startup
+                .iter()
+                .filter_map(|e| crate::startup::publisher(e).map(|v| (e.id.clone(), v)))
+                .collect();
             for (page, name) in [
                 (Page::Processes, "processes.bmp"),
                 (Page::Performance, "performance.bmp"),
                 (Page::Startup, "startup.bmp"),
                 (Page::Services, "services.bmp"),
+                (Page::Settings, "settings.bmp"),
             ] {
                 switch_page(p, page);
                 if page == Page::Performance {
@@ -2541,6 +3921,42 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
                 update_buttons(p);
                 capture::save_client(p, &dir.join(name))?;
             }
+            for theme in [2, 1] {
+                (*p).prefs.theme = theme;
+                interactions::apply_theme(p);
+                for (page, name) in [
+                    (Page::Processes, "processes"),
+                    (Page::Performance, "performance"),
+                    (Page::Startup, "startup"),
+                    (Page::Services, "services"),
+                    (Page::Settings, "settings"),
+                ] {
+                    switch_page(p, page);
+                    if page == Page::Performance {
+                        (*p).performance = performance.clone();
+                    }
+                    (*p).startup_loading = false;
+                    (*p).services_loading = false;
+                    rebuild(p, None);
+                    layout(p);
+                    update_buttons(p);
+                    capture::save_client(
+                        p,
+                        &dir.join(format!(
+                            "{name}-{}.bmp",
+                            if theme == 2 { "dark" } else { "light" }
+                        )),
+                    )?;
+                }
+            }
+            capture::save_foundation_previews(dir)?;
+            save_layout_states(p, dir)?;
+            table::save_previews(p, dir)?;
+            controls::save_previews(p, dir)?;
+            // The Nuclear Zombie panel before / during / after a run, from
+            // read-only data (nothing is trimmed or purged).
+            nuclear::save_previews(p, dir)?;
+            frame::save_previews(p, dir)?;
             switch_page(p, Page::Processes);
             set_tree_mode(p, true);
             capture::save_client(p, &dir.join("process-tree.bmp"))?;
@@ -2551,6 +3967,9 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
             for (dpi, width, height, suffix) in
                 [(96, 980, 660, "minimum"), (144, 1800, 1230, "dpi150")]
             {
+                // These captures come long after the last preview sample: the
+                // status bar would read "Waiting" instead of the live state.
+                (*p).last_sample = Some(Instant::now());
                 let r = RECT {
                     left: 0,
                     top: 0,
@@ -2563,9 +3982,11 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
                     dpi | (dpi << 16),
                     &r as *const _ as isize,
                 );
+                fit_client(hwnd, width, height);
                 for (page, name) in [
                     (Page::Processes, "processes"),
                     (Page::Performance, "performance"),
+                    (Page::Settings, "settings"),
                 ] {
                     switch_page(p, page);
                     if page == Page::Performance {
@@ -2576,6 +3997,7 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
                     update_buttons(p);
                     capture::save_client(p, &dir.join(format!("{name}-{suffix}.bmp")))?;
                     if page == Page::Processes {
+                        table::save_scrolled(p, &dir.join(format!("table-scrolled-{suffix}.bmp")))?;
                         set_tree_mode(p, true);
                         capture::save_client(p, &dir.join(format!("process-tree-{suffix}.bmp")))?;
                         set_tree_mode(p, false);
@@ -2598,6 +4020,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+    #[test]
+    fn counts_and_memory_use_thousands_separators() {
+        assert_eq!(grouped(7u32), "7");
+        assert_eq!(grouped(470u32), "470");
+        assert_eq!(grouped(2470u32), "2,470");
+        assert_eq!(grouped(13837u64), "13,837");
+        assert_eq!(grouped(789440usize), "789,440");
+        assert_eq!(grouped(1234567u64), "1,234,567");
+        assert_eq!(thousands(1499.84), "1,499.8");
+        assert_eq!(thousands(12.26), "12.3");
+        assert_eq!(thousands(-2048.0), "-2,048.0");
+    }
     struct TestWindow {
         p: *mut App,
         class: Vec<u16>,
@@ -2641,6 +4075,8 @@ mod tests {
                     at: Instant::now(),
                     snapshot: Err(error.into()),
                     performance: None,
+                    process_gpu: Default::default(),
+                    process_network: Default::default(),
                 })
                 .unwrap();
             unsafe {
@@ -2659,6 +4095,8 @@ mod tests {
                         sample_ms: 0.25,
                     }),
                     performance: None,
+                    process_gpu: Default::default(),
+                    process_network: Default::default(),
                 })
                 .unwrap();
             unsafe {
@@ -2764,6 +4202,8 @@ mod tests {
             working_set: memory * 1048576,
             private_bytes: memory * 524288,
             io_bytes_per_sec: 2048.0,
+            gpu_percent: None,
+            network_bytes_per_sec: None,
             threads: 3,
             handles: 12,
         }
@@ -2774,6 +4214,76 @@ mod tests {
             process(202, 1002, "Beta.exe", 100, 9.0),
             process(303, 1003, "테스트.exe", 2, 10.0),
         ]
+    }
+    #[test]
+    fn per_process_gpu_and_network_join_by_identity_format_sort_and_sum() {
+        let mut snapshot = Snapshot {
+            processes: rows(),
+            cpu_percent: 0.,
+            memory_used: 0,
+            memory_total: 0,
+            sample_ms: 0.,
+        };
+        let mut gpu = std::collections::HashMap::new();
+        gpu.insert(
+            (101, 1001),
+            ProcessGpu {
+                percent: Some(12.34),
+                ..ProcessGpu::default()
+            },
+        );
+        // A reused PID (other creation time) never inherits a value.
+        gpu.insert(
+            (202, 9999),
+            ProcessGpu {
+                percent: Some(50.),
+                ..ProcessGpu::default()
+            },
+        );
+        let mut network = ProcessNetworkSample {
+            measured: true,
+            ..ProcessNetworkSample::default()
+        };
+        network.by_id.insert(
+            (202, 1002),
+            crate::netetw::ProcessNet {
+                send_bytes_per_sec: 50_000.,
+                recv_bytes_per_sec: 800_000.,
+                total_bytes_per_sec: 850_000.,
+            },
+        );
+        join_process_samples(&mut snapshot, &gpu, &network);
+        let [a, b, c] = &snapshot.processes[..] else {
+            panic!("three rows");
+        };
+        assert_eq!(
+            (a.gpu_percent, b.gpu_percent, c.gpu_percent),
+            (Some(12.34), None, None)
+        );
+        assert_eq!(b.network_bytes_per_sec, Some(850_000.));
+        assert_eq!(cell(a, 6), "12.3%");
+        assert_eq!(cell(b, 6), "—");
+        assert_eq!(cell(b, 5), "6.8 Mbps");
+        assert_eq!(cell(a, 5), "—");
+        // Unmeasured ranks below measured values.
+        assert_eq!(compare(a, c, 6), Ordering::Greater);
+        assert_eq!(compare(c, b, 5), Ordering::Less);
+        // Unmeasured network samples show no values at all.
+        network.measured = false;
+        join_process_samples(&mut snapshot, &gpu, &network);
+        assert!(snapshot
+            .processes
+            .iter()
+            .all(|p| p.network_bytes_per_sec.is_none()));
+        // App rows sum what was measured; GPU is capped at 100 %.
+        let mut busy = snapshot.processes.clone();
+        busy[0].gpu_percent = Some(70.);
+        busy[1].gpu_percent = Some(45.);
+        busy[1].network_bytes_per_sec = Some(1000.);
+        let total = GroupTotal::of(&busy);
+        assert_eq!(total.gpu, Some(100.));
+        assert_eq!(total.network, Some(1000.));
+        assert_eq!(GroupTotal::of(&snapshot.processes[2..]).gpu, None);
     }
     fn service(name: &str, state: u32, pid: u32, start_type: Option<u32>) -> Service {
         Service {
@@ -2820,6 +4330,37 @@ mod tests {
                     assert_eq!((bitmap.bmWidth, bitmap.bmHeight), (expected, expected));
                 }
             }
+        }
+    }
+    #[test]
+    fn a_new_process_count_repaints_the_processes_nav_item() {
+        let test = TestWindow::new();
+        unsafe {
+            let p = test.p;
+            let hwnd = (*p).hwnd;
+            // Shown fully transparent and click-through: hidden windows keep
+            // no update region.
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_EXSTYLE,
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+                    | (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)
+                        as isize,
+            );
+            SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let nav = (*p).nav[0];
+            let pending = || {
+                let mut r: RECT = zeroed();
+                GetUpdateRect(nav, &mut r, 0) != 0
+            };
+            test.snapshot(rows());
+            ValidateRect(nav, null());
+            test.snapshot(rows());
+            assert!(!pending(), "the same count leaves the nav item alone");
+            test.snapshot(rows()[..2].to_vec());
+            assert!(pending(), "the count in the nav item changed");
+            ShowWindow(hwnd, SW_HIDE);
         }
     }
     #[test]
@@ -2893,8 +4434,9 @@ mod tests {
                 },
                 iItem: 0,
                 iSubItem: 0,
+                // The chevron: 20 × 20 inside the name cell's 12 px padding.
                 ptAction: POINT {
-                    x: bounds.left + scale(test.p, 12),
+                    x: bounds.left + scale(test.p, 22),
                     y: (bounds.top + bounds.bottom) / 2,
                 },
                 ..zeroed()
@@ -3016,8 +4558,9 @@ mod tests {
             test.result(JobResult::Startup(Ok(localized)));
             assert_eq!(test.identity(), identity);
             if !entries.is_empty() {
-                assert_eq!(test.text(0, 1), "Fresh English status");
-                assert_eq!(test.text(0, 2), "Fresh English location");
+                assert_eq!(test.text(0, 3), "Fresh English status");
+                let row = selected_row(test.p).unwrap();
+                assert_eq!((&(*test.p).startup)[row].location, "Fresh English location");
             }
             assert!((*test.p).startup_loaded);
             assert!(!(*test.p).startup_loading);
@@ -3042,7 +4585,12 @@ mod tests {
             test.result(JobResult::Startup(Err("Old-language failure".into())));
             assert!((*test.p).error.is_none());
             assert!(!(*test.p).startup_loaded);
-            assert!(test.jobs.try_recv().is_err(), "Keep inactive pages lazy");
+            assert!(
+                test.jobs
+                    .try_iter()
+                    .all(|job| matches!(job, Job::ProcessDetails(..))),
+                "Keep inactive startup pages lazy; selected process metadata is read-only"
+            );
             assert_eq!(test.identity(), identity);
             test.page(Page::Startup);
             assert!(matches!(test.jobs.try_recv(), Ok(Job::Startup)));
@@ -3094,25 +4642,14 @@ mod tests {
                 GetWindowLongW((*test.p).list, GWL_STYLE) as u32 & WS_VISIBLE,
                 0
             );
-            assert_eq!(
-                GetWindowLongW((*test.p).search, GWL_STYLE) as u32 & WS_VISIBLE,
-                0
-            );
+            assert_eq!(IsWindowEnabled((*test.p).search), 0);
         }
         assert!(test.jobs.try_recv().is_err());
         test.page(Page::Startup);
         assert!(matches!(test.jobs.try_recv(), Ok(Job::Startup)));
         test.result(JobResult::Startup(Ok(Vec::new())));
         unsafe {
-            assert_eq!(
-                SendMessageW(
-                    SendMessageW((*test.p).list, LVM_GETHEADER, 0, 0) as HWND,
-                    HDM_GETITEMCOUNT,
-                    0,
-                    0
-                ),
-                4
-            );
+            assert_eq!(table::column_count((*test.p).list), 4);
         }
         test.page(Page::Processes);
         test.page(Page::Startup);
@@ -3126,7 +4663,7 @@ mod tests {
             Some(2),
         )])));
         assert_eq!(test.count(), 1);
-        assert_eq!(test.text(0, 2), "실행 중");
+        assert_eq!(test.text(0, 3), "실행 중");
         test.page(Page::Processes);
         assert_eq!(test.count(), 3);
         assert_eq!(test.text(0, 0), "Beta.exe");
@@ -3146,7 +4683,7 @@ mod tests {
             assert_eq!(IsWindowEnabled((*test.p).primary), 0);
             assert_ne!(IsWindowEnabled((*test.p).secondary), 0);
         }
-        test.sort(3);
+        test.sort(1);
         assert_eq!(test.identity(), Some(Identity::Service("Alpha".into())));
         test.search("Beta");
         test.select(0);
@@ -3158,7 +4695,12 @@ mod tests {
             assert_eq!(IsWindowEnabled((*test.p).primary), 0);
             command(test.p, PRIMARY, 0);
         }
-        assert!(test.jobs.try_recv().is_err());
+        assert!(
+            test.jobs
+                .try_iter()
+                .all(|job| matches!(job, Job::ServiceDetails(_))),
+            "Busy state cannot enqueue management actions"
+        );
         unsafe {
             (*test.p).busy = false;
             update_buttons(test.p);
@@ -3181,7 +4723,7 @@ mod tests {
             test.select(0);
             let identity = test.identity();
             let row = unsafe { selected_row(test.p).unwrap() };
-            assert_eq!(test.text(0, 1), entries[row].status);
+            assert_eq!(test.text(0, 3), entries[row].status);
             test.sort(2);
             assert_eq!(test.identity(), identity);
             unsafe {
@@ -3367,20 +4909,15 @@ mod tests {
                     ..
                 }
             ));
-            SendMessageW((*test.p).rate, CB_SETCURSEL, 3, 0);
+            SendMessageW((*test.p).rate, CB_SETCURSEL, 5, 0);
             command(test.p, RATE, CBN_SELCHANGE);
             assert!(matches!(
                 test.commands.recv().unwrap(),
                 Command::Configure {
-                    paused: true,
+                    paused: false,
                     interval: 5000,
                     ..
                 }
-            ));
-            command(test.p, PAUSE, 0);
-            assert!(matches!(
-                test.commands.recv().unwrap(),
-                Command::Configure { paused: false, .. }
             ));
             SendMessageW((*test.p).hwnd, WM_SIZE, SIZE_MINIMIZED as usize, 0);
             assert!(matches!(
@@ -3392,6 +4929,1306 @@ mod tests {
                 test.commands.recv().unwrap(),
                 Command::Configure { paused: false, .. }
             ));
+        }
+    }
+    #[test]
+    fn new_modal_exit_reposts_consumed_notifications_and_unblocks_sampling() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            (*test.p).modal = true;
+        }
+        test.snapshot(vec![process(909, 99, "Queued.exe", 2, 1.)]);
+        test.result(JobResult::Services(Ok(vec![service(
+            "Queued",
+            SERVICE_RUNNING,
+            1,
+            Some(2),
+        )])));
+        unsafe {
+            interactions::finish_modal(test.p);
+            let mut msg: MSG = zeroed();
+            let mut delivered = 0;
+            while PeekMessageW(
+                &mut msg,
+                (*test.p).hwnd,
+                SNAPSHOT_READY,
+                JOB_READY,
+                PM_REMOVE,
+            ) != 0
+            {
+                DispatchMessageW(&msg);
+                delivered += 1;
+            }
+            assert!(delivered >= 2);
+            assert_eq!((*test.p).services.len(), 1);
+        }
+        assert_eq!(test.text(0, 0), "Queued.exe");
+        test.snapshot(rows());
+        assert_eq!(test.count(), 3);
+    }
+    #[test]
+    fn grouped_headers_are_never_process_targets_and_real_selection_survives() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        test.select(0);
+        let identity = test.identity();
+        unsafe {
+            (*test.p).group_mode = true;
+            (*test.p).window_pids.insert(202);
+            (*test.p).last_window_scan = Some(Instant::now());
+            rebuild(test.p, identity.clone());
+            assert_eq!(test.identity(), identity);
+            assert_eq!((*test.p).group_headers.len(), 2);
+            test.select(0);
+            assert!(test.identity().is_none());
+            assert!(selected_process(test.p).is_none());
+            assert_eq!(IsWindowEnabled((*test.p).primary), 0);
+            set_tree_mode(test.p, true);
+            assert!(!(*test.p).group_mode);
+            assert!((*test.p).group_headers.is_empty());
+        }
+    }
+    /// Service details: nothing selected, the list row's facts while the
+    /// query runs, then the answer — with an empty description, path and
+    /// dependencies (third-party services have none; an empty string used
+    /// to reach DrawTextW with a dangling pointer and crash); the Startup
+    /// type column steps aside while the panel shows.
+    #[test]
+    fn service_details_panel_flows_and_survives_empty_fields() {
+        let test = TestWindow::new();
+        test.page(Page::Services);
+        let _ = test.jobs.recv().unwrap();
+        test.result(JobResult::Services(Ok(vec![
+            service("NoDescription", SERVICE_RUNNING, 4242, Some(2)),
+            service("Other", SERVICE_STOPPED, 0, Some(3)),
+        ])));
+        unsafe {
+            let p = test.p;
+            fit_client((*p).hwnd, 1200, 820);
+            assert_eq!(table::column_count((*p).list), 5);
+            (*p).show_details = true;
+            layout(p);
+            assert_eq!(table::column_count((*p).list), 4, "Startup type hides");
+            let l = current_layout(p);
+            let panel = l.details(true).1.unwrap();
+            let mut frame = gfx::Dib::new(1200, 820).unwrap();
+            // Ink (anything but the panel background) inside a band.
+            let ink = |frame: &mut gfx::Dib, top: i32, bottom: i32| {
+                let bg = colors().bg;
+                let bg = (bg & 0xff) << 16 | (bg & 0xff00) | (bg >> 16 & 0xff);
+                (top..bottom)
+                    .flat_map(|y| (panel.left + 16..panel.right - 16).map(move |x| (x, y)))
+                    .filter(|&(x, y)| frame.pixel(x, y) & 0x00ff_ffff != bg)
+                    .count()
+            };
+            let header = layout::table_header_height(Page::Services, 96);
+            let first_row = panel.top + header..panel.top + header + 34;
+            paint::paint_to(p, frame.dc());
+            assert!(
+                ink(&mut frame, first_row.start, first_row.end) > 0,
+                "Select a service"
+            );
+            test.select(0);
+            assert!(matches!(
+                test.jobs.try_recv(),
+                Ok(Job::ServiceDetails(name)) if name == "NoDescription"
+            ));
+            // Loading: the name on the first row's line, the state pill below.
+            paint::paint_to(p, frame.dc());
+            assert!(ink(&mut frame, first_row.start, first_row.end) > 0);
+            assert!(ink(&mut frame, first_row.end, first_row.end + 40) > 0);
+            let details = crate::services::ServiceDetails {
+                name: "NoDescription".into(),
+                display_name: "NoDescription".into(),
+                description: String::new(),
+                account: String::new(),
+                binary_path: String::new(),
+                load_order_group: String::new(),
+                dependencies: Vec::new(),
+                state: SERVICE_RUNNING,
+                pid: 4242,
+                start_type: 2,
+                warnings: Vec::new(),
+            };
+            test.result(JobResult::ServiceDetails(
+                "NoDescription".into(),
+                Ok(details.clone()),
+            ));
+            assert!((*p).service_details.is_some());
+            // (The dark theme is covered by the previews: flipping the
+            // process-wide palette here would race the parallel tests.)
+            paint::paint_to(p, frame.dc());
+            assert!(ink(&mut frame, first_row.start, first_row.end) > 0);
+            // A long unbroken path wraps inside the panel, never past it.
+            let path = format!("C:\\{}\\service.exe", "VeryLongDirectoryName".repeat(6));
+            (*p).service_details = Some(crate::services::ServiceDetails {
+                binary_path: path,
+                description: "A description long enough to wrap onto several lines of \
+                              the details panel without leaving holes between fields."
+                    .into(),
+                ..details
+            });
+            paint::paint_to(p, frame.dc());
+            (*p).show_details = false;
+            layout(p);
+            assert_eq!(table::column_count((*p).list), 5);
+        }
+    }
+    /// The grouped view ("App groups"): every process with a window is an
+    /// app, its windowless descendants belong to it (not under the shell,
+    /// which starts every sign-in app), an app of the same image nests, and
+    /// the rest splits into background and Windows processes.
+    #[test]
+    fn app_groups_follow_windows_and_the_process_tree() {
+        let tree = |pid: u32, parent: u32, name: &str| Process {
+            parent_pid: parent,
+            ..process(pid, u64::from(pid), name, 10, 1.0)
+        };
+        let processes = vec![
+            tree(10, 0, "explorer.exe"),
+            tree(20, 10, "chrome.exe"),
+            tree(21, 20, "chrome.exe"),
+            tree(22, 20, "chrome.exe"),
+            tree(23, 21, "crashpad_handler.exe"),
+            tree(24, 20, "chrome.exe"),
+            tree(30, 10, "OneDrive.exe"),
+            tree(31, 10, "explorer.exe"),
+            tree(40, 0, "svchost.exe"),
+            tree(50, 0, "Code.exe"),
+            tree(51, 50, "node.exe"),
+        ];
+        // Windows: explorer (10, the shell), chrome (20 and its second
+        // window 24), Code.
+        let windows = HashSet::from([10, 20, 24, 50]);
+        let app = interactions::app_groups(&processes, &windows, Some(10));
+        assert_eq!(app[0], Some(0), "explorer is an app");
+        assert_eq!(app[1], Some(1), "chrome under explorer is its own app");
+        assert_eq!((app[2], app[3], app[4]), (Some(1), Some(1), Some(1)));
+        assert_eq!(app[5], Some(1), "a second chrome window joins chrome");
+        assert_eq!(app[6], None, "the shell keeps no sign-in app");
+        assert_eq!(app[7], Some(0), "but its own instances");
+        assert_eq!(app[8], None);
+        assert_eq!((app[9], app[10]), (Some(9), Some(9)));
+        // Not the shell: a windowless child joins its parent's app.
+        let app = interactions::app_groups(&processes, &windows, None);
+        assert_eq!(app[6], Some(0));
+        // "Windows processes" come from the executable's directory.
+        let windows_dir = "C:\\Windows";
+        assert!(interactions::in_windows_dir(
+            "C:\\WINDOWS\\System32\\svchost.exe",
+            windows_dir
+        ));
+        assert!(!interactions::in_windows_dir(
+            "C:\\WindowsApps\\x.exe",
+            windows_dir
+        ));
+        assert!(!interactions::in_windows_dir(
+            "D:\\Tools\\svchost.exe",
+            windows_dir
+        ));
+    }
+    #[test]
+    fn grouped_view_lists_collapsible_apps_with_their_totals() {
+        let test = TestWindow::new();
+        let tree = |pid: u32, parent: u32, name: &str, memory: u64, cpu: f64| Process {
+            parent_pid: parent,
+            ..process(pid, u64::from(pid), name, memory, cpu)
+        };
+        test.snapshot(vec![
+            tree(20, 0, "chrome.exe", 100, 1.0),
+            tree(21, 20, "chrome.exe", 50, 2.0),
+            tree(22, 20, "chrome.exe", 25, 0.5),
+            tree(30, 0, "idle.exe", 5, 0.0),
+            tree(40, 0, "svchost.exe", 7, 0.1),
+            // Its path unreadable: started by a Windows process.
+            tree(41, 40, "host.exe", 3, 0.0),
+        ]);
+        unsafe {
+            let p = test.p;
+            (*p).group_mode = true;
+            (*p).window_pids = HashSet::from([20]);
+            (*p).last_window_scan = Some(Instant::now());
+            // The path test of the classification, known for this fixture.
+            for (pid, inside) in [(30u32, Some(false)), (40, Some(true)), (41, None)] {
+                (*p).windows_images.insert(
+                    ProcessIdentity {
+                        pid,
+                        created: u64::from(pid),
+                    },
+                    inside,
+                );
+            }
+            rebuild(p, None);
+            let headers: Vec<String> = (0..(*p).rows.len())
+                .filter_map(|row| (*p).group_headers.get(&row).cloned())
+                .collect();
+            assert_eq!(
+                headers,
+                ["앱 (1)", "백그라운드 프로세스 (1)", "Windows 프로세스 (2)"]
+            );
+            // Collapsed by default: one app row with its three processes'
+            // totals and the child count; no child rows.
+            assert_eq!(test.count(), 7);
+            assert_eq!(test.text(1, 0), "chrome.exe");
+            assert_eq!(test.text(1, 2), "3.5%");
+            assert_eq!(test.text(1, 3), "175.0 MB");
+            assert_eq!((&(*p).tree_rows)[1].children, 2);
+            assert!((&(*p).tree_rows)[1].has_children && !(&(*p).tree_rows)[1].expanded);
+            // Right opens it (like a tree parent), children at depth 1.
+            test.select(1);
+            toggle_selected_branch(p, Some(true));
+            assert_eq!(test.count(), 9);
+            assert_eq!((&(*p).tree_rows)[2].depth, 1);
+            assert_eq!(test.text(2, 3), "50.0 MB", "children show their own values");
+            assert_eq!(test.identity(), Some(Identity::Process(20, 20)));
+            toggle_selected_branch(p, Some(false));
+            assert_eq!(test.count(), 7);
+            // A search opens the apps whose processes match.
+            test.search("22");
+            assert_eq!(test.count(), 3, "Apps, chrome, its matching child");
+            assert_eq!(test.text(2, 1), "22");
+        }
+    }
+    /// A flipped startup switch shows the requested state at once and
+    /// slides back when the change fails.
+    #[test]
+    fn startup_switch_is_optimistic_until_the_list_confirms() {
+        let Some(entry) = crate::startup::list()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.manageable)
+        else {
+            return;
+        };
+        let test = TestWindow::new();
+        test.page(Page::Startup);
+        let _ = test.jobs.recv().unwrap();
+        test.result(JobResult::Startup(Ok(vec![entry.clone()])));
+        unsafe {
+            let p = test.p;
+            let switch = table::part_rect((*p).list, 0, table::Part::Switch).unwrap();
+            let click = NMITEMACTIVATE {
+                iItem: 0,
+                iSubItem: 3,
+                ptAction: POINT {
+                    x: (switch.left + switch.right) / 2,
+                    y: (switch.top + switch.bottom) / 2,
+                },
+                ..zeroed()
+            };
+            interactions::startup_click(p, &click);
+            assert!(matches!(test.jobs.try_recv(), Ok(Job::Action(_))));
+            assert_eq!(
+                (*p).startup_pending,
+                Some((entry.id.clone(), !entry.enabled))
+            );
+            // The page keeps its look: ⋯ and Settings stay enabled.
+            assert_ne!(IsWindowEnabled((*p).more), 0);
+            assert_ne!(IsWindowEnabled((*p).settings), 0);
+            test.result(JobResult::Action {
+                result: Err("Access is denied.".into()),
+                page: Page::Startup,
+                notice: String::new(),
+            });
+            assert_eq!((*p).startup_pending, None, "a failure slides it back");
+            // A success waits for the reloaded list.
+            interactions::startup_click(p, &click);
+            let _ = test.jobs.try_recv();
+            test.result(JobResult::Action {
+                result: Ok(()),
+                page: Page::Startup,
+                notice: startup_notice(&entry.name, !entry.enabled),
+            });
+            assert!((*p).startup_pending.is_some());
+            let _ = test.jobs.try_recv();
+            test.result(JobResult::Startup(Ok(vec![entry.clone()])));
+            assert_eq!((*p).startup_pending, None);
+        }
+        assert!(startup_notice("Spotify", true).contains("Spotify"));
+    }
+    #[test]
+    fn startup_publisher_sort_is_case_insensitive_with_missing_last() {
+        let test = TestWindow::new();
+        test.page(Page::Startup);
+        let _ = test.jobs.recv().unwrap();
+        let Some(template) = crate::startup::list().unwrap().into_iter().next() else {
+            return;
+        };
+        let entries: Vec<StartupEntry> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| {
+                let mut entry = template.clone();
+                entry.id = (*id).into();
+                entry.name = format!("App {id}");
+                entry
+            })
+            .collect();
+        test.result(JobResult::Startup(Ok(entries)));
+        test.result(JobResult::Publishers(std::collections::HashMap::from([
+            ("a".to_string(), "wizvera".to_string()),
+            ("b".to_string(), "Now.gg".to_string()),
+            ("c".to_string(), "WIZVERA inc".to_string()),
+        ])));
+        test.sort(1);
+        let order = |test: &TestWindow| (0..4).map(|r| test.text(r, 1)).collect::<Vec<_>>();
+        assert_eq!(order(&test), ["Now.gg", "wizvera", "WIZVERA inc", "—"]);
+        test.sort(1);
+        assert_eq!(order(&test), ["WIZVERA inc", "wizvera", "Now.gg", "—"]);
+        // Startup impact is not measured: its header does not sort.
+        let before = order(&test);
+        test.sort(2);
+        assert_eq!(order(&test), before);
+        unsafe {
+            assert_eq!((*test.p).sort, 1);
+        }
+        // The search finds publishers too.
+        test.search("now.gg");
+        assert_eq!(test.count(), 1);
+    }
+    #[test]
+    fn inline_startup_switch_queues_exact_entry_only_inside_its_hitbox() {
+        let Some(entry) = crate::startup::list()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.manageable)
+        else {
+            return;
+        };
+        let test = TestWindow::new();
+        test.page(Page::Startup);
+        let _ = test.jobs.recv().unwrap();
+        test.result(JobResult::Startup(Ok(vec![entry.clone()])));
+        test.select(0);
+        unsafe {
+            // The 40 × 20 switch, right-aligned in the Enabled cell.
+            let mut cell = RECT {
+                top: 3,
+                left: LVIR_BOUNDS as i32,
+                ..zeroed()
+            };
+            SendMessageW(
+                (*test.p).list,
+                LVM_GETSUBITEMRECT,
+                0,
+                &mut cell as *mut _ as isize,
+            );
+            let switch = table::part_rect((*test.p).list, 0, table::Part::Switch)
+                .expect("a manageable entry shows a switch");
+            assert_eq!(switch.right, cell.right - scale(test.p, 12));
+            assert_eq!(switch.right - switch.left, scale(test.p, 40));
+            let mut click = NMITEMACTIVATE {
+                iItem: 0,
+                iSubItem: 3,
+                ptAction: POINT {
+                    x: switch.left - scale(test.p, 6),
+                    y: (switch.top + switch.bottom) / 2,
+                },
+                ..zeroed()
+            };
+            interactions::startup_click(test.p, &click);
+            assert!(test.jobs.try_recv().is_err(), "beside the switch");
+            click.ptAction.x = (switch.left + switch.right) / 2;
+            interactions::startup_click(test.p, &click);
+            match test.jobs.try_recv().unwrap() {
+                Job::Action(Action::Toggle(captured, enabled)) => {
+                    assert_eq!(captured.id, entry.id);
+                    assert_eq!(enabled, !entry.enabled);
+                }
+                _ => panic!("Expected exact startup switch action"),
+            }
+            interactions::startup_click(test.p, &click);
+            assert!(
+                test.jobs.try_recv().is_err(),
+                "Busy switch cannot duplicate mutation"
+            );
+        }
+    }
+    #[test]
+    fn settings_page_controls_and_rate_are_connected_without_saving_user_preferences() {
+        let test = TestWindow::new();
+        test.page(Page::Settings);
+        unsafe {
+            assert!(!(*test.p).persist_preferences);
+            assert_eq!(IsWindowEnabled((*test.p).search), 0);
+            assert_ne!(
+                GetWindowLongW(GetDlgItem((*test.p).hwnd, PREF_TRAY as i32), GWL_STYLE) as u32
+                    & WS_VISIBLE,
+                0
+            );
+            command(test.p, PREF_TRAY, 0);
+            assert!((*test.p).prefs.tray);
+            command(test.p, PREF_TOP, 0);
+            assert!((*test.p).topmost);
+            command(test.p, THEME_DARK, 0);
+            assert!(colors().dark);
+            command(test.p, THEME_LIGHT, 0);
+            assert!(!colors().dark);
+            SendMessageW(
+                GetDlgItem((*test.p).hwnd, PREF_RATE as i32),
+                CB_SETCURSEL,
+                1,
+                0,
+            );
+            command(test.p, PREF_RATE, CBN_SELCHANGE);
+            assert_eq!((*test.p).interval, 250);
+            assert_eq!(SendMessageW((*test.p).rate, CB_GETCURSEL, 0, 0), 1);
+        }
+    }
+    #[test]
+    fn missing_performance_is_a_gap_and_warmup_preserves_device_selection() {
+        let test = TestWindow::new();
+        test.page(Page::Performance);
+        unsafe {
+            let mut perf = PerfSampler::new().unwrap().sample().unwrap();
+            perf.disks = vec![crate::performance::DiskStats {
+                id: "fixture disk".into(),
+                read_bytes_per_sec: Some(10.),
+                write_bytes_per_sec: Some(20.),
+                active_percent: Some(30.),
+            }];
+            let target = PerfTarget::Disk("fixture disk".into());
+            (*test.p).perf_target = target.clone();
+            test.snapshots
+                .send(MonitorSample {
+                    at: Instant::now(),
+                    snapshot: Ok(Snapshot {
+                        processes: rows(),
+                        cpu_percent: 12.,
+                        memory_used: 100,
+                        memory_total: 400,
+                        sample_ms: 1.,
+                    }),
+                    performance: Some(Ok(perf.clone())),
+                    process_gpu: Default::default(),
+                    process_network: Default::default(),
+                })
+                .unwrap();
+            drain_snapshot(test.p);
+            assert_eq!(
+                (&(*test.p).perf_history.traces)[&target]
+                    .points
+                    .back()
+                    .unwrap()
+                    .values[0],
+                30.
+            );
+            test.sample(rows(), Instant::now() + Duration::from_millis(250));
+            assert!((&(*test.p).perf_history.traces)[&target]
+                .points
+                .back()
+                .unwrap()
+                .values[0]
+                .is_nan());
+            perf.disks.clear();
+            (*test.p).performance = Some(perf);
+            interactions::refresh_components(test.p);
+            assert_eq!((*test.p).perf_target, target);
+            assert!((*test.p).perf_targets.contains(&target));
+        }
+    }
+    /// Client-relative rectangle of a child control.
+    unsafe fn child(p: *mut App, h: HWND) -> RECT {
+        let mut r: RECT = zeroed();
+        GetWindowRect(h, &mut r);
+        MapWindowPoints(
+            null_mut(),
+            (*p).hwnd,
+            (&mut r as *mut RECT).cast::<POINT>(),
+            2,
+        );
+        r
+    }
+    fn edges(r: RECT) -> (i32, i32, i32, i32) {
+        (r.left, r.top, r.right, r.bottom)
+    }
+    unsafe fn shown(h: HWND) -> bool {
+        GetWindowLongW(h, GWL_STYLE) as u32 & WS_VISIBLE != 0
+    }
+    /// Every page against the geometry model (itself pinned to the reference
+    /// in `layout::tests`): the rail keeps only navigation, the head's actions
+    /// are right-aligned 8 px apart at their heights, the view fills the
+    /// content rect, the status bar select sits at the right padding.
+    #[test]
+    fn controls_follow_the_layout_model_on_every_page() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            fit_client((*p).hwnd, 1200, 820);
+            let mut client: RECT = zeroed();
+            GetClientRect((*p).hwnd, &mut client);
+            assert_eq!((client.right, client.bottom), (1200, 820));
+            for page in [
+                Page::Processes,
+                Page::Performance,
+                Page::Startup,
+                Page::Services,
+                Page::Settings,
+            ] {
+                test.page(page);
+                let l = current_layout(p);
+                for i in 0..4 {
+                    assert_eq!(edges(child(p, (*p).nav[i])), edges(l.nav[i]));
+                }
+                assert_eq!(edges(child(p, (*p).settings)), edges(l.nav_settings));
+                // Nothing but navigation lives in the rail any more.
+                let mut h = GetWindow((*p).hwnd, GW_CHILD);
+                while !h.is_null() {
+                    let r = child(p, h);
+                    if shown(h) && r.right <= l.rail.right && r.top >= l.rail.top {
+                        assert!(
+                            (*p).nav.contains(&h) || h == (*p).settings,
+                            "{page:?}: {} is in the rail",
+                            paint::window_text(h)
+                        );
+                    }
+                    h = GetWindow(h, GW_HWNDNEXT);
+                }
+                for hidden in [(*p).pause, (*p).refresh, (*p).run_task, (*p).top] {
+                    assert!(!shown(hidden), "{page:?}: rail command shown");
+                }
+                // Search input inside the title strip's search box.
+                let search = child(p, (*p).search);
+                assert_eq!(
+                    (search.left, search.right),
+                    (l.search_text.left, l.search_text.right)
+                );
+                assert!(search.top > l.search.top && search.bottom < l.search.bottom);
+                assert_eq!(
+                    IsWindowEnabled((*p).search) != 0,
+                    !matches!(page, Page::Performance | Page::Settings)
+                );
+                // Status bar Refresh select: 22 px at the right padding.
+                let rate = child(p, (*p).rate);
+                assert_eq!(rate.right, l.status_inner.right);
+                assert_eq!(rate.bottom - rate.top, 22);
+                assert_eq!(rate.top, 795);
+                // Page head: right-aligned, 8 px apart, 32 px buttons / 28 px
+                // selects, vertically centred in the head's content box.
+                let controls: Vec<HWND> = head_items(p)
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        HeadItem::Control(h) => Some(h),
+                        HeadItem::Note(_) => None,
+                    })
+                    .collect();
+                assert_eq!(controls.is_empty(), page == Page::Settings);
+                let mut right = l.head_inner.right;
+                for &h in controls.iter().rev() {
+                    let r = child(p, h);
+                    assert!(shown(h), "{page:?}: head action hidden");
+                    assert_eq!(r.right, right, "{page:?}: {}", paint::window_text(h));
+                    // 28 px selects; 32 px buttons, but ⋯ matches Startup's
+                    // 28 px head.
+                    let height = if is_select(p, h) || page == Page::Startup {
+                        28
+                    } else {
+                        32
+                    };
+                    assert_eq!(r.bottom - r.top, height);
+                    assert!(
+                        (r.top - l.head_inner.top - (l.head_inner.bottom - r.bottom)).abs() <= 1
+                    );
+                    right = r.left - 8;
+                }
+                if page == Page::Processes {
+                    assert_eq!(controls.last(), Some(&(*p).more));
+                    assert_eq!(child(p, (*p).more).right - child(p, (*p).more).left, 32);
+                }
+                // The view fills the content rect exactly.
+                let list_page = matches!(page, Page::Processes | Page::Startup | Page::Services);
+                assert_eq!(shown((*p).list), list_page);
+                if list_page {
+                    assert_eq!(edges(child(p, (*p).list)), edges(l.content));
+                    assert_eq!(
+                        table::header_height((*p).list),
+                        layout::table_header_height(page, 96)
+                    );
+                }
+                assert_eq!(shown((*p).perf_list), page == Page::Performance);
+                if page == Page::Performance {
+                    assert_eq!(edges(child(p, (*p).perf_list)), edges(l.perf_device_list()));
+                    assert_eq!(SendMessageW((*p).perf_list, LB_GETITEMHEIGHT, 0, 0), 58);
+                }
+                // Tab order follows the visual order.
+                let order = tab_order(p);
+                let mut next = GetWindow((*p).hwnd, GW_CHILD);
+                for &h in &order {
+                    assert_eq!(next, h, "{page:?}: tab order");
+                    next = GetWindow(h, GW_HWNDNEXT);
+                }
+            }
+            // Settings: joined rows, controls right-aligned in their rows.
+            test.page(Page::Settings);
+            let l = current_layout(p);
+            let s = l.settings();
+            for (id, group, row, inset) in [
+                (THEME_SYSTEM, 0, 0, 0),
+                (PREF_LANGUAGE, 0, 1, 0),
+                (PREF_RATE, 1, 0, 0),
+                (PREF_START, 1, 1, 0),
+                (PREF_TOP, 2, 0, 4),
+                (PREF_TRAY, 2, 1, 4),
+                (PREF_REPLACE, 2, 2, 4),
+            ] {
+                let h = GetDlgItem((*p).hwnd, id as i32);
+                let r = child(p, h);
+                let g = &s.groups[group];
+                assert!(shown(h));
+                assert_eq!(r.right, g.row_content(row, 96).right + inset, "{id}");
+                let (row_top, row_bottom) = (g.rows[row].top, g.rows[row].bottom);
+                assert!(
+                    (r.top - row_top - (row_bottom - r.bottom)).abs() <= 1,
+                    "{id}"
+                );
+            }
+            let light = child(p, GetDlgItem((*p).hwnd, THEME_LIGHT as i32));
+            let dark = child(p, GetDlgItem((*p).hwnd, THEME_DARK as i32));
+            let system = child(p, GetDlgItem((*p).hwnd, THEME_SYSTEM as i32));
+            assert_eq!((light.right, dark.right), (dark.left, system.left));
+        }
+    }
+    /// Choosing a view in the page head's select re-lays the head: Expand all
+    /// appears 8 px after the select in tree mode (no hole) and disappears
+    /// again (no stale button under the select) for the flat/grouped views,
+    /// also after a relayout while in tree mode.
+    #[test]
+    fn view_mode_select_shows_expand_all_only_in_tree_mode() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            fit_client((*p).hwnd, 1200, 820);
+            test.page(Page::Processes);
+            let choose = |mode: usize| {
+                SendMessageW((*p).view_mode, CB_SETCURSEL, mode, 0);
+                SendMessageW(
+                    (*p).hwnd,
+                    WM_COMMAND,
+                    VIEW_MODE | (CBN_SELCHANGE as usize) << 16,
+                    (*p).view_mode as isize,
+                );
+            };
+            let intersects = |a: RECT, b: RECT| {
+                a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+            };
+            choose(1);
+            assert!((*p).tree_mode);
+            assert!(shown((*p).expand_all), "Expand all must show in tree mode");
+            let (view, expand, nuclear) = (
+                child(p, (*p).view_mode),
+                child(p, (*p).expand_all),
+                child(p, (*p).nuclear),
+            );
+            assert_eq!(view.right + 8, expand.left, "no gap before Expand all");
+            assert_eq!(expand.right + 8, nuclear.left);
+            assert!(tab_order(p).contains(&(*p).expand_all));
+            // A relayout in tree mode (resize, page return), then flat again.
+            layout(p);
+            for mode in [0, 2] {
+                choose(mode);
+                assert!(!(*p).tree_mode);
+                assert!(!shown((*p).expand_all), "mode {mode}: stale Expand all");
+                let view = child(p, (*p).view_mode);
+                assert_eq!(view.right + 8, child(p, (*p).nuclear).left);
+                assert!(!intersects(view, child(p, (*p).expand_all)) || !shown((*p).expand_all));
+                assert!(!tab_order(p).contains(&(*p).expand_all));
+                choose(1);
+                assert!(shown((*p).expand_all));
+            }
+        }
+    }
+    /// The nav "current" indicator slides and stretches from the old item to
+    /// the new one (180 ms, frame timer only while moving), is painted across
+    /// the rail gaps and the nav buttons from the same edges, and jumps on a
+    /// relayout when idle.
+    #[test]
+    fn nav_indicator_slides_between_items_across_the_rail() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            fit_client((*p).hwnd, 1200, 820);
+            (*p).anim.anim = anim::Animator::new().with_reduced_motion(false);
+            layout(p);
+            let top_key = (anim::NAV_ID, anim::part::NAV_TOP);
+            let bottom_key = (anim::NAV_ID, anim::part::NAV_BOTTOM);
+            let l = current_layout(p);
+            let edges_of = |r: RECT| ((r.top + 12) as f32, (r.bottom - 12) as f32);
+            let value = move |key| (*p).anim.value(key);
+            assert_eq!((value(top_key), value(bottom_key)), edges_of(l.nav[0]));
+            assert!(!(*p).anim.is_running(), "a relayout jumps");
+            test.page(Page::Services);
+            assert!((*p).anim.is_running(), "the slide runs on the frame timer");
+            // Replay the slide on a known clock (the page switch took time).
+            test.page(Page::Processes);
+            (*p).anim.finish_all();
+            let t0 = Instant::now();
+            (*p).page = Page::Services;
+            place_nav_indicator_at(p, &l, true, t0);
+            (*p).anim.tick_at(t0 + Duration::from_millis(60));
+            let (top, bottom) = (value(top_key), value(bottom_key));
+            let (target_top, target_bottom) = edges_of(l.nav[3]);
+            assert!(top > edges_of(l.nav[0]).0 && top < target_top, "{top}");
+            assert!(
+                bottom > top + 16.0,
+                "stretches while moving: {top}..{bottom}"
+            );
+            // Mid-slide paint: the bar shows in the rail gap between items 1
+            // and 2 (parent paint) and inside item 2 (its owner draw) at the
+            // same edges.
+            (*p).anim.tick_at(t0 + Duration::from_millis(40));
+            let (top, bottom) = (value(top_key), value(bottom_key));
+            let mut frame = gfx::Dib::new(1200, 820).unwrap();
+            capture::paint_client_and_children((*p).hwnd, frame.dc()).unwrap();
+            let c = colors();
+            let rgb = |pixel: u32| {
+                let (r, g, b) = (pixel >> 16 & 0xff, pixel >> 8 & 0xff, pixel & 0xff);
+                r | g << 8 | b << 16
+            };
+            let x = l.nav[0].left + 1;
+            let gap = l.nav[1].bottom;
+            assert!((top as i32) < gap && (bottom as i32) > gap + 2);
+            assert_eq!(rgb(frame.pixel(x, gap)), c.fg, "indicator in the rail gap");
+            let inside = (top as i32 + 2).max(l.nav[1].top + 2);
+            assert_eq!(
+                rgb(frame.pixel(x, inside)),
+                c.fg,
+                "indicator over a nav item"
+            );
+            assert_ne!(rgb(frame.pixel(x, bottom as i32 + 3)), c.fg);
+            // Settles on the new item and stops the timer.
+            (*p).anim.tick_at(t0 + Duration::from_secs(1));
+            assert_eq!(
+                (value(top_key), value(bottom_key)),
+                (target_top, target_bottom)
+            );
+            assert!(!(*p).anim.is_running());
+            assert_eq!(
+                (*p).anim.value((NAV + 3, anim::part::SELECTED)),
+                1.0,
+                "the new item's background faded in"
+            );
+            // Settings sits at the bottom of the rail.
+            test.page(Page::Settings);
+            (*p).anim.tick_at(Instant::now() + Duration::from_secs(1));
+            assert_eq!(
+                (value(top_key), value(bottom_key)),
+                edges_of(current_layout(p).nav_settings)
+            );
+            // A resize while idle jumps to the new geometry.
+            fit_client((*p).hwnd, 1100, 700);
+            assert!(!(*p).anim.is_running());
+            assert_eq!(
+                (value(top_key), value(bottom_key)),
+                edges_of(current_layout(p).nav_settings)
+            );
+        }
+    }
+    /// The device-card painter is usable by any list: hover fades fg_soft in,
+    /// selection shows fg_sel, the 2 px gap below the card stays surface.
+    #[test]
+    fn device_cards_paint_hover_and_selection_from_any_list() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            let mut dib = gfx::Dib::new(260, 58).unwrap();
+            let c = colors();
+            let rgb = |pixel: u32| {
+                let (r, g, b) = (pixel >> 16 & 0xff, pixel >> 8 & 0xff, pixel & 0xff);
+                r | g << 8 | b << 16
+            };
+            let item = RECT {
+                left: 0,
+                top: 0,
+                right: 260,
+                bottom: 58,
+            };
+            for (hover, selected, face) in [
+                (0.0, false, c.surface),
+                (1.0, false, c.fg_soft),
+                (0.0, true, c.fg_sel),
+                (1.0, true, c.fg_sel),
+            ] {
+                paint::device_card(p, dib.dc(), item, 1, hover, selected);
+                assert_eq!(
+                    rgb(dib.pixel(4, 28)),
+                    face,
+                    "hover {hover} selected {selected}"
+                );
+                assert_eq!(rgb(dib.pixel(4, 57)), c.surface, "gap below the card");
+            }
+            // Out-of-range indices paint nothing (no panic).
+            paint::device_card(p, dib.dc(), item, 99, 1.0, true);
+        }
+    }
+    /// The telemetry drawer and the service details panel are placed and
+    /// painted from `Layout::{drawer, details}`: the list ends where the
+    /// drawer's top border starts, the main panel's left border stays visible
+    /// along the drawer, and Show / hide leaves no floating drawer button.
+    #[test]
+    fn drawer_and_details_follow_the_layout_model() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        test.select(0);
+        unsafe {
+            let p = test.p;
+            fit_client((*p).hwnd, 1200, 820);
+            (*p).show_telemetry = true;
+            layout(p);
+            let l = current_layout(p);
+            let (table, drawer) = l.drawer(true);
+            let drawer = drawer.unwrap();
+            assert_eq!(edges(child(p, (*p).list)), edges(table));
+            let end_tree = child(p, (*p).end_tree);
+            assert!(shown((*p).end_tree));
+            assert!(end_tree.top > drawer.top && end_tree.bottom < drawer.bottom);
+            let mut frame = gfx::Dib::new(1200, 820).unwrap();
+            paint::paint_to(p, frame.dc());
+            let c = colors();
+            let rgb = |pixel: u32| {
+                let (r, g, b) = (pixel >> 16 & 0xff, pixel >> 8 & 0xff, pixel & 0xff);
+                r | g << 8 | b << 16
+            };
+            assert_eq!(rgb(frame.pixel(l.main.left, drawer.top + 60)), c.border);
+            assert_eq!(rgb(frame.pixel(drawer.left + 4, drawer.top)), c.border);
+            assert_eq!(rgb(frame.pixel(drawer.left + 4, drawer.top + 1)), c.surface);
+            (*p).show_telemetry = false;
+            layout(p);
+            assert!(!shown((*p).end_tree));
+            assert_eq!(edges(child(p, (*p).list)), edges(l.content));
+            test.page(Page::Services);
+            (*p).show_details = true;
+            layout(p);
+            let l = current_layout(p);
+            let (table, panel) = l.details(true);
+            assert_eq!(edges(child(p, (*p).list)), edges(table));
+            paint::paint_to(p, frame.dc());
+            let panel = panel.unwrap();
+            assert_eq!(rgb(frame.pixel(panel.left, panel.top + 40)), c.border);
+            assert_eq!(rgb(frame.pixel(panel.left + 2, panel.bottom - 4)), c.bg);
+        }
+    }
+    /// Commands that left the rail stay reachable: Always on top is a plain
+    /// toggle again on every page (it used to double as the rail's "More
+    /// actions" button), and each page's ⋯ menu carries its commands.
+    #[test]
+    fn rail_commands_stay_reachable_from_menus_and_shortcuts() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        test.select(0);
+        unsafe {
+            let p = test.p;
+            let before = (*p).topmost;
+            command(p, TOP, 0);
+            assert_eq!((*p).topmost, !before, "TOP must not open a menu");
+            command(p, TOP, 0);
+            assert_eq!((*p).topmost, before);
+            let has =
+                |menu: HMENU, id: usize| GetMenuState(menu, id as u32, MF_BYCOMMAND) != u32::MAX;
+            let menu = interactions::build_extra_menu(p, true, None);
+            for id in [
+                PRIMARY,
+                END_TREE,
+                SECONDARY,
+                EXTRA,
+                ELEVATE,
+                EXPAND_ALL,
+                RUN_TASK,
+                RESOURCE_MONITOR,
+                REFRESH,
+                510,
+                511,
+                512,
+            ] {
+                assert!(has(menu, id), "processes menu lacks {id}");
+            }
+            DestroyMenu(menu);
+            test.page(Page::Services);
+            let running = service("Alpha", SERVICE_RUNNING, 120, Some(2));
+            let menu = interactions::build_extra_menu(p, false, Some(&running));
+            for id in [PRIMARY, SECONDARY, EXTRA, 513, 514, REFRESH] {
+                assert!(has(menu, id), "services menu lacks {id}");
+            }
+            assert_eq!(
+                GetMenuState(menu, EXTRA as u32, MF_BYCOMMAND) & MF_GRAYED,
+                0
+            );
+            DestroyMenu(menu);
+            test.page(Page::Startup);
+            let menu = interactions::build_extra_menu(p, false, None);
+            for id in [PRIMARY, 515, REFRESH] {
+                assert!(has(menu, id), "startup menu lacks {id}");
+            }
+            // Loading lists grey out Refresh.
+            assert_ne!(
+                GetMenuState(menu, REFRESH as u32, MF_BYCOMMAND) & MF_GRAYED,
+                0
+            );
+            DestroyMenu(menu);
+            assert!(shown((*p).more));
+            test.page(Page::Performance);
+            assert!(!shown((*p).more));
+            for h in [(*p).cores, (*p).copy, (*p).resource_monitor] {
+                assert!(shown(h));
+            }
+        }
+    }
+    /// Nuclear Zombie took Efficiency mode's place in the Processes head
+    /// (Efficiency mode stays in the ⋯ / context menus). Its panel is a
+    /// modal loop: Tab / Space toggle an option and Esc closes without
+    /// running anything; Enter queues a run on the job worker (here the
+    /// test's queue: nothing is trimmed or purged) as a busy action, and a
+    /// run whose panel was closed still ends that action when it reports.
+    #[test]
+    fn nuclear_zombie_replaces_efficiency_mode_and_runs_on_the_worker() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            fit_client((*p).hwnd, 1200, 820);
+            test.page(Page::Processes);
+            assert!(shown((*p).nuclear));
+            assert!(!shown((*p).extra), "Efficiency mode left the head");
+            assert!(head_items(p).contains(&HeadItem::Control((*p).nuclear)));
+            assert!(tab_order(p).contains(&(*p).nuclear));
+            let menu = interactions::build_extra_menu(p, true, None);
+            assert_ne!(
+                GetMenuState(menu, EXTRA as u32, MF_BYCOMMAND),
+                u32::MAX,
+                "Toggle efficiency mode stays in the menu"
+            );
+            DestroyMenu(menu);
+            test.page(Page::Services);
+            assert!(!shown((*p).nuclear));
+            assert!(shown((*p).extra), "Services keeps Restart");
+            test.page(Page::Processes);
+            let keys = |keys: &[u16]| {
+                for &vk in keys {
+                    PostMessageW((*p).hwnd, WM_KEYDOWN, vk as usize, 0);
+                }
+            };
+            // Page switches queued list jobs; only cleanup jobs matter here.
+            while test.jobs.try_recv().is_ok() {}
+            keys(&[VK_TAB, VK_SPACE, VK_ESCAPE]);
+            command(p, NUCLEAR, 0);
+            assert!(!(*p).modal && !(*p).busy);
+            assert!(
+                !test
+                    .jobs
+                    .try_iter()
+                    .any(|job| matches!(job, Job::Cleanup(..))),
+                "closing runs nothing"
+            );
+            keys(&[VK_RETURN, VK_ESCAPE]);
+            command(p, NUCLEAR, 0);
+            let Some(Job::Cleanup(options, events)) = test
+                .jobs
+                .try_iter()
+                .find(|job| matches!(job, Job::Cleanup(..)))
+            else {
+                panic!("Enter queues a cleanup job");
+            };
+            assert_eq!(
+                options,
+                crate::memclean::CleanupOptions {
+                    trim: true,
+                    standby: true,
+                    modified: false,
+                    zombies: true
+                }
+            );
+            assert!((*p).busy && !(*p).modal, "the run is an action");
+            assert!(IsWindowEnabled((*p).nuclear) == 0);
+            events
+                .send(nuclear::CleanupEvent::Done(Box::new(
+                    crate::memclean::CleanupReport {
+                        before: Err("test".into()),
+                        after: Err("test".into()),
+                        trim: None,
+                        modified: None,
+                        standby: None,
+                        zombies: None,
+                        elevated: false,
+                    },
+                )))
+                .unwrap();
+            SendMessageW((*p).hwnd, nuclear::CLEANUP_READY, 0, 0);
+            assert!(!(*p).busy, "the late report ends the action");
+            assert!(IsWindowEnabled((*p).nuclear) != 0);
+            // With the panel open, progress and the report arrive through
+            // its loop: the results are laid out in the same panel, then Esc
+            // closes it (a timer plays the worker inside the loop).
+            while test.jobs.try_recv().is_ok() {}
+            NUCLEAR_JOBS.with(|slot| {
+                *slot.borrow_mut() = Some(std::ptr::addr_of!(test.jobs) as usize);
+            });
+            keys(&[VK_RETURN]);
+            SetTimer((*p).hwnd, 0x5152, 30, Some(feed_nuclear_report));
+            command(p, NUCLEAR, 0);
+            NUCLEAR_JOBS.with(|slot| slot.borrow_mut().take());
+            assert!(
+                !(*p).modal && !(*p).busy,
+                "the report ended the run in the panel"
+            );
+            popup::finish_closing();
+        }
+    }
+    thread_local! {
+        /// The test window's job queue for [`feed_nuclear_report`].
+        static NUCLEAR_JOBS: std::cell::RefCell<Option<usize>> = const { std::cell::RefCell::new(None) };
+    }
+    /// Inside the panel's loop: take its cleanup job, report progress and a
+    /// finished run (real memory readings, one holder), then press Esc.
+    unsafe extern "system" fn feed_nuclear_report(hwnd: HWND, _: u32, id: usize, _: u32) {
+        KillTimer(hwnd, id);
+        let Some(jobs) = NUCLEAR_JOBS.with(|slot| *slot.borrow()) else {
+            return;
+        };
+        let jobs = &*(jobs as *const Receiver<Job>);
+        let Some(Job::Cleanup(_, events)) =
+            jobs.try_iter().find(|job| matches!(job, Job::Cleanup(..)))
+        else {
+            panic!("the panel queued no cleanup job");
+        };
+        let memory = crate::memclean::memory_state();
+        let report = crate::memclean::CleanupReport {
+            before: memory.clone(),
+            after: memory,
+            trim: Some(Ok(crate::memclean::TrimReport {
+                trimmed: 3,
+                skipped: 1,
+                failed: 0,
+            })),
+            modified: None,
+            standby: Some(Err(crate::memclean::PurgeError::Declined)),
+            zombies: Some(Ok(crate::memclean::ZombieScan {
+                holders: vec![crate::memclean::ZombieHolder {
+                    pid: 4242,
+                    created: 1,
+                    name: "holder.exe".into(),
+                    zombies: 2,
+                    examples: vec![("child.exe".into(), 2)],
+                }],
+                total: 2,
+                inspected: 10,
+                uninspected: 1,
+                uninspected_handles: 0,
+            })),
+            elevated: false,
+        };
+        let progress = crate::memclean::Progress::Scanning;
+        events
+            .send(nuclear::CleanupEvent::Progress(progress))
+            .unwrap();
+        events
+            .send(nuclear::CleanupEvent::Done(Box::new(report)))
+            .unwrap();
+        PostMessageW(hwnd, nuclear::CLEANUP_READY, 0, 0);
+        PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE as usize, 0);
+    }
+    #[test]
+    fn wm_paint_composes_on_the_cached_back_buffer_and_timers_stay_idle() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            let mut client: RECT = zeroed();
+            GetClientRect((*p).hwnd, &mut client);
+            RedrawWindow(
+                (*p).hwnd,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
+            // Drive one WM_PAINT explicitly as well (hidden windows may skip it).
+            SendMessageW((*p).hwnd, WM_PAINT, 0, 0);
+            assert_eq!((*p).back.size(), Some((client.right, client.bottom)));
+            let first = (*p).back.dc();
+            SendMessageW((*p).hwnd, WM_PAINT, 0, 0);
+            assert_eq!((*p).back.dc(), first, "the frame must be reused per size");
+            // Hovering a button starts the frame timer; it stops once settled.
+            SendMessageW((*p).primary, WM_MOUSEMOVE, 0, 0);
+            assert!((*p).anim.is_running() || anim::reduced_motion());
+            SendMessageW((*p).primary, WM_MOUSELEAVE, 0, 0);
+            (*p).anim.tick_at(Instant::now() + Duration::from_secs(1));
+            assert!(!(*p).anim.is_running());
+            assert_eq!((*p).anim.value((PRIMARY, anim::part::HOVER)), 0.0);
+            assert_eq!(KillTimer((*p).hwnd, anim::ANIM_TIMER_ID), 0);
+        }
+    }
+
+    /// GetGuiResources counts the whole process and the other tests create
+    /// windows, fonts and bitmaps concurrently, so the measurement runs alone
+    /// in a child test process (same binary, this test only, one thread).
+    #[test]
+    fn repainting_does_not_leak_gdi_or_user_objects() {
+        const CHILD: &str = "FEATHER_GDI_LEAK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::tests::repainting_does_not_leak_gdi_or_user_objects",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(stdout.contains("gdi-leak-check: ok"), "{stdout}\n{stderr}");
+            return;
+        }
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS, GR_USEROBJECTS,
+        };
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            let mut client: RECT = zeroed();
+            GetClientRect((*p).hwnd, &mut client);
+            let mut frame = gfx::Dib::new(client.right, client.bottom).unwrap();
+            // Every painter path: back-buffered root paint, buffered owner-draw
+            // buttons/items, list custom draw, header, select faces.
+            let repaint = |frame: &mut gfx::Dib| {
+                let mut back = std::mem::take(&mut (*p).back);
+                if let Some((dc, _)) = back.prepare(client.right, client.bottom) {
+                    paint::paint_to(p, dc);
+                }
+                (*p).back = back;
+                capture::paint_client_and_children((*p).hwnd, frame.dc()).unwrap();
+            };
+            let pages = [
+                Page::Processes,
+                Page::Performance,
+                Page::Startup,
+                Page::Services,
+                Page::Settings,
+            ];
+            for page in pages {
+                test.page(page);
+                repaint(&mut frame);
+            }
+            set_tree_mode(p, true);
+            repaint(&mut frame);
+            set_tree_mode(p, false);
+            test.page(Page::Processes);
+            repaint(&mut frame);
+            // The paths that rebuild GDI resources: theme brushes and DWM
+            // frame, the DPI font set / image list / back buffer, the
+            // language (labels, fonts, columns; in memory only, never the
+            // registry) and the palette window.
+            let recreate = |cycle: usize| {
+                let even = cycle.is_multiple_of(2);
+                (*p).prefs.theme = if even { 2 } else { 1 };
+                interactions::apply_theme(p);
+                let dpi = if even { 144 } else { 96 };
+                let r = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1200 * dpi / 96,
+                    bottom: 820 * dpi / 96,
+                };
+                SendMessageW(
+                    (*p).hwnd,
+                    WM_DPICHANGED,
+                    (dpi | dpi << 16) as usize,
+                    &r as *const _ as isize,
+                );
+                let language = if even {
+                    Language::English
+                } else {
+                    Language::Korean
+                };
+                crate::i18n::with_language(language, || refresh_language(p));
+                shell::create_palette(p, false);
+                assert!(!(*p).palette.is_null());
+                shell::destroy_palette(p);
+            };
+            // Warm the per-size caches (Hangul fallback faces) once per combination.
+            for cycle in 0..2 {
+                recreate(cycle);
+                for page in pages {
+                    test.page(page);
+                    repaint(&mut frame);
+                }
+            }
+            test.page(Page::Processes);
+            repaint(&mut frame);
+            let process = GetCurrentProcess();
+            let gdi = GetGuiResources(process, GR_GDIOBJECTS);
+            let user = GetGuiResources(process, GR_USEROBJECTS);
+            let gdiplus = gfx::live_objects();
+            for i in 0..200 {
+                if i % 40 == 20 {
+                    test.page(pages[(i / 40) % pages.len()]);
+                }
+                if i % 50 == 49 {
+                    test.page(Page::Processes);
+                }
+                if i % 25 == 10 {
+                    recreate(i / 25);
+                }
+                // Hover fades and switch slides exercise the animation driver.
+                (*p).anim.set_target(
+                    (PRIMARY, anim::part::HOVER),
+                    (i % 2) as f32,
+                    anim::motion::HOVER_IN,
+                    anim::Easing::EaseOut,
+                );
+                (*p).anim
+                    .tick_at(Instant::now() + Duration::from_millis(500));
+                // The custom table: wheel glides, row / header hover, the
+                // overlay scrollbar and its fades on the table's own driver.
+                let list = (*p).list;
+                let delta = if i % 3 == 2 { 120i32 } else { -120 };
+                SendMessageW(list, WM_MOUSEWHEEL, (delta as u16 as usize) << 16, 0);
+                let (x, y) = (40 + (i as isize * 7) % 900, 20 + (i as isize * 13) % 600);
+                SendMessageW(list, WM_MOUSEMOVE, 0, y << 16 | x);
+                if i % 10 == 5 {
+                    SendMessageW(list, WM_KEYDOWN, VK_NEXT as usize, 0);
+                }
+                if i % 2 == 0 {
+                    table::settle(list);
+                }
+                repaint(&mut frame);
+            }
+            test.page(Page::Processes);
+            repaint(&mut frame);
+            // The page switch starts the nav slide; once it settles the
+            // window must be idle again.
+            (*p).anim.tick_at(Instant::now() + Duration::from_secs(1));
+            SendMessageW((*p).list, WM_MOUSELEAVE, 0, 0);
+            table::settle((*p).list);
+            repaint(&mut frame);
+            (*p).anim.tick_at(Instant::now() + Duration::from_secs(2));
+            let gdi_after = GetGuiResources(process, GR_GDIOBJECTS);
+            let user_after = GetGuiResources(process, GR_USEROBJECTS);
+            assert!(
+                gdi_after <= gdi + 2,
+                "GDI objects grew from {gdi} to {gdi_after} over 200 repaints"
+            );
+            assert!(
+                user_after <= user + 2,
+                "USER objects grew from {user} to {user_after} over 200 repaints"
+            );
+            assert_eq!(gfx::live_objects(), gdiplus, "GDI+ objects leaked");
+            assert!(
+                !(*p).anim.is_running(),
+                "an idle window must not keep a timer"
+            );
+            assert!(
+                !table::is_animating((*p).list),
+                "an idle table must not keep a timer"
+            );
+            println!(
+                "gdi-leak-check: ok gdi {gdi}->{gdi_after} user {user}->{user_after} gdiplus {gdiplus}"
+            );
         }
     }
 }

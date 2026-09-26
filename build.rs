@@ -101,6 +101,14 @@ fn main() {
     // to the portable executable (including when the user approves elevation).
     // https://learn.microsoft.com/cpp/build/reference/dependentloadflag
     println!("cargo:rustc-link-arg=/DEPENDENTLOADFLAG:0x800");
+    // That flag does not cover what a system DLL loads by name while the DLL
+    // initializers run, before main can call SetDefaultDllDirectories:
+    // powrprof.dll's initialization loads its delay import umpdc.dll with
+    // the standard search order, i.e. from the executable's folder first.
+    // Load powrprof.dll (only CallNtPowerInformation) on first use instead,
+    // after main has restricted every DLL search to System32 (FTM-2026-05).
+    println!("cargo:rustc-link-arg=/DELAYLOAD:powrprof.dll");
+    println!("cargo:rustc-link-arg=delayimp.lib");
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
 }

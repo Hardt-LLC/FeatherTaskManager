@@ -41,6 +41,14 @@ pub struct Process {
     pub private_bytes: u64,
     /// All read, write and other I/O transfer bytes per second (not disk only).
     pub io_bytes_per_sec: f64,
+    /// Utilization of the process's busiest GPU engine in percent (0-100),
+    /// joined in by the UI monitor from `performance::ProcessGpuTracker`;
+    /// `None` when not measured for this interval. The sampler never sets it.
+    pub gpu_percent: Option<f64>,
+    /// Network send + receive bytes per second, joined in by the UI monitor
+    /// from `netetw::NetworkMonitor` (elevated only); `None` when not
+    /// measured. The sampler never sets it.
+    pub network_bytes_per_sec: Option<f64>,
     pub threads: u32,
     pub handles: u32,
 }
@@ -348,6 +356,8 @@ fn parse_processes(bytes: &[u8], previous_count: usize) -> Result<Vec<ProcessSam
                 working_set: u64_at(144),
                 private_bytes: u64_at(200),
                 io_bytes_per_sec: 0.0,
+                gpu_percent: None,
+                network_bytes_per_sec: None,
                 threads: u32_at(4),
                 handles: u32_at(96),
             },

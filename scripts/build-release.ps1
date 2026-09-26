@@ -19,7 +19,7 @@ $portableName = "FeatherTaskManager-$($version.Version)-Portable-x64.exe"
 $setupName = "FeatherTaskManager-$($version.Version)-Setup-x64.exe"
 $zipName = "FeatherTaskManager-$($version.Version)-Portable-x64.zip"
 Copy-Item -LiteralPath $binary -Destination (Join-Path $dist $portableName) -Force
-$archiveNames = @('FeatherTaskManager.exe', 'Restore-WindowsTaskManager.ps1', 'README.md', 'README.en.md', 'INSTALLER.md', 'SECURITY.md', 'FEATURES-v2.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html')
+$archiveNames = @('FeatherTaskManager.exe', 'Restore-WindowsTaskManager.ps1', 'README.md', 'README.ko.md', 'INSTALLER.md', 'SECURITY.md', 'FEATURES-v2.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html')
 Compress-Archive -LiteralPath ($archiveNames | ForEach-Object { Join-Path $dist $_ }) -DestinationPath (Join-Path $dist $zipName) -Force
 $assets = @($portableName, $setupName, $zipName)
 $entries = foreach ($name in $assets) {

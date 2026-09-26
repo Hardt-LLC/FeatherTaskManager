@@ -1,34 +1,31 @@
-# Feather Task Manager 2026.9.2 검증 기록
+# Feather Task Manager 2026.9.3 검증 기록
 
-2026-09-26, Windows 11 x64에서 보안 수정의 회귀 검사를 수행했습니다. 발견 내용·재현 조건·수정 및 남은 운영 설정은 [SECURITY.md](SECURITY.md)에 정리했습니다.
+2026-09-27, Windows 11 x64(빌드 26200)에서 새 디자인, 하드웨어 정보, Nuclear Zombie와 보안 수정의 회귀 검사를 수행했습니다. 보안 검토 결과와 수정 내용은 [SECURITY.md](SECURITY.md)에 정리했습니다.
 
 ## 자동 검사
 
-- `cargo test --offline --locked`: **74개 통과, 2개 제외, 실패 없음**.
-- `cargo fmt --all -- --check`, `cargo clippy --offline --locked --all-targets -- -D warnings`, `cargo build --release --offline --locked`: 통과.
-- 레지스트리: 말단·중간·미완성 링크, 생성 직전 링크 삽입, 원래 대상 보존, 정상 언어 저장·시작 앱 상태 변경, Win32와 네이티브 경로의 HKCU/HKLM 보기 일치를 검사했습니다.
-- 작업 관리자 연결: 없는 설치·사용자 쓰기 가능 설치를 거부하고 파일·키를 새로 만들지 않는지 확인했습니다. 정확히 소유한 연결의 복원과 외부 값 보존을 검사했습니다.
-- 기존 PID 재사용 방어, 프로세스 트리, 필수·자기 프로세스 보호, 직접 만든 부모·자식 종료, 서비스·성능 버퍼, 한영 UI·DPI 검사도 통과했습니다. 실제 사용자 프로세스나 서비스를 종료하지 않았습니다.
+- `cargo test --locked`: **290개 통과, 3개 제외, 실패 없음**.
+- `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --release --locked`: 통과.
+- UI: 제목 표시줄 적중 판정·최대화·DPI 크기, 커스텀 표의 스크롤·키보드·선택 유지·트리/앱 그룹, 선택 상자·메뉴·확인 창의 키보드와 포커스 복원, 애니메이션 타이머가 멈춘 상태에서 남지 않는지, 반복 그리기·테마·DPI·언어 전환의 GDI/USER 개체 누수(자식 프로세스에서 격리 실행)를 검사합니다.
+- 하드웨어·메모리: SMBIOS·스토리지·D3DKMT 파서의 경계 검사, 프로세스별 GPU의 PID 재사용 방지, ETW 네트워크 이벤트 파싱·손실 감지·제공자 확인, 핸들 표 파싱, 권한 복원, 도우미 인수 형식, 진단 출력의 링크 거부(정션·하드 링크·심볼릭 링크)를 검사합니다.
+- 배포 스크립트: 로컬 소스·태그 검사와 원격 태그 검사가 각각 정상 2개를 허용하고 잘못된 상태 6개를 거부했습니다.
 
-제외된 2개는 부모 테스트가 별도로 실행하는 자식 진입점과 실환경 성능 공급자 검사입니다. 성능 공급자는 최종 배포 앱의 `--self-test`로 확인합니다. 관리자 설치 통합 검사를 통과했다는 의미는 아닙니다.
+제외된 3개는 부모 테스트가 따로 실행하는 자식 진입점, 실환경 성능 공급자 검사, 실제 ETW 세션 수명 검사입니다. 성능 공급자는 최종 배포 앱의 `--self-test`로 확인합니다.
 
 ## 배포 검사
 
-- 로컬 소스·태그 검사: 정상 2개 허용, 잘못된 상태 6개 거부.
-- 원격 태그 검사: 정상 2개 허용, 잘못된 상태 6개 거부. 테스트는 GitHub 응답 모형을 사용했고, 실제 기존 원격 주석 태그도 읽기 전용으로 확인했습니다.
-- PowerShell 스크립트 구문 및 Actionlint 1.7.12의 GitHub Actions 검사: 통과.
-- PE 로더 정책: 정적 DLL 검색 `0x0800`, ASLR·DEP·고엔트로피 VA 확인. 이전 배포 파일과 14개 정책·구조 변형 파일은 거부했습니다.
+- 앱·설치·제거 프로그램은 Azure Artifact Signing으로 서명했고, 배포 EXE 2개 모두 `Valid`, 게시자 `CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US`, 타임스탬프와 버전 `2026.9.3.0`을 확인했습니다. 서명·해시는 [signatures-2026.9.3.json](measurements/signatures-2026.9.3.json), 배포의 `SHA256SUMS.txt`와 `release-manifest.json`에 있습니다.
+- PE 로더 정책: 정적 DLL 검색 `0x0800`, ASLR·DEP·고엔트로피 VA를 확인했습니다. 정적 가져오기 22개는 모두 System32 또는 WinSxS에 있습니다.
+- 실행 중 DLL 검색(FTM-2026-05): 코드가 없는 올바른 DLL(`opengl32.dll`, `umpdc.dll`, `wmiclnt.dll`)을 EXE 사본 옆에 두었을 때 이전 빌드는 `umpdc.dll`을 EXE 폴더에서 불러왔고, 수정한 빌드는 `--self-test`, `--dump-hardware`, `--memory-cleanup-dry-run`, `--test-child`에서 EXE 폴더의 DLL을 하나도 불러오지 않았습니다.
+- 공개 전 검사: Git 이력 전체와 커밋할 파일에서 비밀정보·개인 경로·기기 식별자를 찾지 못했습니다. README 미리보기는 [디자인 프로토타입](design/reference/feather-task-manager.html)의 시뮬레이션 데이터로 렌더링했고 이미지 메타데이터가 없습니다.
 
-최종 서명·해시는 배포의 `release-manifest.json`, `SHA256SUMS.txt`와 `measurements/signatures-2026.9.2.json`에 기록합니다. 앱·설치·제거 프로그램은 동일한 Azure Artifact Signing 콜백으로 서명하고 Windows Authenticode 게시자·타임스탬프를 검사합니다.
-
-최종 빌드·서명·설치 파일 컴파일이 성공했고, 배포 EXE 2개 모두 `Valid`, 게시자 `CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US`, 타임스탬프 존재 및 버전 `2026.9.2.0`을 확인했습니다. 포터블 ZIP의 10개 파일은 허용 목록과 일치하며 내장 EXE는 별도 배포 EXE와 바이트 단위로 동일합니다. 수정 완료 후 소스의 Gitleaks 검사도 탐지 0건입니다.
-
-서명된 최종 포터블 앱의 [자체 검사](measurements/self-test-2026.9.2.txt)는 `PASS`입니다. 프로세스 554개·서비스 337개·시작 앱 17개를 조회했고 CPU·디스크·네트워크·GPU 공급자는 경고 없이 응답했습니다. 최초 프로세스 수집 9.435ms, 반복 수집 중앙값 6.401ms이며 앱 전체 시작 시간을 뜻하지 않습니다.
+서명된 최종 포터블 앱의 [자체 검사](measurements/self-test-2026.9.3.txt)는 `PASS`입니다. 프로세스 554개·서비스 337개·시작 앱 34개를 조회했고, GPU 모델·온도, SMBIOS 메모리, 디스크 모델, 프로세스별 GPU를 읽었습니다. 프로세스별 네트워크는 일반 권한에서 `Requires administrator`로 정직하게 측정 불가를 보고했습니다. 최초 프로세스 수집 5.274ms, 반복 수집 중앙값 8.087ms이며 앱 전체 시작 시간을 뜻하지 않습니다.
 
 ## 실제 환경과 한계
 
-실제 관리자 설치·업데이트·제거, UAC 전체 흐름, Ctrl+Alt+Delete 보안 화면 실행은 자동 검증하지 않았습니다. Windows 10 1607 및 다른 물리 환경에서도 별도 확인이 필요합니다. 테스트 변경은 전용 임시 HKCU 키·파일·직접 만든 프로세스로 한정했습니다.
-
-이전 한영 화면 미리보기는 로컬 `dist/previews-final-ko`, `dist/previews-final-en`에 있으며 Git/Release에는 사용자 프로세스 캡처를 올리지 않습니다. 이번 UI 변경은 설치 선행 조건 안내 문구입니다.
+- 관리자 권한 경로는 이 검증 환경에서 권한을 올릴 수 없어 실제로 실행하지 않았습니다: 프로세스별 네트워크(ETW), 메모리 목록 비우기(설치된 도우미·UAC), 관리자 권한 Feather의 좀비 전체 검사.
+- 실제 관리자 설치·업데이트·제거, UAC 전체 흐름, `Ctrl+Alt+Delete` 보안 화면 실행, Windows 10 1607과 다른 물리 환경은 별도 확인이 필요합니다. Windows 10용 창 테두리 경로는 단위 테스트만 거쳤습니다.
+- 기본 DLL 디렉터리를 System32로 제한했으므로, 셸 대화 상자가 불러오는 제3자 확장의 호환성은 수동으로 확인해야 합니다.
+- UI 미리보기는 실제 사용자 프로세스를 담기 때문에 Git/Release에 올리지 않고 로컬 `dist/`에만 둡니다.
 
 성능 기록은 [BENCHMARK.md](BENCHMARK.md)의 버전·SHA-256·측정 조건을 함께 확인하세요. 숨김 창 측정은 첫 화면 완성, 보이는 UI 조작, 장시간 누수 또는 극단적 자원 부족 상태를 대표하지 않습니다.

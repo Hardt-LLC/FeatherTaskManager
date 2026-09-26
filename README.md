@@ -1,49 +1,67 @@
-<p align="center">
-  <img src="assets/app.png" width="112" height="112" alt="Feather Task Manager">
-</p>
+<p align="center"><img src="assets/app.png" width="112" height="112" alt="Feather Task Manager feather icon"></p>
 
 # Feather Task Manager
 
-가볍고 빠른 Windows 작업 관리자. Rust와 Win32로 만든 네이티브 앱입니다.
+**English** · [한국어](README.ko.md) · [Download](https://github.com/Hardt-LLC/FeatherTaskManager/releases/latest)
 
-[English](README.en.md) · [다운로드](https://github.com/Hardt-LLC/FeatherTaskManager/releases/latest)
+A lightweight Windows task manager built with Rust and Win32. Supports Windows 10 version 1607 or later and Windows 11, x64.
 
-## 장점
+<p align="center"><img src="assets/preview/processes-light.png" width="900" alt="Feather Task Manager processes page, light theme"></p>
 
-- **가벼운 실행** — 브라우저 엔진 없이 동작하며, 별도 런타임 설치가 필요 없습니다.
-- **편리한 프로세스 관리** — 목록·트리 전환, 검색·정렬, 개별 프로세스 및 트리 전체 종료를 지원합니다.
-- **시스템 상태를 한눈에** — CPU·메모리·디스크·네트워크 성능 확인부터 시작 앱과 서비스 관리까지 제공합니다.
-- **한국어·영어 지원** — 설정에서 즉시 전환하고, 주요 기능을 키보드로 사용할 수 있습니다.
-- **서명된 배포 파일** — 실행 파일과 설치 프로그램에 Azure Artifact Signing의 HARDT 서명을 적용했습니다.
+## Preview
 
-## 설치 및 사용법
-
-**Windows 10 1607 이상 / Windows 11 x64**에서 사용할 수 있습니다. [최신 릴리스](https://github.com/Hardt-LLC/FeatherTaskManager/releases/latest)에서 원하는 파일을 받으세요.
-
-| 파일 | 용도 |
+| Dark theme | Performance |
 | --- | --- |
-| `Setup-x64.exe` | 설치 후 시작 메뉴에서 실행 |
-| `Portable-x64.exe` | 설치 없이 바로 실행 |
-| `Portable-x64.zip` | 포터블 앱, 설명서, 복구 스크립트 묶음 |
+| <img src="assets/preview/processes-dark.png" width="440" alt="Processes page, dark theme"> | <img src="assets/preview/performance-dark.png" width="440" alt="Performance page with GPU details, dark theme"> |
+| **Nuclear Zombie** | **Settings** |
+| <img src="assets/preview/nuclear-zombie-light.png" width="440" alt="Nuclear Zombie memory cleanup panel with results"> | <img src="assets/preview/settings-light.png" width="440" alt="Settings page, light theme"> |
 
-- **프로세스** 화면에서 목록·트리 보기를 선택하고, 작업을 선택해 개별 또는 트리 전체를 종료합니다.
-- **성능 · 시작 앱 · 서비스** 탭에서 시스템 상태와 실행 항목을 관리합니다.
-- **설정 → 한국어 / English**에서 언어를 변경합니다.
+These images come from the [interactive design prototype](design/reference/feather-task-manager.html), a single HTML file with simulated data that mirrors the app. Download it and open it in a browser to try every page, light and dark themes, sorting, the context menu, the command palette (`Ctrl+K`) and a Nuclear Zombie run.
 
-| 단축키 | 동작 |
+## Benefits
+
+- **Native and lightweight** — no browser engine or separate runtime to install. Collection pauses when minimized, and animations run only while something moves.
+- **Designed, not default** — one title bar with the logo, search and window buttons (Snap Layouts supported), custom-drawn tables, menus and dialogs, pixel-smooth scrolling and matching light/dark themes.
+- **Flexible process views** — switch between app groups, a list and a process tree; inspect live history, control efficiency mode, and end a task or an entire tree.
+- **System overview** — CPU cores, memory, disks, network adapters and GPUs with their model names, GPU temperature, memory speed and slots; toggle startup apps; start, stop or restart services.
+- **Nuclear Zombie** — tidy memory on a long-running PC without closing apps (trim working sets, clear the standby cache with administrator approval) and find "zombie" processes that another program still holds open.
+- **English and Korean** — switch languages and light/dark themes from Settings; use command search and optional tray minimize.
+- **Optional Task Manager replacement** — launch Feather through the familiar Windows shortcuts.
+
+## Install and use
+
+Download the latest version from [Releases](https://github.com/Hardt-LLC/FeatherTaskManager/releases/latest):
+
+| Download | Use |
 | --- | --- |
-| `Ctrl+1…4` | 화면 이동 |
-| `Ctrl+F` | 검색 |
-| `F5` | 새로고침 |
-| `Shift+Delete` | 선택한 프로세스 트리 종료 확인 |
+| **Setup-x64.exe** | Install with a Start menu shortcut and an uninstaller. |
+| **Portable-x64.exe** | Run directly without installation. |
+| **Portable-x64.zip** | Portable app, documentation and recovery script. |
 
-**Windows 작업 관리자 대체:** Setup으로 먼저 설치한 뒤, 설정에서 **Feather를 작업 관리자로 설정…**을 선택하고 UAC를 승인하세요. 이후 `Ctrl+Shift+Esc`나 `Ctrl+Alt+Delete → 작업 관리자`로 Feather를 실행할 수 있습니다. 원복은 **Windows 기본 작업 관리자로 복원…**에서 합니다. 설치된 파일을 수동 삭제하기 전에는 먼저 연결을 복원하세요.
+Release executables and installers are signed by **HARDT** through Azure Artifact Signing.
 
-업데이트·제거 전에는 Feather 창을 모두 닫으세요. 자세한 내용은 [설치 안내](INSTALLER.md)와 [기능 안내](FEATURES-v2.md)를 참고하세요.
+- Open **Processes** to choose **App groups**, **List view** or **Tree view**. Select a process to end it or its tree after confirmation.
+- Open **Performance**, **Startup apps** or **Services** for monitoring and management.
+- Open **Settings** to change language, theme, refresh rate, start page and window behavior.
+- Use **⋯ → Show / hide live telemetry** for selected-process CPU, memory and all-I/O history.
+- Select **Processes → Nuclear Zombie** (or `Ctrl+K` → "memory") to clean up memory and list zombie processes. Efficiency mode is in the **⋯** and right-click menus.
+- `—` means unmeasured. Per-process GPU uses Windows Task Manager's rule (the busiest engine); per-process network is measured only when Feather runs as administrator. Startup impact and CPU temperature are not collected.
+- To replace Windows Task Manager, install with Setup first, then select **Settings → Replace Windows Task Manager** and approve the administrator prompt. This enables `Ctrl+Shift+Esc` and `Ctrl+Alt+Delete → Task Manager`. Turn the same setting off to restore Windows Task Manager before manually deleting the app.
 
-## 소스에서 빌드
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+1…4` | Switch pages |
+| `Ctrl+F` | Search |
+| `Ctrl+K` | Find a command or process |
+| `F5` | Refresh |
+| `Space` | Pause or resume updates |
+| `Delete` / `Shift+Delete` | Confirm ending the selected process / process tree |
 
-Windows에서 Rust의 `x86_64-pc-windows-msvc` 도구 모음, Visual Studio C++ Build Tools, Windows SDK가 필요합니다.
+Close all Feather windows before updating or uninstalling. See the [installation guide](INSTALLER.md) and [feature guide](FEATURES-v2.md) for details.
+
+## Build from source
+
+Requires Windows, Rust with the `x86_64-pc-windows-msvc` toolchain, Visual Studio **C++ Build Tools**, and the **Windows SDK**.
 
 ```powershell
 git clone https://github.com/Hardt-LLC/FeatherTaskManager.git
@@ -51,8 +69,8 @@ cd FeatherTaskManager
 cargo build --release --locked
 ```
 
-실행 파일은 `target\release\FeatherTaskManager.exe`에 생성됩니다. 설치 파일 제작과 코드 서명은 [배포 안내](SIGNING.md)를 참고하세요.
+Run `target\release\FeatherTaskManager.exe`. For signed installers and release packaging, see [SIGNING.md](SIGNING.md).
 
-## 라이선스
+## License
 
-[MIT License](LICENSE). 사용한 라이브러리의 고지는 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)에 있습니다.
+[MIT](LICENSE). Third-party licenses are listed in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) and [RUST_LIBRARY_NOTICES.html](RUST_LIBRARY_NOTICES.html).

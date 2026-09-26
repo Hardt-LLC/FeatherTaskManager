@@ -7,12 +7,17 @@ use crate::{i18n::tr, process_tree::TerminationPlan};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0},
     System::{
-        SystemInformation::GetWindowsDirectoryW,
+        SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
         Threading::{
-            GetCurrentProcessId, GetProcessTimes, IsProcessCritical, OpenProcess,
-            QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
-            PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-            PROCESS_TERMINATE,
+            GetCurrentProcessId, GetPriorityClass, GetProcessInformation, GetProcessTimes,
+            IsProcessCritical, OpenProcess, ProcessPowerThrottling, QueryFullProcessImageNameW,
+            SetPriorityClass, SetProcessInformation, TerminateProcess, WaitForSingleObject,
+            ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+            IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_ACCESS_RIGHTS,
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SET_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+            REALTIME_PRIORITY_CLASS,
         },
     },
     UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
@@ -112,6 +117,217 @@ fn check_noncritical(handle: &ProcessHandle) -> Result<(), String> {
             "Processes critical to Windows cannot be terminated.",
         )
         .into());
+    }
+    Ok(())
+}
+
+/// Deliberately excludes High and Realtime, which can starve the desktop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Priority {
+    Idle,
+    BelowNormal,
+    Normal,
+    AboveNormal,
+}
+
+impl Priority {
+    fn native(self) -> u32 {
+        match self {
+            Self::Idle => IDLE_PRIORITY_CLASS,
+            Self::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
+            Self::Normal => NORMAL_PRIORITY_CLASS,
+            Self::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS,
+        }
+    }
+
+    fn from_native(value: u32) -> Option<Self> {
+        match value {
+            IDLE_PRIORITY_CLASS => Some(Self::Idle),
+            BELOW_NORMAL_PRIORITY_CLASS => Some(Self::BelowNormal),
+            NORMAL_PRIORITY_CLASS => Some(Self::Normal),
+            ABOVE_NORMAL_PRIORITY_CLASS => Some(Self::AboveNormal),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        priority_label(self.native())
+    }
+}
+
+fn priority_label(value: u32) -> &'static str {
+    match value {
+        IDLE_PRIORITY_CLASS => tr("낮음", "Idle"),
+        BELOW_NORMAL_PRIORITY_CLASS => tr("낮은 우선순위", "Below normal"),
+        NORMAL_PRIORITY_CLASS => tr("보통", "Normal"),
+        ABOVE_NORMAL_PRIORITY_CLASS => tr("높은 우선순위", "Above normal"),
+        HIGH_PRIORITY_CLASS => tr("높음", "High"),
+        REALTIME_PRIORITY_CLASS => tr("실시간", "Realtime"),
+        _ => tr("확인 불가", "Unavailable"),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProcessSettings {
+    pub priority: Option<Priority>,
+    pub priority_label: &'static str,
+    /// None means the OS or process does not expose power-throttling information.
+    pub efficiency: Option<bool>,
+}
+
+fn power_state(handle: HANDLE) -> Result<PROCESS_POWER_THROTTLING_STATE, String> {
+    let mut state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: 0,
+        StateMask: 0,
+    };
+    if unsafe {
+        GetProcessInformation(
+            handle,
+            ProcessPowerThrottling,
+            (&mut state as *mut PROCESS_POWER_THROTTLING_STATE).cast(),
+            std::mem::size_of_val(&state) as u32,
+        )
+    } == 0
+    {
+        return Err(last_error(tr(
+            "이 Windows 버전 또는 프로세스에서 효율성 모드를 확인할 수 없습니다",
+            "Efficiency mode is unavailable for this Windows version or process",
+        )));
+    }
+    Ok(state)
+}
+
+fn write_power_state(handle: HANDLE, state: &PROCESS_POWER_THROTTLING_STATE) -> bool {
+    unsafe {
+        SetProcessInformation(
+            handle,
+            ProcessPowerThrottling,
+            (state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
+            std::mem::size_of_val(state) as u32,
+        ) != 0
+    }
+}
+
+/// Queries only the selected process; callers should not run this per table row.
+pub fn process_settings(pid: u32, expected_created: u64) -> Result<ProcessSettings, String> {
+    let handle = open_checked(pid, expected_created, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let priority = unsafe { GetPriorityClass(handle.0) };
+    if priority == 0 {
+        return Err(last_error(tr(
+            "프로세스 우선순위를 읽을 수 없습니다",
+            "Cannot read the process priority",
+        )));
+    }
+    Ok(ProcessSettings {
+        priority: Priority::from_native(priority),
+        priority_label: priority_label(priority),
+        efficiency: power_state(handle.0).ok().map(|state| {
+            state.ControlMask & state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED != 0
+        }),
+    })
+}
+
+fn open_mutable(pid: u32, expected_created: u64) -> Result<ProcessHandle, String> {
+    if pid == 0 || pid == 4 || pid == unsafe { GetCurrentProcessId() } {
+        return Err(tr(
+            "Windows 시스템 프로세스와 Feather Task Manager의 실행 설정은 변경할 수 없습니다.",
+            "Execution settings of Windows system processes and Feather Task Manager cannot be changed.",
+        ).into());
+    }
+    let handle = open_checked(pid, expected_created, PROCESS_SET_INFORMATION)?;
+    let mut critical = 0;
+    if unsafe { IsProcessCritical(handle.0, &mut critical) } == 0 {
+        return Err(last_error(tr(
+            "시스템 필수 프로세스 여부를 확인할 수 없어 변경을 취소했습니다",
+            "The change was cancelled because the process critical status could not be verified",
+        )));
+    }
+    if critical != 0 {
+        return Err(tr(
+            "Windows 작동에 필수적인 프로세스의 실행 설정은 변경할 수 없습니다.",
+            "Execution settings of processes critical to Windows cannot be changed.",
+        )
+        .into());
+    }
+    Ok(handle)
+}
+
+pub fn set_priority(pid: u32, expected_created: u64, priority: Priority) -> Result<(), String> {
+    let handle = open_mutable(pid, expected_created)?;
+    if unsafe { SetPriorityClass(handle.0, priority.native()) } == 0 {
+        return Err(last_error(tr(
+            "프로세스 우선순위를 변경할 수 없습니다",
+            "Cannot change the process priority",
+        )));
+    }
+    Ok(())
+}
+
+fn efficiency_power_state(
+    original: &PROCESS_POWER_THROTTLING_STATE,
+    enabled: bool,
+) -> PROCESS_POWER_THROTTLING_STATE {
+    let flag = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: if enabled {
+            original.ControlMask | flag
+        } else {
+            original.ControlMask & !flag
+        },
+        StateMask: if enabled {
+            original.StateMask | flag
+        } else {
+            original.StateMask & !flag
+        },
+    }
+}
+
+fn efficiency_priority(original: u32, enabled: bool) -> u32 {
+    if enabled && original != IDLE_PRIORITY_CLASS {
+        BELOW_NORMAL_PRIORITY_CLASS
+    } else if !enabled && original == BELOW_NORMAL_PRIORITY_CLASS {
+        NORMAL_PRIORITY_CLASS
+    } else {
+        original
+    }
+}
+
+/// EcoQoS plus BelowNormal priority (Idle stays Idle). Disabling returns a
+/// BelowNormal process to Normal and returns execution-speed QoS to Windows
+/// management; other priority classes remain unchanged. No old process
+/// identities or handles are cached. The UI should explain this before enabling.
+pub fn set_efficiency(pid: u32, expected_created: u64, enabled: bool) -> Result<(), String> {
+    let handle = open_mutable(pid, expected_created)?;
+    let original = power_state(handle.0)?;
+    let old_priority = unsafe { GetPriorityClass(handle.0) };
+    if old_priority == 0 {
+        return Err(last_error(tr(
+            "우선순위를 확인할 수 없습니다",
+            "Cannot verify the priority",
+        )));
+    }
+    let state = efficiency_power_state(&original, enabled);
+    if !write_power_state(handle.0, &state) {
+        return Err(last_error(tr(
+            "효율성 모드를 변경할 수 없습니다",
+            "Cannot change efficiency mode",
+        )));
+    }
+    let priority = efficiency_priority(old_priority, enabled);
+    if priority != old_priority && unsafe { SetPriorityClass(handle.0, priority) } == 0 {
+        let failure = last_error(tr(
+            "우선순위를 변경할 수 없습니다",
+            "Cannot change the priority",
+        ));
+        if !write_power_state(handle.0, &original) {
+            return Err(format!("{failure}\n{}", tr(
+                "전원 설정을 되돌리지 못했습니다. 효율성 설정이 일부만 변경되었을 수 있습니다. 새로 고쳐 확인하세요.",
+                "Power settings could not be restored. Efficiency settings may be partially changed. Refresh to verify."
+            )));
+        }
+        return Err(failure);
     }
     Ok(())
 }
@@ -321,6 +537,106 @@ pub fn reveal_executable(pid: u32, expected_created: u64) -> Result<(), String> 
     shell_execute("open", explorer.as_os_str(), Some(OsStr::new(&parameters)))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemTool {
+    ResourceMonitor,
+    Services,
+}
+
+fn system_tool_paths(tool: SystemTool) -> Result<(std::path::PathBuf, Option<String>), String> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = vec![0u16; 32768];
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length == 0 || length as usize >= buffer.len() {
+        return Err(last_error(tr(
+            "Windows 시스템 폴더를 찾을 수 없습니다",
+            "Cannot locate the Windows system directory",
+        )));
+    }
+    let directory =
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize]));
+    match tool {
+        SystemTool::ResourceMonitor => Ok((directory.join("resmon.exe"), None)),
+        // Resolve both MMC and its snap-in absolutely; never dispatch an .msc
+        // association or search for either executable through the working folder.
+        SystemTool::Services => Ok((
+            directory.join("mmc.exe"),
+            Some(format!("\"{}\"", directory.join("services.msc").display())),
+        )),
+    }
+}
+
+pub fn launch_system_tool(tool: SystemTool) -> Result<(), String> {
+    let (path, parameters) = system_tool_paths(tool)?;
+    shell_execute(
+        "open",
+        path.as_os_str(),
+        parameters.as_deref().map(OsStr::new),
+    )
+}
+
+fn task_executable(path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, Path, Prefix};
+    let invalid = || {
+        tr(
+            "로컬 드라이브의 실행 파일(.exe 또는 .com)을 선택하세요.",
+            "Select an executable (.exe or .com) on a local drive.",
+        )
+        .to_owned()
+    };
+    if path.contains('\0') {
+        return Err(invalid());
+    }
+    let candidate = Path::new(path);
+    let local_path = |value: &Path| {
+        value.is_absolute()
+            && matches!(
+                value.components().next(),
+                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+            )
+    };
+    if !local_path(candidate) {
+        return Err(invalid());
+    }
+    let resolved = candidate.canonicalize().map_err(|_| invalid())?;
+    // Canonicalization prevents a local-looking junction from selecting a UNC
+    // executable. We do not pass user text as arguments or request elevation.
+    if !local_path(&resolved) || !resolved.is_file() || resolved.components().any(|component| {
+        matches!(component, Component::Normal(name) if name.encode_wide().any(|unit| unit == b':' as u16))
+    }) {
+        return Err(invalid());
+    }
+    let extension = resolved
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    if !extension.eq_ignore_ascii_case("exe") && !extension.eq_ignore_ascii_case("com") {
+        return Err(invalid());
+    }
+    let Some(Component::Prefix(prefix)) = resolved.components().next() else {
+        return Err(invalid());
+    };
+    let drive = match prefix.kind() {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+        _ => return Err(invalid()),
+    };
+    // A mapped network drive also has a drive letter; reject it explicitly.
+    let root = [u16::from(drive), b':' as u16, b'\\' as u16, 0];
+    let drive_type =
+        unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) };
+    if !matches!(drive_type, 2 | 3 | 5 | 6) {
+        return Err(invalid());
+    }
+    Ok(resolved)
+}
+
+/// Launch the executable explicitly selected in the file picker, without a
+/// command interpreter, inferred arguments, PATH search, or UAC elevation.
+pub fn launch_task(path: &str) -> Result<(), String> {
+    let executable = task_executable(path)?;
+    shell_execute("open", executable.as_os_str(), None)
+}
+
 /// Request elevation through the standard UAC flow; the caller may close on success.
 pub fn relaunch_elevated() -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| {
@@ -368,6 +684,111 @@ mod tests {
         assert_eq!(
             std::path::Path::new(&actual),
             std::env::current_exe().unwrap().as_path()
+        );
+    }
+
+    #[test]
+    fn settings_queries_are_read_only_and_require_identity() {
+        let pid = unsafe { GetCurrentProcessId() };
+        let created = creation_time(unsafe { GetCurrentProcess() }).unwrap();
+        assert!(process_settings(pid, 0).is_err());
+        assert!(process_settings(pid, created + 1).is_err());
+        let settings = process_settings(pid, created).unwrap();
+        assert!(!settings.priority_label.is_empty());
+        for protected in [0, 4, pid] {
+            assert!(set_priority(protected, created, Priority::Normal).is_err());
+            assert!(set_efficiency(protected, created, true).is_err());
+            assert!(set_efficiency(protected, created, false).is_err());
+        }
+    }
+
+    #[test]
+    fn stale_identity_cannot_change_disposable_child_settings() {
+        let child = ChildCleanup(fixture_command("leaf").spawn().unwrap());
+        let handle = ProcessHandle(unsafe {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.0.id())
+        });
+        assert!(!handle.0.is_null());
+        let created = creation_time(handle.0).unwrap();
+        let original = process_settings(child.0.id(), created).unwrap();
+        assert!(set_priority(child.0.id(), created + 1, Priority::BelowNormal).is_err());
+        assert!(set_efficiency(child.0.id(), created + 1, true).is_err());
+        let current = process_settings(child.0.id(), created).unwrap();
+        assert_eq!(current.priority, original.priority);
+        assert_eq!(current.efficiency, original.efficiency);
+    }
+
+    #[test]
+    fn efficiency_only_changes_execution_speed_flag_and_safe_priorities() {
+        let original = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: 4,
+            StateMask: 4,
+        };
+        let enabled = efficiency_power_state(&original, true);
+        assert_eq!(enabled.ControlMask, 5);
+        assert_eq!(enabled.StateMask, 5);
+        let disabled = efficiency_power_state(&enabled, false);
+        assert_eq!(disabled.ControlMask, 4);
+        assert_eq!(disabled.StateMask, 4);
+        assert_eq!(
+            efficiency_priority(IDLE_PRIORITY_CLASS, true),
+            IDLE_PRIORITY_CLASS
+        );
+        assert_eq!(
+            efficiency_priority(NORMAL_PRIORITY_CLASS, true),
+            BELOW_NORMAL_PRIORITY_CLASS
+        );
+        assert_eq!(
+            efficiency_priority(BELOW_NORMAL_PRIORITY_CLASS, false),
+            NORMAL_PRIORITY_CLASS
+        );
+        assert_eq!(
+            efficiency_priority(ABOVE_NORMAL_PRIORITY_CLASS, false),
+            ABOVE_NORMAL_PRIORITY_CLASS
+        );
+        assert_eq!(Priority::from_native(HIGH_PRIORITY_CLASS), None);
+        assert_eq!(Priority::from_native(REALTIME_PRIORITY_CLASS), None);
+    }
+
+    #[test]
+    fn system_tool_launches_use_absolute_system_paths() {
+        let (resource, parameters) = system_tool_paths(SystemTool::ResourceMonitor).unwrap();
+        assert!(resource.is_absolute());
+        assert_eq!(resource.file_name().unwrap(), "resmon.exe");
+        assert!(parameters.is_none());
+        let (mmc, parameters) = system_tool_paths(SystemTool::Services).unwrap();
+        assert!(mmc.is_absolute());
+        assert_eq!(mmc.file_name().unwrap(), "mmc.exe");
+        assert_eq!(
+            parameters.unwrap(),
+            format!(
+                "\"{}\"",
+                mmc.parent().unwrap().join("services.msc").display()
+            )
+        );
+    }
+
+    #[test]
+    fn new_task_validation_never_dispatches_strings_as_commands() {
+        for input in [
+            "cmd.exe",
+            "C:cmd.exe",
+            "\\\\server\\share\\app.exe",
+            "https://example.com/app.exe",
+            "C:\\Windows\\notepad.exe\0x",
+            "\\\\.\\PIPE\\app.exe",
+        ] {
+            assert!(task_executable(input).is_err(), "accepted {input:?}");
+        }
+        let current = std::env::current_exe().unwrap();
+        assert_eq!(
+            task_executable(current.to_str().unwrap()).unwrap(),
+            current.canonicalize().unwrap()
+        );
+        let (resource, _) = system_tool_paths(SystemTool::ResourceMonitor).unwrap();
+        assert!(
+            task_executable(resource.with_file_name("services.msc").to_str().unwrap()).is_err()
         );
     }
 

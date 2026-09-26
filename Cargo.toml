@@ -1,6 +1,6 @@
 [package]
 name = "feather-task"
-version = "2026.9.2"
+version = "2026.9.3"
 edition = "2021"
 description = "Feather Task Manager - a small, responsive native Windows task manager"
 license = "MIT"
@@ -21,7 +21,11 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_System_Services", "Win32_System_Registry", "Win32_System_Performance",
   "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis",
   "Win32_Networking_WinSock", "Win32_Storage_FileSystem",
-  "Win32_System_Com", "Win32_System_Memory", "Win32_Globalization"
+  "Win32_UI_Controls_Dialogs", "Win32_System_DataExchange", "Win32_Graphics_Dwm",
+  "Win32_System_Com", "Win32_System_Memory", "Win32_Globalization",
+  "Win32_Graphics_GdiPlus", "Win32_Media", "Win32_UI_Accessibility",
+  "Win32_System_Ioctl", "Win32_System_IO", "Win32_System_Power", "Wdk_Graphics_Direct3D",
+  "Win32_System_Diagnostics_Etw", "Win32_System_Time", "Win32_System_SystemServices"
 ] }
 
 [profile.release]

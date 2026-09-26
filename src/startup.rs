@@ -12,13 +12,17 @@
 use crate::i18n::tr;
 use crate::registry::Key;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Registry::*;
@@ -556,6 +560,311 @@ pub fn list() -> Result<Vec<StartupEntry>, String> {
     Ok(result)
 }
 
+type PublisherCache = HashMap<String, (Instant, Option<String>)>;
+static PUBLISHER_CACHE: OnceLock<Mutex<PublisherCache>> = OnceLock::new();
+const PUBLISHER_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Optional CompanyName from the executable's version resource. This text is
+/// supplied by the file author and is NOT a verified signature or identity.
+/// Call only on the startup enumeration worker, never from the paint path.
+/// No command, shortcut, shell handler, COM object, or DLL entry point is run.
+pub fn publisher(entry: &StartupEntry) -> Option<String> {
+    if entry.id.len() + entry.command.len() > 8192 {
+        return None;
+    }
+    let mut key = format!("{}\0{}", entry.id, entry.command);
+    if let Source::Folder { identity, .. } = &entry.source {
+        key.push_str(&format!("\0{identity:?}"));
+    }
+    let cache = PUBLISHER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    if let Some((sampled, result)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if now.saturating_duration_since(*sampled) < PUBLISHER_CACHE_TTL {
+            return result.clone();
+        }
+    }
+    let result = metadata_executable(entry).and_then(|path| version_company(&path));
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 1024 {
+        cache.retain(|_, (sampled, _)| {
+            now.saturating_duration_since(*sampled) < PUBLISHER_CACHE_TTL
+        });
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+    }
+    cache.insert(key, (now, result.clone()));
+    result
+}
+
+fn command_executable(command: &str) -> Option<PathBuf> {
+    if command.len() > 32768 || command.contains('\0') {
+        return None;
+    }
+    let command = command.trim();
+    let token = if let Some(rest) = command.strip_prefix('"') {
+        let end = rest.find('"')?;
+        if rest[end + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace())
+        {
+            return None;
+        }
+        &rest[..end]
+    } else {
+        command.split_whitespace().next()?
+    };
+    // Do not guess how the shell would resolve unquoted paths containing spaces,
+    // environment references, bare names, interpreter commands, or arguments.
+    if token.contains(['%', '"']) {
+        return None;
+    }
+    let path = PathBuf::from(token);
+    if !path.is_absolute() || !metadata_program(&path) {
+        return None;
+    }
+    Some(path)
+}
+
+fn metadata_program(path: &Path) -> bool {
+    let Some(name) = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .map(|v| v.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    if matches!(
+        name.as_str(),
+        "cmd.exe"
+            | "powershell.exe"
+            | "pwsh.exe"
+            | "wscript.exe"
+            | "cscript.exe"
+            | "rundll32.exe"
+            | "regsvr32.exe"
+            | "mshta.exe"
+    ) {
+        return false;
+    }
+    path.extension()
+        .is_some_and(|v| v.eq_ignore_ascii_case("exe"))
+}
+
+fn local_metadata_path(path: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    if !path.is_absolute() {
+        return None;
+    }
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    // Input paths use ordinary drive syntax; namespaces and UNC are unsupported.
+    let Prefix::Disk(drive) = prefix.kind() else {
+        return None;
+    };
+    let root = [u16::from(drive), b':' as u16, b'\\' as u16, 0];
+    if unsafe { GetDriveTypeW(root.as_ptr()) } != 3 {
+        return None;
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return None;
+        }
+        if matches!(component, Component::Normal(value) if value.encode_wide().any(|v| v == b':' as u16))
+        {
+            return None;
+        }
+        current.push(component);
+        // Do not follow junctions/symlinks into network locations while reading
+        // metadata supplied by a startup entry. Access failures mean unknown.
+        if current.is_absolute()
+            && fs::symlink_metadata(&current).ok()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
+        {
+            return None;
+        }
+    }
+    path.is_file().then(|| path.to_path_buf())
+}
+
+fn metadata_executable(entry: &StartupEntry) -> Option<PathBuf> {
+    let path = match &entry.source {
+        Source::Registry { value, .. } => command_executable(&command_text(value)?)?,
+        Source::Folder { path, identity } => {
+            local_metadata_path(path)?;
+            let expected = identity.as_ref()?;
+            let (_guard, actual) = file_identity(path, true).ok()?;
+            if &actual != expected || actual.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return None;
+            }
+            if path.extension()?.eq_ignore_ascii_case("exe") {
+                path.clone()
+            } else if path.extension()?.eq_ignore_ascii_case("lnk") && actual.size <= 1024 * 1024 {
+                let mut bytes = Vec::with_capacity(actual.size as usize);
+                File::open(path)
+                    .ok()?
+                    .take(1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                if bytes.len() > 1024 * 1024 {
+                    return None;
+                }
+                shortcut_local_target(&bytes)?
+            } else {
+                return None;
+            }
+        }
+    };
+    if !metadata_program(&path) {
+        return None;
+    }
+    local_metadata_path(&path)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+/// A small subset of MS-SHLLINK: an explicit local LinkInfo target only. No
+/// ShellLink Resolve, network links, ID-list resolution, environment expansion,
+/// advertised MSI targets, tracking, or relative-path guessing.
+fn shortcut_local_target(bytes: &[u8]) -> Option<PathBuf> {
+    const CLSID: [u8; 16] = [1, 20, 2, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 70];
+    if read_u32(bytes, 0)? != 76 || bytes.get(4..20)? != CLSID {
+        return None;
+    }
+    let flags = read_u32(bytes, 20)?;
+    if flags & 2 == 0 || flags & (0x100 | 0x200 | 0x1000) != 0 {
+        return None;
+    }
+    let mut start = 76usize;
+    if flags & 1 != 0 {
+        let length = u16::from_le_bytes(bytes.get(start..start + 2)?.try_into().ok()?) as usize;
+        start = start.checked_add(2 + length)?;
+    }
+    let length = read_u32(bytes, start)? as usize;
+    let info = bytes.get(start..start.checked_add(length)?)?;
+    let header = read_u32(info, 4)? as usize;
+    if header < 28 || header > info.len() || read_u32(info, 8)? != 1 {
+        return None;
+    }
+    let string = |offset: usize, unicode: bool| -> Option<String> {
+        if offset < header || offset >= info.len() {
+            return None;
+        }
+        if unicode {
+            let units: Vec<u16> = info[offset..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .take(32768)
+                .collect();
+            let end = units.iter().position(|v| *v == 0)?;
+            String::from_utf16(&units[..end]).ok()
+        } else {
+            let tail = &info[offset..];
+            let end = tail.iter().position(|v| *v == 0)?;
+            let value = &tail[..end];
+            value
+                .is_ascii()
+                .then(|| String::from_utf8_lossy(value).into_owned())
+        }
+    };
+    let unicode = header >= 36 && read_u32(info, 28)? != 0 && read_u32(info, 32)? != 0;
+    let base = string(
+        read_u32(info, if unicode { 28 } else { 16 })? as usize,
+        unicode,
+    )?;
+    let suffix = string(
+        read_u32(info, if unicode { 32 } else { 24 })? as usize,
+        unicode,
+    )?;
+    // Common shortcuts contain the complete file path and an empty suffix. The
+    // suffix may otherwise be a relative component appended to a local base.
+    let mut target = PathBuf::from(base);
+    if !suffix.is_empty() {
+        let relative = Path::new(&suffix);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        target.push(relative);
+    }
+    Some(target)
+}
+
+fn version_query<'a>(buffer: &'a [u32], key: &str, wide_string: bool) -> Option<&'a [u8]> {
+    let key: Vec<u16> = key.encode_utf16().chain(Some(0)).collect();
+    let mut pointer = null_mut();
+    let mut length = 0;
+    if unsafe {
+        VerQueryValueW(
+            buffer.as_ptr().cast(),
+            key.as_ptr(),
+            &mut pointer,
+            &mut length,
+        )
+    } == 0
+    {
+        return None;
+    }
+    let length = (length as usize).checked_mul(if wide_string { 2 } else { 1 })?;
+    let offset = (pointer as usize).checked_sub(buffer.as_ptr() as usize)?;
+    if offset.checked_add(length)? > std::mem::size_of_val(buffer) {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>().add(offset), length) })
+}
+
+fn version_company(path: &Path) -> Option<String> {
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut ignored = 0;
+    // Zero flags read the file resource without opting into MUI sidecar lookup.
+    let length = unsafe { GetFileVersionInfoSizeExW(0, path.as_ptr(), &mut ignored) };
+    if length == 0 || length > 1024 * 1024 {
+        return None;
+    }
+    let mut buffer = vec![0u32; (length as usize).div_ceil(4)];
+    if unsafe { GetFileVersionInfoExW(0, path.as_ptr(), 0, length, buffer.as_mut_ptr().cast()) }
+        == 0
+    {
+        return None;
+    }
+    let translations = version_query(&buffer, r"\VarFileInfo\Translation", false)?;
+    for pair in translations.as_chunks::<4>().0.iter().take(32) {
+        let language = u16::from_le_bytes([pair[0], pair[1]]);
+        let page = u16::from_le_bytes([pair[2], pair[3]]);
+        let key = format!(r"\StringFileInfo\{language:04x}{page:04x}\CompanyName");
+        if let Some(bytes) = version_query(&buffer, &key, true) {
+            let units: Vec<u16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .take(513)
+                .collect();
+            let Some(end) = units.iter().position(|v| *v == 0) else {
+                continue;
+            };
+            let value = String::from_utf16(&units[..end]).ok()?;
+            let value = value.trim();
+            if !value.is_empty() && !value.chars().any(char::is_control) {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
 fn write_value(key: &Key, name: &[u16], value: &Value) -> Result<(), String> {
     let code = unsafe {
         RegSetValueExW(
@@ -652,6 +961,120 @@ pub fn set_enabled(entry: &StartupEntry, enabled: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publisher_commands_do_not_guess_execution_rules() {
+        assert_eq!(
+            command_executable(r#""C:\Program Files\App\app.exe" --hidden"#),
+            Some(PathBuf::from(r"C:\Program Files\App\app.exe"))
+        );
+        assert_eq!(
+            command_executable(r"C:\Apps\app.EXE /start"),
+            Some(PathBuf::from(r"C:\Apps\app.EXE"))
+        );
+        for command in [
+            "app.exe",
+            r"C:app.exe",
+            r"C:\Program Files\App\app.exe",
+            r"%APPDATA%\App\app.exe",
+            r#""C:\Apps\app.exe"suffix"#,
+            r"C:\Windows\System32\cmd.exe /c app.exe",
+            r"C:\Apps\app.bat",
+            "C:\\Apps\\app.exe\0 /bad",
+        ] {
+            assert!(
+                command_executable(command).is_none(),
+                "accepted {command:?}"
+            );
+        }
+        for path in [
+            r"\\server\share\app.exe",
+            r"\\?\C:\Windows\explorer.exe",
+            r"C:\Windows\explorer.exe:stream.exe",
+            r"C:\Windows\..\Windows\explorer.exe",
+        ] {
+            assert!(
+                local_metadata_path(Path::new(path)).is_none(),
+                "accepted {path:?}"
+            );
+        }
+    }
+
+    fn shortcut_fixture(base: &str, suffix: &str) -> Vec<u8> {
+        let mut bytes = vec![0; 76 + 28];
+        bytes[0..4].copy_from_slice(&76u32.to_le_bytes());
+        bytes[4..20].copy_from_slice(&[1, 20, 2, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 70]);
+        bytes[20..24].copy_from_slice(&2u32.to_le_bytes());
+        bytes[80..84].copy_from_slice(&28u32.to_le_bytes());
+        bytes[84..88].copy_from_slice(&1u32.to_le_bytes());
+        bytes[92..96].copy_from_slice(&28u32.to_le_bytes());
+        let suffix_offset = 28 + base.len() as u32 + 1;
+        bytes[100..104].copy_from_slice(&suffix_offset.to_le_bytes());
+        bytes.extend(base.as_bytes());
+        bytes.push(0);
+        bytes.extend(suffix.as_bytes());
+        bytes.push(0);
+        let size = (bytes.len() - 76) as u32;
+        bytes[76..80].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn publisher_shortcuts_are_bounded_local_linkinfo_only() {
+        let valid = shortcut_fixture(r"C:\Apps\app.exe", "");
+        assert_eq!(
+            shortcut_local_target(&valid),
+            Some(PathBuf::from(r"C:\Apps\app.exe"))
+        );
+        assert_eq!(
+            shortcut_local_target(&shortcut_fixture(r"C:\Apps", "app.exe")),
+            Some(PathBuf::from(r"C:\Apps\app.exe"))
+        );
+        assert!(shortcut_local_target(&shortcut_fixture(r"C:\Apps", r"..\evil.exe")).is_none());
+        assert!(
+            shortcut_local_target(&shortcut_fixture(r"C:\Apps", r"\\server\app.exe")).is_none()
+        );
+        for length in 0..valid.len() {
+            assert!(shortcut_local_target(&valid[..length]).is_none());
+        }
+        for (offset, value) in [
+            (20, 2 | 0x100),
+            (20, 2 | 0x200),
+            (20, 2 | 0x1000),
+            (76, u32::MAX),
+            (80, u32::MAX),
+            (84, 3),
+            (92, u32::MAX),
+            (100, u32::MAX),
+        ] {
+            let mut bad = valid.clone();
+            bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                shortcut_local_target(&bad).is_none(),
+                "accepted offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn publisher_reads_company_resource_without_launching_target() {
+        let mut directory = [0u16; 32768];
+        let length = unsafe {
+            windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+                directory.as_mut_ptr(),
+                directory.len() as u32,
+            )
+        } as usize;
+        assert!(length > 0 && length < directory.len());
+        let path = PathBuf::from(OsString::from_wide(&directory[..length])).join("cmd.exe");
+        let company =
+            version_company(&path).expect("Windows command processor CompanyName resource");
+        assert!(!company.is_empty());
+        assert!(!company.chars().any(char::is_control));
+        assert!(
+            version_company(Path::new(r"C:\this-feather-fixture-does-not-exist.exe")).is_none()
+        );
+    }
     use crate::i18n::{with_language, Language};
 
     #[test]

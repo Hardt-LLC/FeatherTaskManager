@@ -15,7 +15,7 @@ try {
     $null = New-Item -ItemType Directory -Path $distPath -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'target\release\FeatherTaskManager.exe') -Destination $distPath -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'scripts\Restore-WindowsTaskManager.ps1') -Destination $distPath -Force
-    foreach ($name in @('README.md', 'README.en.md', 'INSTALLER.md', 'SIGNING.md', 'SECURITY.md', 'FEATURES-v2.md', 'BENCHMARK.md', 'VALIDATION.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html')) {
+    foreach ($name in @('README.md', 'README.ko.md', 'INSTALLER.md', 'SIGNING.md', 'SECURITY.md', 'FEATURES-v2.md', 'BENCHMARK.md', 'VALIDATION.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html')) {
         Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $distPath -Force
     }
     $designPath = Join-Path $distPath 'design-system\feather-task'
@@ -28,7 +28,7 @@ try {
     $version = & (Join-Path $PSScriptRoot 'version.ps1') -BinaryPath $binary
     $hash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText((Join-Path $distPath 'SHA256SUMS.txt'), "$hash  FeatherTaskManager.exe`r`n")
-    $files = @('FeatherTaskManager.exe', 'Restore-WindowsTaskManager.ps1', 'README.md', 'README.en.md', 'INSTALLER.md', 'SIGNING.md', 'FEATURES-v2.md', 'BENCHMARK.md', 'VALIDATION.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html', 'SHA256SUMS.txt') | ForEach-Object { Join-Path $distPath $_ }
+    $files = @('FeatherTaskManager.exe', 'Restore-WindowsTaskManager.ps1', 'README.md', 'README.ko.md', 'INSTALLER.md', 'SIGNING.md', 'FEATURES-v2.md', 'BENCHMARK.md', 'VALIDATION.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RUST_LIBRARY_NOTICES.html', 'SHA256SUMS.txt') | ForEach-Object { Join-Path $distPath $_ }
     $files += Join-Path $distPath 'design-system'
     $files += $measurementsPath
     Compress-Archive -LiteralPath $files -DestinationPath (Join-Path $distPath 'FeatherTaskManager-windows-x64.zip') -Force

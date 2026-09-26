@@ -28,6 +28,22 @@ pub struct Service {
     pub start_type: Option<u32>,
 }
 
+/// Configuration is queried for a selected service only, never once per row.
+#[derive(Clone, Debug)]
+pub struct ServiceDetails {
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    pub account: String,
+    pub binary_path: String,
+    pub load_order_group: String,
+    pub dependencies: Vec<String>,
+    pub state: u32,
+    pub pid: u32,
+    pub start_type: u32,
+    pub warnings: Vec<String>,
+}
+
 struct ServiceHandle(SC_HANDLE);
 
 impl Drop for ServiceHandle {
@@ -100,6 +116,147 @@ fn buffer_string(buffer: &[usize], pointer: *const u16) -> Result<String, String
         "An unterminated string was found in the service list.",
     ))?;
     Ok(String::from_utf16_lossy(&chars[..end]))
+}
+
+fn optional_buffer_string(buffer: &[usize], pointer: *const u16) -> Result<String, String> {
+    if pointer.is_null() {
+        Ok(String::new())
+    } else {
+        buffer_string(buffer, pointer)
+    }
+}
+
+fn buffer_dependencies(buffer: &[usize], pointer: *const u16) -> Result<Vec<String>, String> {
+    if pointer.is_null() {
+        return Ok(Vec::new());
+    }
+    let base = buffer.as_ptr() as usize;
+    let bytes = size_of_val(buffer);
+    let offset = (pointer as usize)
+        .checked_sub(base)
+        .filter(|offset| *offset < bytes && offset % size_of::<u16>() == 0)
+        .ok_or(tr(
+            "서비스 종속성 주소가 올바르지 않습니다.",
+            "Invalid service dependency address.",
+        ))?;
+    let chars = unsafe { std::slice::from_raw_parts(pointer, (bytes - offset) / size_of::<u16>()) };
+    let mut result = Vec::new();
+    let mut position = 0;
+    loop {
+        let tail = chars.get(position..).ok_or(tr(
+            "서비스 종속성 목록이 올바르게 끝나지 않았습니다.",
+            "Unterminated service dependency list.",
+        ))?;
+        let end = tail.iter().position(|value| *value == 0).ok_or(tr(
+            "서비스 종속성 목록이 올바르게 끝나지 않았습니다.",
+            "Unterminated service dependency list.",
+        ))?;
+        if end == 0 {
+            return Ok(result);
+        }
+        result.push(String::from_utf16_lossy(&tail[..end]));
+        position += end + 1;
+    }
+}
+
+fn query_status(service: &ServiceHandle) -> Result<SERVICE_STATUS_PROCESS, String> {
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0;
+    if unsafe {
+        QueryServiceStatusEx(
+            service.0,
+            SC_STATUS_PROCESS_INFO,
+            (&mut status as *mut SERVICE_STATUS_PROCESS).cast(),
+            size_of_val(&status) as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(service_error(
+            tr(
+                "서비스 상태를 확인할 수 없습니다",
+                "Cannot read the service status",
+            ),
+            unsafe { GetLastError() },
+        ));
+    }
+    Ok(status)
+}
+
+pub fn details(name: &str) -> Result<ServiceDetails, String> {
+    let wide = wide_name(name)?;
+    let manager = open_manager(SC_MANAGER_CONNECT)?;
+    let raw = unsafe {
+        OpenServiceW(
+            manager.0,
+            wide.as_ptr(),
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    };
+    if raw.is_null() {
+        return Err(service_error(
+            tr(
+                "서비스 세부 정보를 읽을 수 없습니다",
+                "Cannot read service details",
+            ),
+            unsafe { GetLastError() },
+        ));
+    }
+    // Holding this handle also prevents deletion/recreation under the same name
+    // while the status and configuration are queried.
+    let service = ServiceHandle(raw);
+    let status = query_status(&service)?;
+    let mut buffer = [0usize; 8192 / size_of::<usize>()];
+    let mut needed = 0;
+    let config = buffer.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>();
+    if unsafe { QueryServiceConfigW(service.0, config, size_of_val(&buffer) as u32, &mut needed) }
+        == 0
+    {
+        return Err(service_error(
+            tr(
+                "서비스 구성을 읽을 수 없습니다",
+                "Cannot read the service configuration",
+            ),
+            unsafe { GetLastError() },
+        ));
+    }
+    let config = unsafe { config.read() };
+    let mut result = ServiceDetails {
+        name: name.to_owned(),
+        display_name: optional_buffer_string(&buffer, config.lpDisplayName)?,
+        description: String::new(),
+        account: optional_buffer_string(&buffer, config.lpServiceStartName)?,
+        binary_path: optional_buffer_string(&buffer, config.lpBinaryPathName)?,
+        load_order_group: optional_buffer_string(&buffer, config.lpLoadOrderGroup)?,
+        dependencies: buffer_dependencies(&buffer, config.lpDependencies)?,
+        state: status.dwCurrentState,
+        pid: status.dwProcessId,
+        start_type: config.dwStartType,
+        warnings: Vec::new(),
+    };
+    buffer.fill(0);
+    if unsafe {
+        QueryServiceConfig2W(
+            service.0,
+            SERVICE_CONFIG_DESCRIPTION,
+            buffer.as_mut_ptr().cast(),
+            size_of_val(&buffer) as u32,
+            &mut needed,
+        )
+    } != 0
+    {
+        let description = unsafe { buffer.as_ptr().cast::<SERVICE_DESCRIPTIONW>().read() };
+        result.description = optional_buffer_string(&buffer, description.lpDescription)?;
+    } else {
+        result.warnings.push(service_error(
+            tr(
+                "서비스 설명을 읽을 수 없습니다",
+                "Cannot read the service description",
+            ),
+            unsafe { GetLastError() },
+        ));
+    }
+    Ok(result)
 }
 
 fn parse_page(buffer: &[usize], count: u32) -> Result<Vec<Service>, String> {
@@ -291,6 +448,91 @@ pub fn stop(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn restartable(state: u32, controls: u32) -> bool {
+    matches!(state, SERVICE_RUNNING | SERVICE_PAUSED) && controls & SERVICE_ACCEPT_STOP != 0
+}
+
+fn wait_for_state(service: &ServiceHandle, target: u32, deadline: Instant) -> Result<(), String> {
+    loop {
+        let status = query_status(service)?;
+        if status.dwCurrentState == target {
+            return Ok(());
+        }
+        if target == SERVICE_RUNNING && status.dwCurrentState == SERVICE_STOPPED {
+            return Err(service_error(
+                tr(
+                    "서비스가 시작되는 동안 중지되었습니다",
+                    "The service stopped while starting",
+                ),
+                status.dwWin32ExitCode,
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(tr(
+                "서비스 상태 변경 대기 시간이 초과되었습니다. 요청은 취소되지 않았으며 Windows에서 계속 처리될 수 있습니다. 새로 고쳐 확인하세요.",
+                "Timed out waiting for the service. The request was not cancelled and Windows may still be processing it. Refresh to verify."
+            ).into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Restart this service only, without stopping dependent services. All checks
+/// and operations use one pinned SCM handle. Run on a worker: our polling is
+/// bounded to 15 seconds, while Windows may itself block a control RPC longer.
+/// The UI must confirm the service name before calling.
+pub fn restart(name: &str) -> Result<(), String> {
+    let wide = wide_name(name)?;
+    let manager = open_manager(SC_MANAGER_CONNECT)?;
+    let raw = unsafe {
+        OpenServiceW(
+            manager.0,
+            wide.as_ptr(),
+            SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP,
+        )
+    };
+    if raw.is_null() {
+        return Err(service_error(
+            tr(
+                "서비스를 다시 시작할 수 없습니다",
+                "Cannot restart the service",
+            ),
+            unsafe { GetLastError() },
+        ));
+    }
+    let service = ServiceHandle(raw);
+    let status = query_status(&service)?;
+    if !restartable(status.dwCurrentState, status.dwControlsAccepted) {
+        return Err(tr(
+            "실행 중이거나 일시 중지된 서비스 중 중지를 허용하는 서비스만 다시 시작할 수 있습니다. 상태를 새로 고치세요.",
+            "Only a running or paused service that accepts stop can be restarted. Refresh its status."
+        ).into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stopped = SERVICE_STATUS::default();
+    if unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut stopped) } == 0 {
+        return Err(service_error(
+            tr(
+                "다시 시작하기 위해 서비스를 중지할 수 없습니다",
+                "Cannot stop the service for restart",
+            ),
+            unsafe { GetLastError() },
+        ));
+    }
+    wait_for_state(&service, SERVICE_STOPPED, deadline)?;
+    // Never start while a stop is pending, including after a wait timeout.
+    if unsafe { StartServiceW(service.0, 0, null()) } == 0 {
+        return Err(service_error(
+            tr(
+                "서비스를 중지했지만 다시 시작할 수 없습니다",
+                "The service was stopped but could not be started again",
+            ),
+            unsafe { GetLastError() },
+        ));
+    }
+    wait_for_state(&service, SERVICE_RUNNING, deadline)
+}
+
 pub fn state_label(state: u32) -> &'static str {
     match state {
         SERVICE_STOPPED => tr("중지됨", "Stopped"),
@@ -363,6 +605,8 @@ mod tests {
             assert!(wide_name(name).is_err());
             assert!(start(name).is_err());
             assert!(stop(name).is_err());
+            assert!(details(name).is_err());
+            assert!(restart(name).is_err());
         }
         assert!(wide_name(&"a".repeat(257)).is_err());
         assert_eq!(wide_name("서비스_123").unwrap().last(), Some(&0));
@@ -401,6 +645,64 @@ mod tests {
         assert!(parse_page(&buffer, 1).is_err());
         buffer.fill(usize::MAX);
         assert!(buffer_string(&buffer, buffer.as_ptr().cast()).is_err());
+    }
+
+    #[test]
+    fn dependencies_validate_native_multi_string_bounds() {
+        let mut buffer = vec![0usize; 32];
+        let text: Vec<u16> = "RpcSs\0+NetworkProvider\0\0".encode_utf16().collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(text.as_ptr(), buffer.as_mut_ptr().cast(), text.len());
+        }
+        assert_eq!(
+            buffer_dependencies(&buffer, buffer.as_ptr().cast()).unwrap(),
+            ["RpcSs", "+NetworkProvider"]
+        );
+        assert!(buffer_dependencies(&buffer, std::ptr::null())
+            .unwrap()
+            .is_empty());
+        assert!(buffer_dependencies(&buffer, unsafe {
+            buffer.as_ptr().cast::<u8>().add(1).cast()
+        })
+        .is_err());
+        buffer.fill(usize::MAX);
+        assert!(buffer_dependencies(&buffer, buffer.as_ptr().cast()).is_err());
+        // A valid first string without the terminating list NUL is still invalid.
+        let end = size_of_val(buffer.as_slice()) / 2;
+        unsafe {
+            buffer.as_mut_ptr().cast::<u16>().add(end - 1).write(0);
+        }
+        assert!(buffer_dependencies(&buffer, buffer.as_ptr().cast()).is_err());
+    }
+
+    #[test]
+    fn restart_preflight_requires_stoppable_stable_state() {
+        assert!(restartable(SERVICE_RUNNING, SERVICE_ACCEPT_STOP));
+        assert!(restartable(SERVICE_PAUSED, SERVICE_ACCEPT_STOP));
+        assert!(!restartable(SERVICE_RUNNING, 0));
+        for state in [
+            SERVICE_STOPPED,
+            SERVICE_START_PENDING,
+            SERVICE_STOP_PENDING,
+            SERVICE_PAUSE_PENDING,
+            SERVICE_CONTINUE_PENDING,
+            u32::MAX,
+        ] {
+            assert!(!restartable(state, SERVICE_ACCEPT_STOP));
+        }
+    }
+
+    #[test]
+    fn selected_service_configuration_is_read_only() {
+        let services = list().unwrap();
+        let detail = services
+            .iter()
+            .find_map(|service| details(&service.name).ok())
+            .expect("at least one readable service configuration");
+        assert!(!detail.name.is_empty());
+        assert!(!detail.display_name.is_empty());
+        assert!(!detail.binary_path.is_empty());
+        assert!((SERVICE_STOPPED..=SERVICE_PAUSED).contains(&detail.state));
     }
 
     #[test]

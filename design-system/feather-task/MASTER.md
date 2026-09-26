@@ -1,49 +1,48 @@
-# Feather Task Manager — desktop design system
+# Feather Task Manager design
 
-Source: [UI UX Pro Max skill](https://github.com/nextlevelbuilder/ui-ux-pro-max-skill), applied 2026-09-26. Read its SKILL.md, pro-rules.md and quick-reference.md. Ran `system monitoring dashboard desktop --design-system`, refined with `desktop utility fluent --design-system`, and verified the exact `Fluent 2 desktop --domain style` match.
+The canonical reference is `design/reference/feather-task-manager.html`, supplied by the user on 2026-09-26. It supersedes the earlier Stitch design. Its JavaScript uses simulated data and is reference material only; the application remains native Rust/Win32 with real Windows measurements.
 
-Source revision: `dcc40ff5133ef78276117db0cc34e7b83cc8aeba`. Skill checkout stays in `vendor/` and is not a runtime dependency.
+## Layout and appearance
 
-The generator's marketing-page sections and web fonts are not suitable for this native utility. Apply its verified Fluent 2 style guidance and minimal utility layout principles; preserve Rust/Win32 native controls, system fonts and a small binary. No blur, decorative animation or web runtime.
+- Five views: Processes, Performance, Startup apps, Services, Settings.
+- 220 dp navigation rail, 44 dp global search strip, 60 dp page heading, 30 dp status bar.
+- Dense virtual native tables with a 48 dp resource header, 32 dp rows and aligned numeric text.
+- Light, dark and Windows-following themes. Segoe UI/Malgun Gothic for interface text; Consolas for numeric data.
+- Source OKLCH colors converted to sRGB: light canvas #F6F9FC, surface #FFFFFF, foreground #121C23, accent #299236; dark canvas #0F1519, surface #171E23, foreground #E7ECF0, accent #5BBE62.
+- Green measured history charts, subtle resource heatmaps, monochrome navigation and existing feather branding.
+- Native Windows title bar and window controls remain available. The browser reference's desktop shadow is not part of the app client area.
 
-## Layout
-- Calm light workspace with a dark navigation rail, 4 labeled pages: 프로세스, 성능, 시작 앱, 서비스.
-- Main content begins at 220 dp; navigation width 196 dp. Spacing follows 4/8 dp increments, gutters 24 dp.
-- Page header has one title, one short explanation, live/paused feedback and consistent toolbar.
-- Process, startup and service tables use virtual native ListView controls, 32 dp row rhythm, readable headers and numeric alignment. Selection and hover are visible. Actions are tied to the selected item.
-- Performance uses four time-series panels: CPU, memory, disk and network; disk/GPU availability is stated explicitly. No data is fabricated.
-- Font: Malgun Gothic for Korean labels and Segoe UI for numeric metrics. Title 28 dp, labels/body 14 dp, secondary 12 dp, metrics 28 dp. Preserve DPI scaling and native keyboard focus.
+## Connected behavior
 
-## Tokens
-- workspace #F5F7FA; surface #FFFFFF; primary text #17233A; muted text #59667B; border #DCE3ED.
-- navigation #152036; navigation text #B8C4D8; navigation active #263D63 and white label.
-- brand #2563EB, selection #EAF1FF; success #157A52; warning #956000; destructive #B42332.
-- Radius: panels 10 dp; controls 6 dp. Thin dividers, no gradients/shadows/blur.
-- Charts: CPU blue, memory violet, disk teal, network orange; always pair colors with labels and current values.
+- Processes: app-window/background/system grouping, flat list or generation-safe process tree; search/sort, confirmed termination/tree termination, priority/EcoQoS, file location, name/PID copy, optional selected-process CPU/memory/all-I/O history.
+- Performance: logical CPU charts, CPU topology/reported clock, memory commit/cache/pools, individual physical disks, physical network interfaces, GPU adapter/engine usage and GPU memory. Selected device survives counter warm-up. Histories cover up to 60 seconds at 250 ms–5 s rates and mark collection gaps.
+- Startup: inline native toggle, pending/access-denied state, stale-source checks, optional CompanyName metadata, explicit unmeasured startup impact.
+- Services: state/start-type filters, start/stop/restart, selected configuration/dependencies, Services console.
+- Settings: system/light/dark, Korean/English, refresh, initial page, always on top, optional tray minimize, installed-app Task Manager replacement. Registry preferences use the shared no-reparse opener.
+- Nuclear Zombie (Processes head button, replacing Efficiency mode, which stays in the ⋯ and context menus as "Toggle efficiency mode"; palette command "Nuclear Zombie", found by "memory" / "zombie"): one modal panel (scrim, 560 dp surface, radius 8, header / scrolling body / footer like the confirm dialog). It shows the measured memory strip (Available, In use, Standby, Modified, Free), options with switches (trim working sets; clear standby cache and flush modified pages, which need administrator/UAC; find zombie processes) and runs on the job worker with progress on the Run button. The results appear in the same panel: Available/Free before → after with the change, each step's outcome (done, needs administrator, declined, error text), trimmed/skipped counts, and zombie holders (busiest first, PID, count, most common exited names) with a partial-scan line when processes could not be inspected. A holder's End task closes the panel and uses the normal End task confirmation. Copy details copies the report. Esc closes, except while the UAC prompt is pending. If the panel is closed during a run, a toast reports the result.
+- Ctrl+K command palette; Ctrl+F search; Ctrl+1…4 views; F5 refresh; Delete/Shift+Delete termination confirmation; Space pauses, or toggles a selected startup entry.
+- Minimized and modal monitoring pauses; hidden tray state has a tested restoration path. No WebView, WMI, external telemetry or polling subprocess.
 
-## Interaction and resource budget
-- Ctrl+1…4 selects pages; Ctrl+F searches; F5 refreshes; Escape clears search; Delete only ends selected process after confirmation.
-- Native buttons expose names, disabled semantics, keyboard focus and pressed states. Search has a persistent visible label, plus contextual placeholder.
-- Lazy-load startup/services; performance counters run only on its page. Minimize pauses periodic monitoring. No animation timers.
-- Show loading, empty, failure and stale states. Never display unavailable metrics as successfully measured zero.
-- Start/stop services and enable/disable startup only on explicit user action; retain selected identity during confirmation and asynchronous work.
-- Settings uses an on-demand native popup for administrator launch and Windows Task Manager replacement/restore. Show the current association; disable changes that would overwrite another program. Explain the all-user scope, permanent installation location and restore-before-delete requirement before UAC. No extra background polling or elevation during ordinary startup.
-- Shortcut labels and descriptions use separate fixed columns, with no space padding. Korean uses Malgun Gothic and English uses Segoe UI; changing language updates native controls immediately.
-- Process list/tree modes share numeric columns. Tree indentation and branch chevrons occupy only the name column. Tree search includes ancestor context; termination confirmation captures identities and includes collapsed descendants.
+## Data boundaries
 
-## Verification
-- Contrast for normal text >=4.5:1; icons/state boundaries >=3:1 when meaningful.
-- Native control integration tests for all page switches, search/sort, selection preservation and action enablement.
-- Render actual native client surfaces at normal and high DPI, review clipping, state visibility and table alignment.
-- Native desktop rules take precedence over skill examples about phone safe areas, CSS, marketing CTAs or touch-only layout.
+- Apps means processes with visible unowned top-level windows; an app row sums its windowless descendants (not the shell's sign-in children). Windows processes are PID 0/4, the minimal processes System starts, and processes whose executable is inside the Windows directory (the end-task warning's test, on the image path the kernel reports for every PID without elevation). Background is the rest. This does not guess Windows process ownership from executable names.
+- Process I/O includes all transfer types and is never labeled disk-only. System/device counters are measured independently of process counters.
+- Process GPU (data layer, `performance::ProcessGpuTracker`): utilization is the busiest engine after summing that engine's instances, the maximum over all engines and adapters (Task Manager's rule); memory is PDH "GPU Process Memory" Local Usage (dedicated) and Shared Usage. The unreliable "Dedicated Usage" counter is not used. A new or reused (PID, creation time) shows "-" until its first full interval.
+- Process network (data layer, `netetw::NetworkMonitor`): send/receive bytes per second from a private Microsoft-Windows-Kernel-Network ETW session, which Windows allows only when Feather runs elevated. Otherwise, and for any interval where the trace stopped or ETW reported lost events, the value is "-" with the reason ("Requires administrator", "Network trace stopped", "Network events dropped"). Bytes from events that predate a process's creation time are not attributed to it. Addresses and ports are never read.
+- The Processes table shows both per process: GPU as "12.3%" (heat at 12 %), Network as "6.8 Mbps" (bytes × 8 / 10⁶, heat at 8 Mbps), "—" for an unmeasured value. When network is unmeasured the page head names the reason (e.g. "Network per process requires administrator"); there is no note when it is measured. The column totals are system-wide: physical adapters' throughput and the busiest listed GPU.
+- The Performance page lists no software (Basic Render Driver) or indirect-display GPU and no network adapter that is not present or not connected.
+- Device identity is collected once and again on device change, never guessed from names:
+  - GPU (D3DKMT): name, dedicated/shared memory, driver version/date, WDDM version, PCI IDs. Software (Basic Render) and indirect-display adapters are flagged, not listed as GPUs.
+  - Disks (storage IOCTLs): model, bus, SSD/HDD from the seek-penalty property, TRIM, capacity, system and page-file disk. Serial numbers are never read. A disk that does not report seek penalty (e.g. USB flash) is neither SSD nor HDD.
+  - Memory (SMBIOS types 16/17): slots used/total, type, form factor, module size, manufacturer and part number. Speeds are labeled MT/s only for SMBIOS 3.2+ tables. Older tables expose only the raw reported value, because their specification says MHz and firmware reported either the clock or the transfer rate.
+  - Network adapters: adapter model and Wi-Fi/Ethernet kind. MAC and IP addresses are never read.
+  - CPU: base speed (`MaxMhz`), L1/L2/L3 totals, firmware virtualization.
+- Temperatures: GPU temperature, fan RPM, power as % of the power limit (not watts) and memory clock come from D3DKMT adapter performance data, the source Windows Task Manager uses. CPU package temperature has no supported user-mode source without a kernel driver or WMI, so it is not collected or shown. ACPI thermal zones are labeled only by zone name, never as a CPU temperature.
+- Still not measured: startup impact, SSD health/wear, CPU temperature, GPU power in watts. They are not inferred from mock values, and the UI omits them or marks them unavailable.
+- Memory cleanup (`memclean`): readings are `GlobalMemoryStatusEx` (Available, In use = total − available) and `SystemMemoryListInformation` (Standby over all priorities, Modified, Free + zeroed); "—" when Windows does not report the lists. Trimming calls `EmptyWorkingSet` only on processes Feather may open with quota rights. Pages move to the standby/modified lists and fault back in, so nothing stops running. Standby purge and modified flush use `NtSetSystemInformation` with `SeProfileSingleProcessPrivilege`. Feather does this itself when elevated. Otherwise it starts the installed, byte-identical Program Files image with `--purge-memory-lists` through UAC, and reports a declined prompt or a missing or different installed build as such. The zombie scan is read-only: it duplicates process handles into Feather with limited access, never with `DUPLICATE_CLOSE_SOURCE`, and closes only its own copies. It counts distinct exited processes (PID + creation time) per holder, and Windows gives no supported per-zombie memory figure, so no memory size is claimed.
+- Publisher is unverified executable version metadata, not an Authenticode signer.
+- Do not replace missing counters with zero or use random/sample values in the application.
 
-Measured contrast: primary text on white 15.70:1; secondary text on workspace 5.42:1; navigation labels 9.23:1; selected navigation 10.88:1; white primary button label 5.17:1.
+## Delivery
 
-## Icon refinement — 0.2.1
-- Product name: **Feather Task Manager**. Sidebar uses a two-line wordmark; title bar and Windows product metadata use the complete name.
-- Feather silhouette has a curved asymmetric vane, visible rachis, open barbs and extended quill. The same geometry is used in the sidebar and app icon.
-- Original SVG artwork lives in `assets/source`. Navigation uses a consistent 24×24 viewBox, 1.8-unit round strokes, square aspect ratio and vertically centered placement.
-- Tab glyphs: process list, performance pulse, startup power, service gear. Selected and unselected icons change tint without changing shape or stroke weight.
-- Build-time SVG rasterization emits coverage masks at 100/125/150/175/200/250/300/400% scale. Runtime GDI uses a bounded cache of premultiplied bitmaps; unusual DPI uses area-resampled coverage. No SVG/image engine is shipped.
-- Windows ICO embeds 16/20/24/32/40/48/64/128/256-pixel images. Native big/small window icons reload when DPI changes.
-- Regenerate artwork with `node scripts/generate-icons.cjs [absolute-path-to-sharp]`. Checked-in generated assets allow ordinary Rust builds without Node or Sharp.
+Released in 2026.9.3. Development checks never publish, sign, upload a release or change the Task Manager association; releases follow [SIGNING.md](../../SIGNING.md). README previews are rendered from the design prototype's simulated data, never from captures of a real PC.

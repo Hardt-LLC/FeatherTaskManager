@@ -29,6 +29,8 @@ pub struct Row {
     pub depth: usize,
     pub has_children: bool,
     pub expanded: bool,
+    /// Children shown under this row when expanded (after filtering).
+    pub children: usize,
 }
 
 /// Immutable, children-first identities captured before the confirmation dialog.
@@ -132,6 +134,17 @@ impl<'a> Tree<'a> {
         }
     }
 
+    /// The parent of `index` in the hierarchy (None for roots and unknown
+    /// indices).
+    pub fn parent(&self, index: usize) -> Option<usize> {
+        self.parents.get(index).copied().flatten()
+    }
+
+    /// The children of `index` (snapshot indices, in snapshot order).
+    pub fn children_of(&self, index: usize) -> &[usize] {
+        self.children.get(index).map_or(&[], Vec::as_slice)
+    }
+
     /// `sorted_indices` gives the desired sibling/root order, normally all
     /// snapshot indices sorted by the active column. Missing indices are appended
     /// in snapshot order; duplicates and out-of-range indices are ignored.
@@ -183,6 +196,7 @@ impl<'a> Tree<'a> {
                 depth,
                 has_children,
                 expanded,
+                children: children[index].len(),
             });
             if expanded {
                 stack.extend(
@@ -248,6 +262,8 @@ mod tests {
             working_set: 0,
             private_bytes: 0,
             io_bytes_per_sec: 0.0,
+            gpu_percent: None,
+            network_bytes_per_sec: None,
             threads: 1,
             handles: 0,
         }

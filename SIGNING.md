@@ -27,7 +27,7 @@ $env:FEATHER_SIGNING_SUBJECT = 'CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US'
 Create and push the matching tag after review, then publish with the prepared release notes:
 
 ```powershell
-./scripts/publish-release.ps1 -NotesFile ./releases/2026.9.2.md
+./scripts/publish-release.ps1 -NotesFile ./releases/2026.9.3.md
 ```
 
 Publishing requires clean tracked source at the exact local release tag, with that commit in `origin/main` history. Immediately before creating the release it resolves the target GitHub repository's tag, including annotated tags, and checks the remote commit matches the local source. It also checks hashes, signatures and the app loader policy, and refuses to overwrite a release. Only the three explicitly named versioned assets and their manifests are uploaded. Fetch current remote refs before publishing; tags should be protected against modification.

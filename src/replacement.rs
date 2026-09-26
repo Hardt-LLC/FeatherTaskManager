@@ -329,24 +329,21 @@ pub fn status() -> Result<Status, String> {
     Ok(state)
 }
 
-/// Called only by an explicit UI action, on the action worker rather than the UI thread.
-pub fn run_elevated(enable: bool) -> Result<(), String> {
-    let path = install_path()?;
-    // Pin every path component and the protected installed image until the
-    // elevated helper finishes. A portable EXE can be renamed while running;
-    // its current_exe() pathname is not a trusted source for an elevated launch.
-    let _installation = lock_existing_installation(&path).map_err(installation_required)?;
-    let file = wide(path.as_os_str());
+/// How [`runas_and_wait`] ended.
+enum Launch {
+    Exited(u32),
+    Cancelled,
+    StartFailed(std::io::Error),
+    NoProcess,
+    WaitFailed(std::io::Error),
+    ExitUnknown(std::io::Error),
+}
+
+/// Start `file` elevated (UAC "runas") with `parameters` and wait for it.
+fn runas_and_wait(file: &Path, parameters: &str) -> Launch {
+    let file = wide(file.as_os_str());
     let verb = wide("runas");
-    let parameters = wide(format!(
-        "{} --language {}",
-        if enable {
-            "--install-task-manager"
-        } else {
-            "--restore-task-manager"
-        },
-        crate::i18n::language().code()
-    ));
+    let parameters = wide(parameters);
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
@@ -357,39 +354,87 @@ pub fn run_elevated(enable: bool) -> Result<(), String> {
         ..Default::default()
     };
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
-        if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_CANCELLED as i32) {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_CANCELLED as i32) {
+            return Launch::Cancelled;
+        }
+        return Launch::StartFailed(error);
+    }
+    if info.hProcess.is_null() {
+        return Launch::NoProcess;
+    }
+    let process = Process(info.hProcess);
+    if unsafe { WaitForSingleObject(process.0, INFINITE) } != WAIT_OBJECT_0 {
+        return Launch::WaitFailed(std::io::Error::last_os_error());
+    }
+    let mut exit = 0;
+    if unsafe { GetExitCodeProcess(process.0, &mut exit) } == 0 {
+        return Launch::ExitUnknown(std::io::Error::last_os_error());
+    }
+    Launch::Exited(exit)
+}
+
+/// Called only by an explicit UI action, on the action worker rather than the UI thread.
+pub fn run_elevated(enable: bool) -> Result<(), String> {
+    let path = install_path()?;
+    // Pin every path component and the protected installed image until the
+    // elevated helper finishes. A portable EXE can be renamed while running;
+    // its current_exe() pathname is not a trusted source for an elevated launch.
+    let _installation = lock_existing_installation(&path).map_err(installation_required)?;
+    let parameters = format!(
+        "{} --language {}",
+        if enable {
+            "--install-task-manager"
+        } else {
+            "--restore-task-manager"
+        },
+        crate::i18n::language().code()
+    );
+    let context = |message: &str, error: std::io::Error| format!("{message}: {error}");
+    let exit = match runas_and_wait(&path, &parameters) {
+        Launch::Exited(exit) => exit,
+        Launch::Cancelled => {
             return Err(tr(
                 "관리자 권한 요청이 취소되어 연결 설정을 변경하지 않았습니다.",
                 "The administrator request was cancelled. The association was not changed.",
             )
-            .into());
+            .into())
         }
-        return Err(error(tr(
-            "관리자 권한으로 연결 설정을 실행할 수 없습니다",
-            "Cannot run the association setup as administrator",
-        )));
-    }
-    if info.hProcess.is_null() {
-        return Err(tr(
-            "연결 설정 프로세스를 확인할 수 없습니다.",
-            "Cannot verify the association setup process.",
-        )
-        .into());
-    }
-    let process = Process(info.hProcess);
-    if unsafe { WaitForSingleObject(process.0, INFINITE) } != WAIT_OBJECT_0 {
-        return Err(error(tr(
-            "연결 설정의 완료를 확인할 수 없습니다",
-            "Cannot verify that the association setup completed",
-        )));
-    }
-    let mut exit = 0;
-    if unsafe { GetExitCodeProcess(process.0, &mut exit) } == 0 {
-        return Err(error(tr(
-            "연결 설정 결과를 확인할 수 없습니다",
-            "Cannot read the association setup result",
-        )));
-    }
+        Launch::StartFailed(error) => {
+            return Err(context(
+                tr(
+                    "관리자 권한으로 연결 설정을 실행할 수 없습니다",
+                    "Cannot run the association setup as administrator",
+                ),
+                error,
+            ))
+        }
+        Launch::NoProcess => {
+            return Err(tr(
+                "연결 설정 프로세스를 확인할 수 없습니다.",
+                "Cannot verify the association setup process.",
+            )
+            .into())
+        }
+        Launch::WaitFailed(error) => {
+            return Err(context(
+                tr(
+                    "연결 설정의 완료를 확인할 수 없습니다",
+                    "Cannot verify that the association setup completed",
+                ),
+                error,
+            ))
+        }
+        Launch::ExitUnknown(error) => {
+            return Err(context(
+                tr(
+                    "연결 설정 결과를 확인할 수 없습니다",
+                    "Cannot read the association setup result",
+                ),
+                error,
+            ))
+        }
+    };
     if exit != 0 {
         return Err(
             tr("연결 설정을 완료하지 못했습니다. 관리자 창에 표시된 오류를 확인하세요.", "The association setup did not complete. Check the error shown in the administrator window.").into(),
@@ -412,6 +457,106 @@ pub fn run_elevated(enable: bool) -> Result<(), String> {
             "Another application changed the association. Check its current state again.",
         )
         .into())
+    }
+}
+
+/// How an elevated helper run from the installed image ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HelperLaunch {
+    Exited(u32),
+    /// The UAC prompt was declined.
+    Cancelled,
+}
+
+/// Run the protected installed image elevated with `arguments` (plus the UI
+/// language) and wait for its exit code, like the association helpers: the
+/// same pinned Program Files image, never a portable current_exe(). It must
+/// be this very build, byte for byte, so an older installation (which would
+/// open its UI for an argument it does not know) is never started. Worker
+/// thread only.
+pub fn run_installed_helper(arguments: &str) -> Result<HelperLaunch, String> {
+    let path = install_path()?;
+    let _installation = lock_existing_installation(&path).map_err(helper_installation_required)?;
+    if !same_build(&path)? {
+        return Err(tr(
+            "설치된 Feather Task Manager가 이 실행 파일과 다른 버전입니다. 같은 버전을 설치하거나 Feather를 관리자 권한으로 실행하세요.",
+            "The installed Feather Task Manager is a different build from this one. Install this version, or run Feather as administrator.",
+        )
+        .into());
+    }
+    let parameters = format!("{arguments} --language {}", crate::i18n::language().code());
+    match runas_and_wait(&path, &parameters) {
+        Launch::Exited(code) => Ok(HelperLaunch::Exited(code)),
+        Launch::Cancelled => Ok(HelperLaunch::Cancelled),
+        Launch::StartFailed(error) | Launch::WaitFailed(error) | Launch::ExitUnknown(error) => {
+            Err(crate::trf!(
+                "관리자 도우미를 실행하지 못했습니다: {}",
+                "Cannot run the administrator helper: {}",
+                error
+            ))
+        }
+        Launch::NoProcess => Err(tr(
+            "관리자 도우미 프로세스를 확인할 수 없습니다.",
+            "Cannot verify the administrator helper process.",
+        )
+        .into()),
+    }
+}
+
+fn helper_installation_required(detail: String) -> String {
+    crate::trf!(
+        "관리자 작업에는 설치된 Feather Task Manager가 필요합니다(또는 Feather를 관리자 권한으로 실행하세요). 보호된 설치 파일을 확인할 수 없습니다: {detail}",
+        "Administrator steps need the installed Feather Task Manager (or run Feather as administrator). The protected installed executable could not be verified: {detail}"
+    )
+}
+
+/// Whether the installed image is the running build: the same file, or a
+/// byte-identical copy of it.
+fn same_build(installed: &Path) -> Result<bool, String> {
+    use std::io::Read;
+    let unreadable = |error: std::io::Error| {
+        crate::trf!(
+            "실행 파일을 비교할 수 없습니다: {}",
+            "Cannot compare the executables: {}",
+            error
+        )
+    };
+    let current = std::env::current_exe().map_err(unreadable)?;
+    let mut ours = File::open(&current).map_err(unreadable)?;
+    let mut theirs = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(installed)
+        .map_err(unreadable)?;
+    let identity = |file: &File| {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        (unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0).then_some((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+            (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+        ))
+    };
+    let (Some(a), Some(b)) = (identity(&ours), identity(&theirs)) else {
+        return Err(unreadable(std::io::Error::last_os_error()));
+    };
+    if a == b {
+        return Ok(true);
+    }
+    if a.3 != b.3 {
+        return Ok(false);
+    }
+    let (mut left, mut right) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let n = ours.read(&mut left).map_err(unreadable)?;
+        if n == 0 {
+            // Equal sizes: the other file must end here too.
+            return Ok(theirs.read(&mut right[..1]).map_err(unreadable)? == 0);
+        }
+        theirs.read_exact(&mut right[..n]).map_err(unreadable)?;
+        if left[..n] != right[..n] {
+            return Ok(false);
+        }
     }
 }
 

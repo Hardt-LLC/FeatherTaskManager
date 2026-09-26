@@ -3,7 +3,9 @@
 //! pixels from the desktop or another application's window.
 
 use super::*;
-use std::fs::File;
+// Preview files are created like every diagnostic output: never through a
+// link planted in the preview folder (`--render-previews` may run elevated).
+use crate::create_output_file;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -32,6 +34,12 @@ pub(super) unsafe fn save_client(p: *mut App, path: &Path) -> Result<(), String>
         .bottom
         .checked_sub(rect.top)
         .ok_or("Invalid preview height")?;
+    // A preview is a settled state: running tweens (a page switch's nav
+    // slide, hover fades) jump to their end — no message loop ticks them
+    // here. Stage a mid-animation state with `anim.set` instead.
+    (*p).anim.finish_all();
+    table::settle((*p).list);
+    table::settle((*p).perf_list);
     let surface = Surface::new(width, height)?;
     // Initialize every pixel, including pixels outside any native child's paint
     // region. Root WM_PRINTCLIENT paints the real app background over this.
@@ -47,14 +55,14 @@ pub(super) unsafe fn save_client(p: *mut App, path: &Path) -> Result<(), String>
     for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
         pixel[3] = 255;
     }
-    let file = File::create(path).map_err(|error| format!("Create preview: {error}"))?;
+    let file = create_output_file(path).map_err(|error| format!("Create preview: {error}"))?;
     let mut output = BufWriter::new(file);
     write_bmp(&mut output, width, height, pixels)
         .and_then(|()| output.flush())
         .map_err(|error| format!("Write preview: {error}"))
 }
 
-unsafe fn paint_client_and_children(hwnd: HWND, dc: HDC) -> Result<(), String> {
+pub(super) unsafe fn paint_client_and_children(hwnd: HWND, dc: HDC) -> Result<(), String> {
     let saved = SaveDC(dc);
     if saved == 0 {
         return Err(win32_error("SaveDC root"));
@@ -108,72 +116,9 @@ unsafe fn paint_client_and_children(hwnd: HWND, dc: HDC) -> Result<(), String> {
         if print_state != 0 {
             RestoreDC(dc, print_state);
         }
-        print_combo_selection(child, dc);
         RestoreDC(dc, saved);
     }
     Ok(())
-}
-
-unsafe fn print_combo_selection(hwnd: HWND, dc: HDC) {
-    let mut class = [0u16; 32];
-    let class_len = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
-    if class_len <= 0
-        || !String::from_utf16_lossy(&class[..class_len as usize]).eq_ignore_ascii_case("ComboBox")
-        || GetWindowLongW(hwnd, GWL_STYLE) as u32 & 3 != CBS_DROPDOWNLIST as u32
-    {
-        return;
-    }
-    // A hidden CBS_DROPDOWNLIST paints its border/arrow for WM_PRINT but may
-    // omit the selected field. Render that field from the control's actual
-    // selection, font and native item rectangle; do not substitute app data.
-    let selected = SendMessageW(hwnd, CB_GETCURSEL, 0, 0);
-    if selected < 0 {
-        return;
-    }
-    let length = SendMessageW(hwnd, CB_GETLBTEXTLEN, selected as usize, 0);
-    if !(0..=2048).contains(&length) {
-        return;
-    }
-    let mut text = vec![0u16; length as usize + 1];
-    if SendMessageW(
-        hwnd,
-        CB_GETLBTEXT,
-        selected as usize,
-        text.as_mut_ptr() as LPARAM,
-    ) < 0
-    {
-        return;
-    }
-    let mut info = COMBOBOXINFO {
-        cbSize: size_of::<COMBOBOXINFO>() as u32,
-        ..zeroed()
-    };
-    if GetComboBoxInfo(hwnd, &mut info) == 0 {
-        return;
-    }
-    let mut item = info.rcItem;
-    FillRect(dc, &item, GetSysColorBrush(COLOR_WINDOW));
-    item.left += 2;
-    let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT;
-    if !font.is_null() {
-        SelectObject(dc, font);
-    }
-    SetBkMode(dc, TRANSPARENT as i32);
-    SetTextColor(
-        dc,
-        GetSysColor(if IsWindowEnabled(hwnd) == 0 {
-            COLOR_GRAYTEXT
-        } else {
-            COLOR_WINDOWTEXT
-        }),
-    );
-    DrawTextW(
-        dc,
-        text.as_ptr(),
-        length as i32,
-        &mut item,
-        DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
-    );
 }
 
 struct Surface {
@@ -282,6 +227,221 @@ fn write_bmp(
     output.write_all(&0u32.to_le_bytes())?; // Color table entries.
     output.write_all(&0u32.to_le_bytes())?; // Important colors.
     output.write_all(pixels)
+}
+
+/// Foundation previews for review: the component gallery (light, dark,
+/// 150 %), font specimens for both languages and a layered popup with its
+/// soft shadow composited over the window background.
+pub(super) unsafe fn save_foundation_previews(dir: &Path) -> Result<(), String> {
+    use super::theme::{DARK_PALETTE, LIGHT};
+    use super::widgets::{gallery, Painter, GALLERY_DIP};
+    for (dpi, palette, name) in [
+        (96, LIGHT, "components-light.bmp"),
+        (96, DARK_PALETTE, "components-dark.bmp"),
+        (144, LIGHT, "components-dpi150.bmp"),
+    ] {
+        let fonts = fonts::Fonts::new(dpi, language());
+        let mut dib = gfx::Dib::new(
+            gfx::pxi(dpi, GALLERY_DIP.0 as f32),
+            gfx::pxi(dpi, GALLERY_DIP.1 as f32),
+        )
+        .ok_or("Gallery surface allocation failed")?;
+        {
+            let pt = Painter::new(dib.dc(), dpi, &fonts).with_palette(palette);
+            gallery(&pt);
+        }
+        save_dib(&mut dib, &dir.join(name))?;
+    }
+    for (lang, name) in [
+        (Language::English, "fonts-en.bmp"),
+        (Language::Korean, "fonts-ko.bmp"),
+    ] {
+        let mut dib = gfx::Dib::new(900, 560).ok_or("Specimen allocation failed")?;
+        font_specimen(&mut dib, lang);
+        save_dib(&mut dib, &dir.join(name))?;
+    }
+    for (palette, name) in [(LIGHT, "popup-light.bmp"), (DARK_PALETTE, "popup-dark.bmp")] {
+        let mut dib = popup_sample(palette, 96).ok_or("Popup sample failed")?;
+        save_dib(&mut dib, &dir.join(name))?;
+    }
+    Ok(())
+}
+
+/// Every font role with its resolved family, in one language.
+unsafe fn font_specimen(dib: &mut gfx::Dib, lang: Language) {
+    use super::fonts::{resolve, Fonts, Role};
+    use super::theme::LIGHT;
+    use super::widgets::Painter;
+    let fonts = Fonts::new(96, lang);
+    let pt = Painter::new(dib.dc(), 96, &fonts).with_palette(LIGHT);
+    pt.fill(
+        RECT {
+            left: 0,
+            top: 0,
+            right: dib.width(),
+            bottom: dib.height(),
+        },
+        LIGHT.surface,
+    );
+    let korean = lang == Language::Korean;
+    let mut y = 8;
+    for role in Role::ALL {
+        let (family, weight) = resolve(role, lang);
+        let (_, size, _) = role.spec();
+        let sample = match (role, korean) {
+            (Role::MonoCell | Role::MonoTotal | Role::MonoStat, _) => "1,410.4 MB  30.1%  0.4 MB/s",
+            (Role::MonoSmall, true) => "568개 프로세스 · CPU 26.7%",
+            (Role::MonoSmall, false) => "568 processes · CPU 26.7%",
+            (Role::MonoTiny, _) => "Ctrl K  564",
+            (Role::MonoBadge, _) => "GC VS FT",
+            (_, true) => "프로세스 성능 시작 앱 서비스 설정 · Processes",
+            (_, false) => "Processes Performance Startup apps · 0123",
+        };
+        pt.label(
+            fonts.small,
+            LIGHT.muted,
+            &format!("{role:?} {size}px → {family} {weight}"),
+            RECT {
+                left: 8,
+                top: y,
+                right: 330,
+                bottom: y + 30,
+            },
+            DT_LEFT,
+        );
+        pt.label(
+            fonts.get(role),
+            LIGHT.fg,
+            sample,
+            RECT {
+                left: 336,
+                top: y,
+                right: 892,
+                bottom: y + 30,
+            },
+            DT_LEFT,
+        );
+        y += 32;
+    }
+}
+
+/// A context-menu-like layered popup composed with `gfx::LayeredSurface`
+/// and alpha-blended over the window background (as DWM would show it).
+unsafe fn popup_sample(palette: theme::Palette, dpi: i32) -> Option<gfx::Dib> {
+    use super::widgets::{kbd, Painter};
+    let fonts = fonts::Fonts::new(dpi, language());
+    let s = |v: i32| gfx::pxi(dpi, v as f32);
+    let layers = gfx::popup_shadow(dpi);
+    let mut surface = gfx::LayeredSurface::new(s(208), s(4 + 32 * 4 + 9 + 4), &layers)?;
+    let content = surface.content();
+    surface.fill_frame(
+        palette.surface,
+        palette.border,
+        gfx::px(dpi, theme::RADIUS),
+        gfx::hairline(dpi),
+    );
+    {
+        let pt = Painter::new(surface.dc(), dpi, &fonts).with_palette(palette);
+        let items = [
+            ("End task", Some("Del"), true, false),
+            ("Efficiency mode", None, false, false),
+            ("Open file location", None, false, true),
+        ];
+        let mut y = content.top + s(4);
+        for (i, (text, hint, hot, disabled)) in items.into_iter().enumerate() {
+            let item = RECT {
+                left: content.left + s(4),
+                top: y,
+                right: content.right - s(4),
+                bottom: y + s(32),
+            };
+            if hot {
+                pt.canvas.fill_round_rect(
+                    gfx::RectF::from_rect(item),
+                    pt.px(theme::RADIUS_SM),
+                    theme::solid(palette.fg_sel),
+                );
+            }
+            pt.label(
+                fonts.ui,
+                if disabled { palette.muted } else { palette.fg },
+                text,
+                RECT {
+                    left: item.left + s(10),
+                    ..item
+                },
+                DT_LEFT,
+            );
+            if let Some(hint) = hint {
+                kbd(&pt, item.right - s(10), (item.top + item.bottom) / 2, hint);
+            }
+            y += s(32);
+            if i == 1 {
+                pt.fill(
+                    RECT {
+                        left: content.left + s(4),
+                        top: y + s(4),
+                        right: content.right - s(4),
+                        bottom: y + s(4) + gfx::hairline(dpi) as i32,
+                    },
+                    palette.border,
+                );
+                y += s(9);
+            }
+        }
+        pt.label(
+            fonts.ui,
+            palette.fg,
+            "Copy PID",
+            RECT {
+                left: content.left + s(14),
+                top: y,
+                right: content.right - s(14),
+                bottom: y + s(32),
+            },
+            DT_LEFT,
+        );
+        kbd(&pt, content.right - s(14), y + s(16), "4812");
+    }
+    surface.compose(gfx::px(dpi, theme::RADIUS), palette.shadow());
+    let size = surface.size();
+    let mut output = gfx::Dib::new(size.cx + s(40), size.cy + s(40))?;
+    output
+        .pixels()
+        .fill(0xff00_0000 | theme::solid(palette.bg).0);
+    GdiAlphaBlend(
+        output.dc(),
+        s(20),
+        s(20),
+        size.cx,
+        size.cy,
+        surface.dc(),
+        0,
+        0,
+        size.cx,
+        size.cy,
+        BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        },
+    );
+    Some(output)
+}
+
+/// Save a foundation DIB (gallery, specimen, popup previews) as an opaque BMP.
+pub(super) fn save_dib(dib: &mut gfx::Dib, path: &Path) -> Result<(), String> {
+    let (width, height) = (dib.width(), dib.height());
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in dib.pixels().iter() {
+        pixels.extend_from_slice(&(pixel | 0xff00_0000).to_le_bytes());
+    }
+    let file = create_output_file(path).map_err(|error| format!("Create preview: {error}"))?;
+    let mut output = BufWriter::new(file);
+    write_bmp(&mut output, width, height, &pixels)
+        .and_then(|()| output.flush())
+        .map_err(|error| format!("Write preview: {error}"))
 }
 
 fn win32_error(operation: &str) -> String {

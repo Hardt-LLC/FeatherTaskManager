@@ -9,3 +9,21 @@
 *.log
 .vs/
 .vscode/
+
+# Signing material and cloud credentials never belong in the repository
+*.pfx
+*.p12
+*.pem
+*.key
+*.pvk
+*.snk
+*.publishsettings
+.azure/
+installer/signing-metadata.local.json
+
+# Raw captures of a real PC (process, service and startup lists)
+*.bmp
+
+# Local tool and OS state
+.idea/
+Thumbs.db
