@@ -1,40 +1,57 @@
 <p align="center"><img src="assets/app.png" width="112" height="112" alt="Feather Task Manager feather icon"></p>
 
-# Feather Task Manager 2026.9.1
+# Feather Task Manager
 
 [한국어](README.md) · [Download](https://github.com/Hardt-LLC/FeatherTaskManager/releases/latest)
 
-A small native Windows task manager built with Rust and Win32. No browser engine, WebView or WMI. Supports Windows 10/11 x64 without a separate Rust or Visual C++ runtime installation.
+A lightweight Windows task manager built with Rust and Win32. Supports Windows 10/11 x64.
 
-## Install or run portable
+## Benefits
 
-Choose **Setup-x64.exe** to install into Program Files with a Start menu shortcut and an uninstaller, or **Portable-x64.exe** to run directly. The optional portable ZIP includes recovery instructions and scripts. Release executables use Azure Artifact Signing; compare downloaded checksums with `SHA256SUMS.txt`.
+- **Native and lightweight** — no browser engine or separate runtime to install. Collection pauses when minimized.
+- **Flexible process views** — switch between a list and a process tree, search processes, and end a task or an entire tree.
+- **System overview** — monitor CPU, memory, disk and network, manage startup apps, and start or stop services.
+- **English and Korean** — switch languages immediately from Settings.
+- **Optional Task Manager replacement** — launch Feather through the familiar Windows shortcuts.
 
-Select **Settings → English / 한국어** to switch languages immediately. Your choice is saved per user; the initial default follows the Windows display language. `--language en` and `--language ko` override it for one launch without changing the saved preference.
+## Install and use
 
-## Processes and performance
+Download the latest version from [Releases](https://github.com/Hardt-LLC/FeatherTaskManager/releases/latest):
 
-- Switch the Processes view between **List** and **Process tree**. Expand or collapse branches with their arrows or the left/right arrow keys. Search keeps the matching process and its ancestor path visible; sorting applies within each sibling group.
-- **End task** ends one process after confirmation. **End tree** (`Shift+Delete`) targets the selected process and descendants captured before confirmation, children first. PID and creation time are verified and handles retained. System, critical and Feather's own processes are protected. Preflight failures abort before any termination; later failures are reported with counts.
-- New descendants created after confirmation are excluded. Restarting services or applications may launch replacement processes. Termination can discard unsaved work.
-- Performance shows CPU, memory, disk and network history with GPU summaries where Windows provides counters. Startup apps and Services offer explicit supported management actions.
+| Download | Use |
+| --- | --- |
+| **Setup-x64.exe** | Install with a Start menu shortcut and an uninstaller. |
+| **Portable-x64.exe** | Run directly without installation. |
+| **Portable-x64.zip** | Portable app, documentation and recovery script. |
 
-`Ctrl+1…4` switches pages, `Ctrl+F` focuses search, `F5` refreshes, `Space` pauses/resumes while the list is focused, and `Ctrl+L` reveals a process executable. Collection pauses when minimized. The default refresh interval is one second.
+Release executables and installers are signed by **HARDT** through Azure Artifact Signing.
 
-## Replace Windows Task Manager
+- Open **Processes** to choose **List** or **Process tree**. Select a process to end it or its tree after confirmation.
+- Open **Performance**, **Startup apps** or **Services** for monitoring and management.
+- Select **Settings → English / 한국어** to save your preferred language.
+- To replace Windows Task Manager, select **Settings → Use Feather as Task Manager…** and approve the administrator prompt. This enables `Ctrl+Shift+Esc` and `Ctrl+Alt+Delete → Task Manager`. Select **Restore Windows Task Manager…** before manually deleting the app.
 
-Choose **Settings → Use Feather as Task Manager…** and approve UAC. This copies the executable into the fixed Program Files directory and registers it for all users. Subsequent `Ctrl+Alt+Delete → Task Manager`, `Ctrl+Shift+Esc` and `taskmgr.exe` launches use Feather. Installation alone does not enable this setting, and other applications' associations are preserved.
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+1…4` | Switch pages |
+| `Ctrl+F` | Search |
+| `F5` | Refresh |
+| `Shift+Delete` | Confirm ending the selected process tree |
 
-Restore with **Settings → Restore Windows Task Manager…** before manually deleting installed files. The uninstaller restores an exact Feather association before deleting the app and stops if recovery cannot be completed safely. Close all Feather windows before updating or uninstalling.
+Close all Feather windows before updating or uninstalling. See the [installation guide](INSTALLER.md) and [feature guide](FEATURES-v2.md) for details.
 
-If the executable has already been deleted, run the included `Restore-WindowsTaskManager.ps1` from an administrator 64-bit PowerShell window. The script removes only Feather's exact registration and preserves unrelated settings.
+## Build from source
 
-## Build, validation and limitations
+Requires Windows, Rust with the `x86_64-pc-windows-msvc` toolchain, Visual Studio **C++ Build Tools**, and the **Windows SDK**.
 
-Use Rust `x86_64-pc-windows-msvc`, Visual Studio C++ Build Tools and Windows SDK: `cargo build --release --locked`. `scripts/build.ps1` packages a local build. Signed installer/release instructions are in [SIGNING.md](SIGNING.md).
+```powershell
+git clone https://github.com/Hardt-LLC/FeatherTaskManager.git
+cd FeatherTaskManager
+cargo build --release --locked
+```
 
-Versions use `yyyy.m.x`; `x` increments for each release in the same month. See [VALIDATION.md](VALIDATION.md) and [BENCHMARK.md](BENCHMARK.md) for checks and measurement limits. A short hidden-window benchmark does not measure first paint, worst-case load or a direct comparison with Windows Task Manager.
+Run `target\release\FeatherTaskManager.exe`. For signed installers and release packaging, see [SIGNING.md](SIGNING.md).
 
-This app does not implement every Windows Task Manager feature: packaged StartupTask entries, scheduled tasks, startup impact, service configuration and detailed per-GPU graphs are outside the current scope. NT process structures and StartupApproved formats may change with Windows releases. Unknown states remain read-only.
+## License
 
-MIT license. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+[MIT](LICENSE). Third-party licenses are listed in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) and [RUST_LIBRARY_NOTICES.html](RUST_LIBRARY_NOTICES.html).
