@@ -1,0 +1,127 @@
+{
+  "measuredDate": "2026-09-28",
+  "branch": "codex/high-priority-controls",
+  "page": "processes",
+  "windowStyle": "Hidden",
+  "iterations": 3,
+  "sampleSecondsPerRun": 5,
+  "startupObservationLimitSeconds": 10,
+  "logicalProcessors": 16,
+  "operatingSystem": "Microsoft Windows NT 10.0.26200.0",
+  "refreshMsStored": 1000,
+  "elevated": false,
+  "processColumns": "Default seven; optional metadata columns disabled",
+  "baseline": {
+    "sha256": "473e3dc02c350200025206fddcf6c45dff9d1ea91f6732cff337842aec8d978b",
+    "sizeBytes": 1890816,
+    "provenance": "Previously validated bc3ec94 release binary; hash matches the previous validation record."
+  },
+  "candidate": {
+    "sha256": "fc2d7f332ae270641b54d73a39a48649ee6ce4f8479607227d8ed52a9d98726e",
+    "sizeBytes": 2029056,
+    "provenance": "Final cargo build --release --locked --offline including canonical device order and hidden-column sort fixes."
+  },
+  "status": "within-budget",
+  "comparisons": [
+    {
+      "page": "processes",
+      "metric": "cpuPercentNormalized",
+      "unit": "percentage points",
+      "baseline": {
+        "count": 3,
+        "median": 0.0583,
+        "mad": 0.0172
+      },
+      "candidate": {
+        "count": 3,
+        "median": 0.077,
+        "mad": 0.00010000000000000286
+      },
+      "delta": 0.0187,
+      "threshold": 0.1,
+      "noiseAllowance": 0.0516,
+      "verdict": "within-budget"
+    },
+    {
+      "page": "processes",
+      "metric": "sampledMaxWorkingSetBytes",
+      "unit": "bytes",
+      "baseline": {
+        "count": 3,
+        "median": 26226688,
+        "mad": 12288
+      },
+      "candidate": {
+        "count": 3,
+        "median": 26693632,
+        "mad": 45056
+      },
+      "delta": 466944,
+      "threshold": 2622668.8000000003,
+      "noiseAllowance": 135168,
+      "verdict": "within-budget"
+    },
+    {
+      "page": "processes",
+      "metric": "sampledMaxPrivateBytes",
+      "unit": "bytes",
+      "baseline": {
+        "count": 3,
+        "median": 11595776,
+        "mad": 45056
+      },
+      "candidate": {
+        "count": 3,
+        "median": 11837440,
+        "mad": 8192
+      },
+      "delta": 241664,
+      "threshold": 2097152,
+      "noiseAllowance": 135168,
+      "verdict": "within-budget"
+    },
+    {
+      "page": "processes",
+      "metric": "sampledMaxHandleCount",
+      "unit": "handles",
+      "baseline": {
+        "count": 3,
+        "median": 276,
+        "mad": 0
+      },
+      "candidate": {
+        "count": 3,
+        "median": 290,
+        "mad": 0
+      },
+      "delta": 14,
+      "threshold": 27.6,
+      "noiseAllowance": 0,
+      "verdict": "within-budget"
+    },
+    {
+      "page": "processes",
+      "metric": "startupTimeToInputIdleMs",
+      "unit": "milliseconds",
+      "baseline": {
+        "count": 3,
+        "median": 40.91,
+        "mad": 0.7899999999999991
+      },
+      "candidate": {
+        "count": 3,
+        "median": 39.65,
+        "mad": 0.9399999999999977
+      },
+      "delta": -1.259999999999998,
+      "threshold": 30,
+      "noiseAllowance": 2.819999999999993,
+      "verdict": "within-budget"
+    }
+  ],
+  "limitations": [
+    "Short hidden Processes observation; does not measure visible dragging, all optional columns, cold startup, or long-term leaks.",
+    "Existing baseline executable was copied before implementation and measured in this workspace under the same settings.",
+    "Within-budget means no material regression under the configured thresholds; it is not evidence of an improvement."
+  ]
+}

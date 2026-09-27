@@ -49,8 +49,11 @@ mod layout;
 mod navigation;
 mod nuclear;
 mod paint;
+mod perf_order;
 mod popup;
 mod preferences;
+mod process_columns;
+mod run_task;
 mod scroll;
 mod shell;
 mod table;
@@ -173,6 +176,7 @@ struct HistoryPoint {
     network: f64,
 }
 enum Command {
+    Metadata(crate::process_metadata::Needs),
     /// Sampling interval and pause state. Every page samples the performance
     /// counters too (see `monitor`), so there is no per-page switch.
     Configure {
@@ -204,12 +208,20 @@ struct GroupTotal {
     io: f64,
     network: Option<f64>,
     gpu: Option<f64>,
+    gpu_dedicated: Option<u64>,
+    gpu_shared: Option<u64>,
+    cpu_time: u64,
+    threads: u32,
+    handles: u32,
+    private_bytes: u64,
 }
 impl GroupTotal {
     /// Sum `processes` (an app's root and members).
     fn of<'a>(processes: impl IntoIterator<Item = &'a Process>) -> Self {
         let mut total = Self {
             io: f64::NAN,
+            gpu_dedicated: Some(0),
+            gpu_shared: Some(0),
             ..Self::default()
         };
         let add = |sum: Option<f64>, value: Option<f64>| match (sum, value) {
@@ -225,6 +237,18 @@ impl GroupTotal {
             }
             total.network = add(total.network, process.network_bytes_per_sec);
             total.gpu = add(total.gpu, process.gpu_percent);
+            total.gpu_dedicated = total
+                .gpu_dedicated
+                .zip(process.gpu_dedicated_bytes)
+                .map(|(a, b)| a.saturating_add(b));
+            total.gpu_shared = total
+                .gpu_shared
+                .zip(process.gpu_shared_bytes)
+                .map(|(a, b)| a.saturating_add(b));
+            total.cpu_time = total.cpu_time.saturating_add(process.cpu_time_100ns);
+            total.threads = total.threads.saturating_add(process.threads);
+            total.handles = total.handles.saturating_add(process.handles);
+            total.private_bytes = total.private_bytes.saturating_add(process.private_bytes);
         }
         total.gpu = total.gpu.map(|v| v.min(100.0));
         total
@@ -235,6 +259,12 @@ impl GroupTotal {
         process.io_bytes_per_sec = self.io;
         process.network_bytes_per_sec = self.network;
         process.gpu_percent = self.gpu;
+        process.gpu_dedicated_bytes = self.gpu_dedicated;
+        process.gpu_shared_bytes = self.gpu_shared;
+        process.cpu_time_100ns = self.cpu_time;
+        process.threads = self.threads;
+        process.handles = self.handles;
+        process.private_bytes = self.private_bytes;
     }
 }
 /// The per-process network availability of the latest sample.
@@ -251,7 +281,8 @@ enum Action {
     /// Service key and display name (the toast names the service).
     Restart(String, String),
     SystemTool(crate::actions::SystemTool),
-    RunTask(String),
+    RunTask(crate::actions::TaskLaunch),
+    RestartExplorer(u32, u64),
     EndTree(TerminationPlan),
     Reveal(u32, u64),
     Properties(u32, u64),
@@ -298,12 +329,14 @@ enum ErrorSource {
     Action,
 }
 struct App {
+    metadata_needs: crate::process_metadata::Needs,
     persist_preferences: bool,
     palette: HWND,
     prefs: Preferences,
     /// The preferences as this window last read or saved them: a save
     /// writes only the values changed since (`Preferences::save`).
     stored_prefs: Preferences,
+    process_columns: process_columns::Config,
     preference_controls: Vec<HWND>,
     tray_visible: bool,
     replacement_active: bool,
@@ -359,6 +392,7 @@ struct App {
     perf_history: PerfHistory,
     perf_target: PerfTarget,
     perf_targets: Vec<PerfTarget>,
+    perf_order: perf_order::Order,
     core_graphs: bool,
     category: usize,
     process_settings: Option<crate::actions::ProcessSettings>,
@@ -428,10 +462,12 @@ impl App {
         results: Receiver<JobResult>,
     ) -> Self {
         Self {
+            metadata_needs: Default::default(),
             persist_preferences: false,
             palette: null_mut(),
             prefs: Preferences::default(),
             stored_prefs: Preferences::default(),
+            process_columns: process_columns::Config::default(),
             preference_controls: Vec::new(),
             tray_visible: false,
             replacement_active: false,
@@ -479,6 +515,7 @@ impl App {
             perf_history: PerfHistory::default(),
             perf_target: PerfTarget::Cpu,
             perf_targets: vec![PerfTarget::Cpu, PerfTarget::Memory],
+            perf_order: perf_order::Order::default(),
             core_graphs: false,
             category: 0,
             process_settings: None,
@@ -604,9 +641,11 @@ pub fn run() {
         let (complete, results) = mpsc::channel();
         let p = Box::into_raw(Box::new(App::new(rx, tx, jobs, results)));
         (*p).persist_preferences = true;
+        (*p).perf_order = perf_order::Order::load();
         (*p).group_mode = true;
         (*p).stored_prefs = prefs.clone();
         (*p).prefs = prefs;
+        (*p).process_columns = process_columns::Config::load();
         (*p).interval = (*p).prefs.rate;
         (*p).topmost = (*p).prefs.topmost;
         (*p).prefs.apply_theme();
@@ -737,6 +776,8 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
     // thread returns on Stop.
     let mut gpu_tracker = ProcessGpuTracker::default();
     let mut network = NetworkMonitor::new();
+    let mut metadata = crate::process_metadata::Client::default();
+    let mut metadata_needs = crate::process_metadata::Needs::default();
     let mut interval = 1000;
     let mut paused = false;
     let mut refresh = true;
@@ -749,10 +790,13 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
             if sampler.is_err() {
                 sampler = Sampler::new();
             }
-            let snapshot = match &mut sampler {
+            let mut snapshot = match &mut sampler {
                 Ok(s) => s.sample(),
                 Err(e) => Err(e.clone()),
             };
+            if let Ok(snapshot) = &mut snapshot {
+                metadata.decorate(&mut snapshot.processes, metadata_needs);
+            }
             if perf.is_none() {
                 match PerfSampler::new() {
                     Ok(s) => perf = Some(s),
@@ -812,6 +856,10 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
             commands.recv_timeout(last.map_or(period, |at| period.saturating_sub(at.elapsed())))
         };
         match result {
+            Ok(Command::Metadata(needs)) => {
+                metadata_needs = needs;
+                refresh = false;
+            }
             Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(Command::Configure {
                 interval: i,
@@ -960,10 +1008,19 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
                         Page::Performance,
                         tr("Windows 도구를 열었습니다.", "Opened the Windows tool.").into(),
                     ),
-                    Action::RunTask(path) => (
-                        crate::actions::launch_task(&path),
+                    Action::RunTask(task) => (
+                        crate::actions::launch_task(&task, hwnd),
                         Page::Processes,
                         tr("새 작업을 실행했습니다.", "Started the new task.").into(),
+                    ),
+                    Action::RestartExplorer(pid, created) => (
+                        crate::actions::restart_explorer(pid, created),
+                        Page::Processes,
+                        tr(
+                            "Windows 탐색기를 다시 시작했습니다.",
+                            "Restarted Windows Explorer.",
+                        )
+                        .into(),
                     ),
                     Action::End(pid, created) => (
                         crate::actions::terminate(pid, created),
@@ -1528,6 +1585,7 @@ unsafe fn create_controls(p: *mut App) {
         PERF_COMPONENT,
         tr("하드웨어 구성 요소", "Hardware components"),
     );
+    perf_order::install((*p).perf_list, p);
     (*p).list = table::create_table(p, 200, tr("프로세스 목록", "Process list"));
     SetWindowSubclass(
         (*p).search,
@@ -1642,6 +1700,9 @@ fn columns(page: Page) -> Vec<(&'static str, i32, bool)> {
 /// when space runs out).
 unsafe fn shown_columns(p: *mut App) -> Vec<table::Column> {
     let page = (*p).page;
+    if page == Page::Processes {
+        return (*p).process_columns.columns();
+    }
     let mut all = columns(page);
     if page == Page::Services && view_split(p, &current_layout(p)).2.is_some() {
         all.truncate(4);
@@ -1666,6 +1727,14 @@ unsafe fn sync_columns(p: *mut App) {
     }
 }
 unsafe fn setup_columns(p: *mut App) {
+    // Loaded layouts and page changes must never sort by a hidden column.
+    if (*p).page == Page::Processes
+        && !process_columns::ProcessColumn::from_id((*p).sort)
+            .is_some_and(|column| (*p).process_columns.contains(column))
+    {
+        (*p).sort = process_columns::ProcessColumn::Name as usize;
+        (*p).descending = false;
+    }
     table::set_columns((*p).list, shown_columns(p));
     // The placeholder is painted by the search subclass in the design's
     // muted color, focused or not; the cue banner (never drawn: wParam 0
@@ -2096,6 +2165,20 @@ unsafe fn order_tabs(p: *mut App) {
     }
 }
 unsafe fn configure(p: *mut App) {
+    use process_columns::ProcessColumn;
+    let needs = if (*p).page == Page::Processes && !((*p).paused || (*p).minimized || (*p).modal) {
+        crate::process_metadata::Needs {
+            user: (*p).process_columns.contains(ProcessColumn::User),
+            command_line: (*p).process_columns.contains(ProcessColumn::CommandLine),
+            status: (*p).process_columns.contains(ProcessColumn::Status),
+        }
+    } else {
+        Default::default()
+    };
+    if needs != (*p).metadata_needs {
+        (*p).metadata_needs = needs;
+        let _ = (*p).tx.send(Command::Metadata(needs));
+    }
     if (*p).paused || (*p).minimized || (*p).modal {
         (*p).perf_history.gap(Instant::now());
     }
@@ -3036,10 +3119,25 @@ fn join_process_samples(
     snapshot: &mut Snapshot,
     gpu: &std::collections::HashMap<(u32, u64), ProcessGpu>,
     network: &ProcessNetworkSample,
+    performance: Option<&PerfSnapshot>,
 ) {
     for process in &mut snapshot.processes {
         let id = (process.pid, process.created);
         process.gpu_percent = gpu.get(&id).and_then(|g| g.percent);
+        process.gpu_dedicated_bytes = gpu.get(&id).and_then(|g| g.dedicated_bytes);
+        process.gpu_shared_bytes = gpu.get(&id).and_then(|g| g.shared_bytes);
+        process.gpu_engine = gpu.get(&id).and_then(|g| g.engine.as_ref()).map(|engine| {
+            let index = performance.and_then(|s| {
+                s.gpus
+                    .iter()
+                    .filter(|g| listed_gpu(g))
+                    .position(|g| g.id == engine.adapter)
+            });
+            index.map_or_else(
+                || engine.engine_type.clone(),
+                |i| format!("GPU {i} - {}", engine.engine_type),
+            )
+        });
         process.network_bytes_per_sec = network
             .measured
             .then(|| network.by_id.get(&id).map(|n| n.total_bytes_per_sec))
@@ -3070,7 +3168,12 @@ unsafe fn drain_snapshot(p: *mut App) {
     match sample.snapshot {
         Ok(mut snapshot) => {
             (*p).recover_error(ErrorSource::Monitor);
-            join_process_samples(&mut snapshot, &sample.process_gpu, &sample.process_network);
+            join_process_samples(
+                &mut snapshot,
+                &sample.process_gpu,
+                &sample.process_network,
+                (*p).performance.as_ref(),
+            );
             (*p).network_state = Some(NetworkState {
                 measured: sample.process_network.measured,
                 reason: sample.process_network.reason.clone(),
@@ -3269,17 +3372,9 @@ fn option_cmp(a: Option<f64>, b: Option<f64>) -> Ordering {
     }
 }
 fn compare(a: &Process, b: &Process, col: usize) -> Ordering {
-    match col {
-        0 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        1 => a.pid.cmp(&b.pid),
-        2 => a.cpu_percent.total_cmp(&b.cpu_percent),
-        3 => a.working_set.cmp(&b.working_set),
-        4 => a.io_bytes_per_sec.total_cmp(&b.io_bytes_per_sec),
-        // Unmeasured ("—") ranks below every measured value.
-        5 => option_cmp(a.network_bytes_per_sec, b.network_bytes_per_sec),
-        6 => option_cmp(a.gpu_percent, b.gpu_percent),
-        _ => Ordering::Equal,
-    }
+    process_columns::ProcessColumn::from_id(col).map_or(Ordering::Equal, |column| {
+        process_columns::compare(a, b, column)
+    })
 }
 unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
     (*p).updating = true;
@@ -3489,7 +3584,7 @@ unsafe fn notify(p: *mut App, l: LPARAM) -> LRESULT {
     match hdr.code {
         LVN_COLUMNCLICK => {
             let col = (*(l as *const NMLISTVIEW)).iSubItem;
-            if col < 0 || col as usize >= columns((*p).page).len() {
+            if col < 0 || col as usize >= shown_columns(p).len() {
                 return 0;
             }
             // No startup-impact measurement exists: nothing to sort by.
@@ -3497,13 +3592,22 @@ unsafe fn notify(p: *mut App, l: LPARAM) -> LRESULT {
                 return 0;
             }
             let identity = selected_identity(p);
-            let col = col as usize;
+            let col = if (*p).page == Page::Processes {
+                (*p).process_columns
+                    .at(col as usize)
+                    .unwrap_or(process_columns::ProcessColumn::Name) as usize
+            } else {
+                col as usize
+            };
             (*p).sort_chosen = true;
             if col == (*p).sort {
                 (*p).descending = !(*p).descending;
             } else {
                 (*p).sort = col;
-                (*p).descending = (*p).page == Page::Processes && col >= 2;
+                (*p).descending = (*p).page == Page::Processes
+                    && process_columns::ProcessColumn::from_id(col).is_some_and(|column| {
+                        column.numeric() && column != process_columns::ProcessColumn::Pid
+                    });
             }
             rebuild(p, identity);
             update_sort_header(p);
@@ -3580,7 +3684,11 @@ unsafe fn shown_process(p: *mut App, index: usize) -> Option<Process> {
 unsafe fn cell_at(p: *mut App, row: usize, col: i32) -> String {
     match (*p).page {
         Page::Processes => shown_process(p, row)
-            .map(|s| cell(&s, col))
+            .and_then(|s| {
+                (*p).process_columns
+                    .at(col as usize)
+                    .map(|column| process_columns::text(&s, column))
+            })
             .unwrap_or_default(),
         Page::Startup => (&(*p).startup)
             .get(row)
@@ -3617,18 +3725,8 @@ unsafe fn cell_at(p: *mut App, row: usize, col: i32) -> String {
     }
 }
 fn cell(p: &Process, col: i32) -> String {
-    match col {
-        0 => p.name.clone(),
-        1 => p.pid.to_string(),
-        2 => format!("{:.1}%", p.cpu_percent),
-        3 => format!("{} MB", thousands(p.working_set as f64 / 1048576.0)),
-        4 => format!("{}/s", rate(p.io_bytes_per_sec)),
-        5 => p.network_bytes_per_sec.map_or_else(|| "—".into(), mbps),
-        6 => p
-            .gpu_percent
-            .map_or_else(|| "—".into(), |v| format!("{v:.1}%")),
-        _ => String::new(),
-    }
+    process_columns::ProcessColumn::from_id(col as usize)
+        .map_or_else(String::new, |column| process_columns::text(p, column))
 }
 /// One decimal with thousands separators, like the reference's
 /// `toLocaleString('en-US', { minimumFractionDigits: 1 })` ("1,410.4").
@@ -4065,6 +4163,91 @@ mod tests {
         assert_eq!(thousands(12.26), "12.3");
         assert_eq!(thousands(-2048.0), "-2,048.0");
     }
+
+    #[test]
+    fn new_task_dialog_cancels_without_a_job_and_submits_exact_arguments() {
+        use std::cell::Cell;
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        thread_local! {
+            static PLAN: Cell<(usize, bool)> = const { Cell::new((0, false)) };
+            static INSPECTED: Cell<bool> = const { Cell::new(false) };
+        }
+        unsafe extern "system" fn dialog_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+            if code == HCBT_ACTIVATE as i32 {
+                let dialog = w as HWND;
+                let (owner, submit) = PLAN.get();
+                if GetWindow(dialog, GW_OWNER) as usize == owner
+                    && !GetDlgItem(dialog, 701).is_null()
+                {
+                    INSPECTED.set(
+                        IsWindowEnabled(GetDlgItem(dialog, IDOK)) == 0
+                            && IsDlgButtonChecked(dialog, 704) == BST_UNCHECKED,
+                    );
+                    SetDlgItemTextW(
+                        dialog,
+                        701,
+                        wide(r#""C:\Program Files\Example\app.exe" --inline"#).as_ptr(),
+                    );
+                    SetDlgItemTextW(dialog, 702, wide(r#""two words" &literal"#).as_ptr());
+                    CheckDlgButton(dialog, 704, BST_CHECKED);
+                    PostMessageW(
+                        dialog,
+                        WM_COMMAND,
+                        if submit { IDOK } else { IDCANCEL } as usize,
+                        0,
+                    );
+                }
+            }
+            CallNextHookEx(null_mut(), code, w, l)
+        }
+        struct Hook(HHOOK);
+        impl Drop for Hook {
+            fn drop(&mut self) {
+                unsafe {
+                    UnhookWindowsHookEx(self.0);
+                }
+            }
+        }
+        let test = TestWindow::new();
+        unsafe {
+            while test.jobs.try_recv().is_ok() {}
+            let hook = Hook(SetWindowsHookExW(
+                WH_CBT,
+                Some(dialog_hook),
+                null_mut(),
+                GetCurrentThreadId(),
+            ));
+            assert!(!hook.0.is_null());
+            PLAN.set(((*test.p).hwnd as usize, false));
+            SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
+            assert!(
+                INSPECTED.get(),
+                "Run starts disabled and administrator mode starts unchecked"
+            );
+            assert!(
+                test.jobs.try_recv().is_err(),
+                "Cancel must never enqueue a task"
+            );
+            assert!(!(*test.p).modal && !(*test.p).busy);
+            PLAN.set(((*test.p).hwnd as usize, true));
+            SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
+            let Job::Action(Action::RunTask(task)) = test.jobs.try_recv().expect("submitted task")
+            else {
+                panic!("unexpected job")
+            };
+            assert_eq!(
+                task.command,
+                r#""C:\Program Files\Example\app.exe" --inline"#
+            );
+            assert_eq!(task.arguments, r#""two words" &literal"#);
+            assert!(task.elevated);
+            assert!(!(*test.p).modal);
+            assert!(
+                test.jobs.try_recv().is_err(),
+                "submit enqueues exactly one task"
+            );
+        }
+    }
     struct TestWindow {
         p: *mut App,
         class: Vec<u16>,
@@ -4239,6 +4422,7 @@ mod tests {
             network_bytes_per_sec: None,
             threads: 3,
             handles: 12,
+            ..Process::default()
         }
     }
     fn rows() -> Vec<Process> {
@@ -4247,6 +4431,70 @@ mod tests {
             process(202, 1002, "Beta.exe", 100, 9.0),
             process(303, 1003, "테스트.exe", 2, 10.0),
         ]
+    }
+    #[test]
+    fn process_header_drag_resize_preserve_semantic_sort_and_scroll_to_overflow() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            let list = (*p).list;
+            let widths = || {
+                (0..7)
+                    .map(|i| SendMessageW(list, LVM_GETCOLUMNWIDTH, i, 0) as i32)
+                    .collect::<Vec<_>>()
+            };
+            let width = widths();
+            let middle = |column: usize| width[..column].iter().sum::<i32>() + width[column] / 2;
+            let at = |x: i32| ((12i32 << 16) | (x & 0xffff)) as isize;
+            SendMessageW(list, WM_LBUTTONDOWN, 0, at(middle(2)));
+            SendMessageW(list, WM_MOUSEMOVE, 0, at(middle(4)));
+            SendMessageW(list, WM_LBUTTONUP, 0, at(middle(4)));
+            assert_eq!(
+                (*p).process_columns.at(4),
+                Some(process_columns::ProcessColumn::Cpu)
+            );
+            test.sort(4);
+            assert_eq!((*p).sort, process_columns::ProcessColumn::Cpu as usize);
+            assert_eq!(test.text(0, 0), "테스트.exe");
+            assert_eq!(test.text(0, 4), "10.0%");
+            let width = widths();
+            let edge = width[..=4].iter().sum::<i32>();
+            SendMessageW(list, WM_LBUTTONDOWN, 0, at(edge));
+            SendMessageW(list, WM_MOUSEMOVE, 0, at(edge + 600));
+            SendMessageW(list, WM_LBUTTONUP, 0, at(edge + 600));
+            assert!((*p).process_columns.columns()[4].width > 400.0);
+            let mut scroll = SCROLLINFO {
+                cbSize: size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_ALL,
+                ..zeroed()
+            };
+            assert_ne!(GetScrollInfo(list, SB_HORZ, &mut scroll), 0);
+            assert!(
+                scroll.nMax as u32 >= scroll.nPage,
+                "extra width must remain reachable"
+            );
+            SendMessageW(list, WM_HSCROLL, SB_RIGHT as usize, 0);
+            GetScrollInfo(list, SB_HORZ, &mut scroll);
+            assert!(scroll.nPos > 0);
+            // Resizing and scrolling never change the semantic sort column.
+            assert_eq!((*p).sort, process_columns::ProcessColumn::Cpu as usize);
+            test.page(Page::Services);
+            GetScrollInfo(list, SB_HORZ, &mut scroll);
+            assert_eq!(scroll.nPos, 0);
+            (*p).process_columns
+                .toggle(process_columns::ProcessColumn::Memory);
+            test.page(Page::Processes);
+            assert_eq!((*p).sort, process_columns::ProcessColumn::Name as usize);
+            assert!(!(*p).descending);
+            assert_eq!(test.text(0, 0), "Alpha.exe");
+            // Startup setup uses the same normalization for a restored layout.
+            (*p).sort = process_columns::ProcessColumn::Memory as usize;
+            (*p).descending = true;
+            setup_columns(p);
+            assert_eq!((*p).sort, process_columns::ProcessColumn::Name as usize);
+            assert!(!(*p).descending);
+        }
     }
     #[test]
     fn per_process_gpu_and_network_join_by_identity_format_sort_and_sum() {
@@ -4285,7 +4533,7 @@ mod tests {
                 total_bytes_per_sec: 850_000.,
             },
         );
-        join_process_samples(&mut snapshot, &gpu, &network);
+        join_process_samples(&mut snapshot, &gpu, &network, None);
         let [a, b, c] = &snapshot.processes[..] else {
             panic!("three rows");
         };
@@ -4303,7 +4551,7 @@ mod tests {
         assert_eq!(compare(c, b, 5), Ordering::Less);
         // Unmeasured network samples show no values at all.
         network.measured = false;
-        join_process_samples(&mut snapshot, &gpu, &network);
+        join_process_samples(&mut snapshot, &gpu, &network, None);
         assert!(snapshot
             .processes
             .iter()
@@ -5543,6 +5791,54 @@ mod tests {
             command(test.p, PREF_RATE, CBN_SELCHANGE);
             assert_eq!((*test.p).interval, 250);
             assert_eq!(SendMessageW((*test.p).rate, CB_GETCURSEL, 0, 0), 1);
+        }
+    }
+    #[test]
+    fn performance_drag_cancels_and_reorders_without_changing_the_chart() {
+        use windows_sys::Win32::System::SystemServices::MK_LBUTTON;
+        let test = TestWindow::new();
+        test.page(Page::Performance);
+        unsafe {
+            let p = test.p;
+            interactions::refresh_components(p);
+            let list = (*p).perf_list;
+            assert!(!(*p).persist_preferences);
+            (*p).perf_history
+                .traces
+                .entry(PerfTarget::Cpu)
+                .or_default()
+                .record(Instant::now(), [12.0, 0.0, 0.0]);
+            let cpu = table::part_rect(list, 0, table::Part::Row).unwrap();
+            let memory = table::part_rect(list, 1, table::Part::Row).unwrap();
+            let at = |x: i32, y: i32| ((x as u16 as u32) | ((y as u16 as u32) << 16)) as isize;
+            let start = at(memory.left + 30, (memory.top + memory.bottom) / 2);
+            let end = at(cpu.left + 30, cpu.top + 1);
+            let original = (*p).perf_targets.clone();
+            // An ordinary click does not reorder the list.
+            SendMessageW(list, WM_LBUTTONDOWN, MK_LBUTTON as usize, end);
+            SendMessageW(list, WM_LBUTTONUP, 0, end);
+            assert_eq!((*p).perf_targets, original);
+            for cancel in [WM_KEYDOWN, WM_CAPTURECHANGED] {
+                SendMessageW(list, WM_LBUTTONDOWN, MK_LBUTTON as usize, start);
+                SendMessageW(list, WM_MOUSEMOVE, MK_LBUTTON as usize, end);
+                SendMessageW(list, cancel, VK_ESCAPE as usize, 0);
+                SendMessageW(list, WM_LBUTTONUP, 0, end);
+                assert_ne!(GetCapture(), list);
+                assert_eq!((*p).perf_targets, original);
+                assert_eq!((*p).perf_target, PerfTarget::Cpu);
+            }
+            SendMessageW(list, WM_LBUTTONDOWN, MK_LBUTTON as usize, start);
+            SendMessageW(list, WM_MOUSEMOVE, MK_LBUTTON as usize, end);
+            SendMessageW(list, WM_LBUTTONUP, 0, end);
+            assert_eq!((*p).perf_targets, vec![PerfTarget::Memory, PerfTarget::Cpu]);
+            assert_eq!((*p).perf_target, PerfTarget::Cpu);
+            assert_eq!(SendMessageW(list, LB_GETCURSEL, 0, 0), 1);
+            assert_eq!(
+                (&(*p).perf_history.traces)[&PerfTarget::Cpu].points.len(),
+                1
+            );
+            interactions::refresh_components(p);
+            assert_eq!((*p).perf_targets, vec![PerfTarget::Memory, PerfTarget::Cpu]);
         }
     }
     #[test]

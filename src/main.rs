@@ -11,6 +11,7 @@ mod i18n;
 mod memclean;
 mod netetw;
 mod performance;
+mod process_metadata;
 mod process_tree;
 mod registry;
 mod replacement;

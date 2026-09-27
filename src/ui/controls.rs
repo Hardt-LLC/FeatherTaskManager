@@ -2220,6 +2220,7 @@ mod tests {
                         network_bytes_per_sec: None,
                         threads: 1,
                         handles: 1,
+                        ..Process::default()
                     }],
                     cpu_percent: 1.0,
                     memory_used: 1,

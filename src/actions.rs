@@ -695,7 +695,7 @@ fn task_executable(path: &str) -> Result<std::path::PathBuf, String> {
     }
     let resolved = candidate.canonicalize().map_err(|_| invalid())?;
     // Canonicalization prevents a local-looking junction from selecting a UNC
-    // executable. We do not pass user text as arguments or request elevation.
+    // executable; arguments and elevation are handled only after this check.
     if !local_path(&resolved) || !resolved.is_file() || resolved.components().any(|component| {
         matches!(component, Component::Normal(name) if name.encode_wide().any(|unit| unit == b':' as u16))
     }) {
@@ -725,11 +725,407 @@ fn task_executable(path: &str) -> Result<std::path::PathBuf, String> {
     Ok(resolved)
 }
 
-/// Launch the executable explicitly selected in the file picker, without a
-/// command interpreter, inferred arguments, PATH search, or UAC elevation.
-pub fn launch_task(path: &str) -> Result<(), String> {
-    let executable = task_executable(path)?;
-    shell_execute("open", executable.as_os_str(), None)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskLaunch {
+    pub command: String,
+    pub arguments: String,
+    pub elevated: bool,
+}
+
+/// Separate the program from its arguments without invoking a command shell.
+/// A path containing spaces must be quoted (Browse supplies those quotes).
+pub fn task_command(task: &TaskLaunch) -> Result<(String, String), String> {
+    let invalid = || {
+        tr(
+            "프로그램 이름을 입력하고 공백이 있는 경로는 큰따옴표로 묶으세요.",
+            "Enter a program name; enclose paths containing spaces in double quotes.",
+        )
+        .to_owned()
+    };
+    if task
+        .command
+        .chars()
+        .chain(task.arguments.chars())
+        .any(|c| matches!(c, '\0' | '\r' | '\n'))
+        || task.command.encode_utf16().count() + task.arguments.encode_utf16().count() > 32760
+    {
+        return Err(invalid());
+    }
+    let command = task.command.trim();
+    let (file, tail) = if let Some(quoted) = command.strip_prefix('"') {
+        let end = quoted.find('"').ok_or_else(invalid)?;
+        let tail = &quoted[end + 1..];
+        if !tail.is_empty() && !tail.starts_with(char::is_whitespace) {
+            return Err(invalid());
+        }
+        (&quoted[..end], tail.trim_start())
+    } else {
+        let end = command.find(char::is_whitespace).unwrap_or(command.len());
+        (&command[..end], command[end..].trim_start())
+    };
+    if file.is_empty() || file.contains('"') {
+        return Err(invalid());
+    }
+    let arguments = match (tail.is_empty(), task.arguments.is_empty()) {
+        (true, _) => task.arguments.clone(),
+        (_, true) => tail.to_owned(),
+        _ => format!("{tail} {}", task.arguments),
+    };
+    Ok((file.into(), arguments))
+}
+
+fn resolve_task_executable(file: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Path;
+    if file.contains(['\\', '/', ':']) {
+        return task_executable(file);
+    }
+    let extension = Path::new(file).extension().and_then(OsStr::to_str);
+    if extension
+        .is_some_and(|ext| !ext.eq_ignore_ascii_case("exe") && !ext.eq_ignore_ascii_case("com"))
+    {
+        return Err(tr(
+            "실행 파일(.exe 또는 .com)을 입력하세요.",
+            "Enter an executable (.exe or .com).",
+        )
+        .into());
+    }
+    let name = if extension.is_none() {
+        format!("{file}.exe")
+    } else {
+        file.to_owned()
+    };
+    // Explicit search order: Windows tools first, then absolute local PATH entries.
+    // Never include the current directory, an implicit interpreter, or file associations.
+    let (system_tool, _) = system_tool_paths(SystemTool::ResourceMonitor)?;
+    let mut directories = vec![
+        system_tool.parent().unwrap().to_path_buf(),
+        windows_explorer()?.parent().unwrap().to_path_buf(),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        directories.extend(std::env::split_paths(&path).filter(|path| path.is_absolute()));
+    }
+    for directory in directories {
+        if let Some(path) = directory.join(&name).to_str() {
+            if let Ok(executable) = task_executable(path) {
+                return Ok(executable);
+            }
+        }
+    }
+    Err(tr(
+        "프로그램을 찾을 수 없습니다. 찾아보기에서 실행 파일을 선택하세요.",
+        "Program not found. Use Browse to choose its executable.",
+    )
+    .into())
+}
+
+/// Programs and arguments remain separate; only an explicit admin choice uses runas.
+pub fn launch_task(task: &TaskLaunch, owner: usize) -> Result<(), String> {
+    let (file, arguments) = task_command(task)?;
+    let executable = resolve_task_executable(&file)?;
+    let initialized = unsafe {
+        CoInitializeEx(
+            null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
+    if initialized < 0 {
+        return Err(tr(
+            "Windows 셸을 초기화할 수 없습니다.",
+            "Cannot initialize the Windows shell.",
+        )
+        .into());
+    }
+    let file = wide(executable.as_os_str());
+    let parameters = wide(OsStr::new(&arguments));
+    let verb = wide(OsStr::new(if task.elevated { "runas" } else { "open" }));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        hwnd: owner as _,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
+    };
+    let result = if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        Err(last_error(tr(
+            "새 작업을 실행할 수 없습니다",
+            "Cannot start the new task",
+        )))
+    } else {
+        Ok(())
+    };
+    unsafe { CoUninitialize() };
+    result
+}
+
+fn windows_explorer() -> Result<std::path::PathBuf, String> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = vec![0u16; 32768];
+    let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err(last_error(tr(
+            "Windows 폴더를 찾을 수 없습니다",
+            "Cannot locate the Windows directory",
+        )));
+    }
+    Ok(
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]))
+            .join("explorer.exe"),
+    )
+}
+
+/// Read-only identity check, also used to decide whether to offer Restart Explorer.
+pub fn is_shell_process(pid: u32, expected_created: u64) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
+    let shell = unsafe { GetShellWindow() };
+    let mut shell_pid = 0;
+    if shell.is_null() {
+        return false;
+    }
+    unsafe { GetWindowThreadProcessId(shell, &mut shell_pid) };
+    shell_pid == pid && running_process_created(pid).ok() == Some(expected_created)
+}
+
+fn checked_shell(pid: u32, expected_created: u64) -> Result<ProcessHandle, String> {
+    use windows_sys::Win32::{
+        Security::{
+            EqualSid, GetTokenInformation, TokenElevation, TokenUser, TOKEN_ELEVATION, TOKEN_QUERY,
+            TOKEN_USER,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    let invalid = || {
+        tr(
+            "현재 사용자의 Windows 탐색기를 안전하게 확인할 수 없습니다. 목록을 새로 고치세요.",
+            "Cannot safely verify the current user's Windows Explorer. Refresh the list.",
+        )
+        .to_owned()
+    };
+    if !is_shell_process(pid, expected_created) {
+        return Err(invalid());
+    }
+    let process = open_checked(pid, expected_created, PROCESS_SYNCHRONIZE)?;
+    let actual = std::path::PathBuf::from(executable_path(pid, expected_created)?)
+        .canonicalize()
+        .map_err(|_| invalid())?;
+    let expected = windows_explorer()?.canonicalize().map_err(|_| invalid())?;
+    if !actual
+        .as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
+    {
+        return Err(invalid());
+    }
+    let token = |process| -> Result<ProcessHandle, String> {
+        let mut handle = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut handle) } == 0 {
+            return Err(invalid());
+        }
+        Ok(ProcessHandle(handle))
+    };
+    let shell_token = token(process.0)?;
+    let our_token = token(unsafe { GetCurrentProcess() })?;
+    // Aligned token buffers retain their SIDs until comparison completes.
+    let user = |token: HANDLE| -> Result<Vec<usize>, String> {
+        let mut needed = 0;
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 || needed > 65536 {
+            return Err(invalid());
+        }
+        let mut data = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                data.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(invalid());
+        }
+        Ok(data)
+    };
+    let shell_user = user(shell_token.0)?;
+    let our_user = user(our_token.0)?;
+    let same_user = unsafe {
+        EqualSid(
+            (*(shell_user.as_ptr().cast::<TOKEN_USER>())).User.Sid,
+            (*(our_user.as_ptr().cast::<TOKEN_USER>())).User.Sid,
+        )
+    } != 0;
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut needed = 0;
+    if !same_user
+        || unsafe {
+            GetTokenInformation(
+                shell_token.0,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut needed,
+            )
+        } == 0
+        || elevation.TokenIsElevated != 0
+    {
+        return Err(invalid());
+    }
+    Ok(process)
+}
+
+/// Restart Manager preserves Explorer's restart registration and normal user token.
+/// No forced termination or fallback to launching an elevated desktop shell.
+pub fn restart_explorer(pid: u32, expected_created: u64) -> Result<(), String> {
+    use windows_sys::Win32::System::RestartManager::*;
+    let _process = checked_shell(pid, expected_created)?;
+    let error = |code| {
+        format!(
+            "{}: {}",
+            tr(
+                "Windows 탐색기를 다시 시작할 수 없습니다",
+                "Cannot restart Windows Explorer"
+            ),
+            std::io::Error::from_raw_os_error(code as i32)
+        )
+    };
+    let mut session = 0;
+    let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+    let status = unsafe { RmStartSession(&mut session, 0, key.as_mut_ptr()) };
+    if status != 0 {
+        return Err(error(status));
+    }
+    struct Session(u32);
+    impl Drop for Session {
+        fn drop(&mut self) {
+            unsafe { RmEndSession(self.0) };
+        }
+    }
+    let session = Session(session);
+    let process = RM_UNIQUE_PROCESS {
+        dwProcessId: pid,
+        ProcessStartTime: FILETIME {
+            dwLowDateTime: expected_created as u32,
+            dwHighDateTime: (expected_created >> 32) as u32,
+        },
+    };
+    let status = unsafe { RmRegisterResources(session.0, 0, null(), 1, &process, 0, null()) };
+    if status != 0 {
+        return Err(error(status));
+    }
+    let mut item = RM_PROCESS_INFO::default();
+    let (mut needed, mut count, mut reasons) = (0, 1, 0);
+    let status = unsafe { RmGetList(session.0, &mut needed, &mut count, &mut item, &mut reasons) };
+    if status != 0 {
+        return Err(error(status));
+    }
+    if count != 1
+        || reasons != 0
+        || item.bRestartable == 0
+        || item.Process.dwProcessId != pid
+        || filetime_value(item.Process.ProcessStartTime) != expected_created
+        || item.ApplicationType != RmExplorer
+        || !is_shell_process(pid, expected_created)
+    {
+        return Err(tr(
+            "Windows에서 탐색기의 안전한 재시작을 지원하지 않아 취소했습니다.",
+            "Cancelled because Windows cannot safely restart this Explorer process.",
+        )
+        .into());
+    }
+    let shutdown = unsafe { RmShutdown(session.0, RmShutdownOnlyRegistered as u32, None) };
+    // Required even after a partial shutdown failure; restore anything RM stopped.
+    let restart = unsafe { RmRestart(session.0, 0, None) };
+    if restart != 0 {
+        return Err(error(restart));
+    }
+    if shutdown != 0 {
+        return Err(error(shutdown));
+    }
+    Ok(())
+}
+
+fn app_window(pid: u32) -> Option<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::{
+        core::BOOL,
+        Win32::{
+            Foundation::{HWND, LPARAM},
+            UI::WindowsAndMessaging::*,
+        },
+    };
+    struct Search {
+        pid: u32,
+        window: HWND,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> BOOL {
+        let search = &mut *(data as *mut Search);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == search.pid
+            && IsWindowVisible(hwnd) != 0
+            && GetWindow(hwnd, GW_OWNER).is_null()
+            && GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW == 0
+            && hwnd != GetShellWindow()
+        {
+            let mut cloaked = 0u32;
+            windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+                hwnd,
+                windows_sys::Win32::Graphics::Dwm::DWMWA_CLOAKED as u32,
+                (&mut cloaked as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            );
+            if cloaked != 0 {
+                return 1;
+            }
+            search.window = hwnd;
+            return 0;
+        }
+        1
+    }
+    let mut search = Search {
+        pid,
+        window: std::ptr::null_mut(),
+    };
+    unsafe { EnumWindows(Some(visit), (&mut search as *mut Search) as isize) };
+    (!search.window.is_null()).then_some(search.window)
+}
+
+pub fn has_app_window(pid: u32) -> bool {
+    app_window(pid).is_some()
+}
+
+/// Call on the UI thread in direct response to user input. Windows remains in
+/// control of foreground eligibility; never attach input queues or bypass locks.
+pub fn switch_to_window(pid: u32, expected_created: u64) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    let _process = open_checked(pid, expected_created, PROCESS_SYNCHRONIZE)?;
+    let window = app_window(pid).ok_or_else(|| {
+        tr(
+            "전환할 앱 창이 없습니다.",
+            "There is no application window to switch to.",
+        )
+        .to_owned()
+    })?;
+    let mut actual_pid = 0;
+    unsafe { GetWindowThreadProcessId(window, &mut actual_pid) };
+    if actual_pid != pid || running_process_created(pid)? != expected_created {
+        return Err(tr(
+            "앱 창이 변경되었습니다. 다시 시도하세요.",
+            "The application window changed. Try again.",
+        )
+        .into());
+    }
+    unsafe {
+        if IsIconic(window) != 0 {
+            ShowWindowAsync(window, SW_RESTORE);
+        }
+        if SetForegroundWindow(window) == 0 {
+            return Err(tr("Windows가 창의 포커스 전환을 허용하지 않았습니다. 작업 표시줄에서 앱을 선택하세요.", "Windows did not allow the focus change. Select the app on the taskbar.").into());
+        }
+    }
+    Ok(())
 }
 
 /// Private marker on every elevated relaunch of the UI (this one-shot
@@ -899,6 +1295,85 @@ mod tests {
         assert!(
             task_executable(resource.with_file_name("services.msc").to_str().unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn task_commands_preserve_arguments_and_require_explicit_programs() {
+        let request = |command: &str, arguments: &str| TaskLaunch {
+            command: command.into(),
+            arguments: arguments.into(),
+            elevated: false,
+        };
+        assert_eq!(
+            task_command(&request(
+                r#""C:\Program Files\App\app.exe" --one"#,
+                r#""two words" &literal"#
+            ))
+            .unwrap(),
+            (
+                r#"C:\Program Files\App\app.exe"#.into(),
+                r#"--one "two words" &literal"#.into()
+            )
+        );
+        assert_eq!(
+            task_command(&request("cmd.exe /c echo hello", "")).unwrap(),
+            ("cmd.exe".into(), "/c echo hello".into())
+        );
+        for invalid in [
+            "",
+            "\"\"",
+            "\"unterminated",
+            "\"cmd.exe\"suffix",
+            "cmd.exe\n/c whoami",
+            "cmd.exe\0",
+        ] {
+            assert!(
+                task_command(&request(invalid, "")).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        for invalid in [
+            "script.bat",
+            "script.ps1",
+            "services.msc",
+            "https://example.com",
+            "C:cmd.exe",
+            "\\\\server\\app.exe",
+        ] {
+            assert!(
+                resolve_task_executable(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        assert_eq!(
+            resolve_task_executable("cmd").unwrap().file_name().unwrap(),
+            "cmd.exe"
+        );
+        assert!(task_command(&request("cmd.exe", "\0")).is_err());
+    }
+
+    #[test]
+    fn shell_targeting_and_window_switch_reject_stale_identity() {
+        // Read-only targeting: never call restart_explorer on the real shell.
+        let pid = unsafe { GetCurrentProcessId() };
+        assert!(!is_shell_process(pid, 0));
+        assert!(checked_shell(pid, 0).is_err());
+        assert!(switch_to_window(pid, 0).is_err());
+        let shell = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow() };
+        if !shell.is_null() {
+            let mut shell_pid = 0;
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                    shell,
+                    &mut shell_pid,
+                )
+            };
+            if let Ok(created) = running_process_created(shell_pid) {
+                assert!(is_shell_process(shell_pid, created));
+                assert!(!is_shell_process(shell_pid, created.saturating_add(1)));
+                assert!(checked_shell(shell_pid, created.saturating_add(1)).is_err());
+            }
+        }
     }
 
     /// This ignored fixture runs only in a disposable child test-harness process.
