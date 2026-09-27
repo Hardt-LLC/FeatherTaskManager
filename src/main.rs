@@ -19,6 +19,7 @@ mod services;
 mod smbios;
 mod startup;
 mod storage;
+mod thermal;
 mod ui;
 
 use std::fs::{File, OpenOptions};

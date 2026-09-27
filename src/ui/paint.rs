@@ -1075,11 +1075,26 @@ unsafe fn performance_display(p: *mut App, target: &PerfTarget) -> PerformanceDi
                 ),
             ];
             // Firmware-defined ACPI sensor locations, never "CPU temperature".
-            for zone in perf.map_or(&[][..], |v| &v.thermal_zones[..]) {
-                d.specs.push((
-                    tf!("ACPI 열 영역 ({})", "ACPI thermal zone ({})", zone.name),
-                    celsius(zone.celsius),
-                ));
+            // Keep temperatures near the top: short windows trim the final
+            // specification rows to preserve the established chart layout.
+            let zones = perf.map_or(&[][..], |v| &v.thermal_zones[..]);
+            if zones.is_empty() {
+                d.specs.insert(
+                    1,
+                    spec(
+                        tr("펌웨어 온도", "Firmware temperature"),
+                        tr("사용 불가", "Unavailable").into(),
+                    ),
+                );
+            }
+            for (index, zone) in zones.iter().enumerate() {
+                d.specs.insert(
+                    index + 1,
+                    (
+                        tf!("ACPI 열 영역 ({})", "ACPI thermal zone ({})", zone.name),
+                        celsius(zone.celsius),
+                    ),
+                );
             }
         }
         PerfTarget::Memory => {

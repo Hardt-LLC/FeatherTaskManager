@@ -1,0 +1,127 @@
+{
+  "measuredDate": "2026-09-28",
+  "branch": "codex/task-manager-improvements",
+  "page": "processes",
+  "windowStyle": "Hidden",
+  "iterations": 3,
+  "sampleSecondsPerRun": 5,
+  "startupObservationLimitSeconds": 10,
+  "logicalProcessors": 16,
+  "operatingSystem": "Microsoft Windows NT 10.0.26200.0",
+  "refreshMsStored": 1000,
+  "elevated": false,
+  "baseline": {
+    "sha256": "e2fccea4fc28cc36747c7a98922b28b80ead2e39983b1285fa7481443eda7692",
+    "sizeBytes": 1884672,
+    "provenance": "Previously built release executable; source provenance unverified."
+  },
+  "candidate": {
+    "sha256": "473e3dc02c350200025206fddcf6c45dff9d1ea91f6732cff337842aec8d978b",
+    "sizeBytes": 1890816,
+    "provenance": "cargo build --release --locked --offline after 308 passing tests and Clippy."
+  },
+  "status": "within-budget",
+  "comparisons": [
+    {
+      "page": "processes",
+      "metric": "cpuPercentNormalized",
+      "unit": "percentage points",
+      "baseline": {
+        "count": 3,
+        "median": 0.0578,
+        "mad": 0.0004000000000000045
+      },
+      "candidate": {
+        "count": 3,
+        "median": 0.0585,
+        "mad": 0.00010000000000000286
+      },
+      "delta": 0.0007000000000000062,
+      "threshold": 0.1,
+      "noiseAllowance": 0.0012000000000000136,
+      "verdict": "within-budget"
+    },
+    {
+      "page": "processes",
+      "metric": "sampledMaxWorkingSetBytes",
+      "unit": "bytes",
+      "baseline": {
+        "count": 3,
+        "median": 26025984,
+        "mad": 28672
+      },
+      "candidate": {
+        "count": 3,
+        "median": 26144768,
+        "mad": 81920
+      },
+      "delta": 118784,
+      "threshold": 2602598.4000000004,
+      "noiseAllowance": 245760,
+      "verdict": "within-budget"
+    },
+    {
+      "page": "processes",
+      "metric": "sampledMaxPrivateBytes",
+      "unit": "bytes",
+      "baseline": {
+        "count": 3,
+        "median": 11464704,
+        "mad": 24576
+      },
+      "candidate": {
+        "count": 3,
+        "median": 11546624,
+        "mad": 36864
+      },
+      "delta": 81920,
+      "threshold": 2097152,
+      "noiseAllowance": 110592,
+      "verdict": "within-budget"
+    },
+    {
+      "page": "processes",
+      "metric": "sampledMaxHandleCount",
+      "unit": "handles",
+      "baseline": {
+        "count": 3,
+        "median": 276,
+        "mad": 0
+      },
+      "candidate": {
+        "count": 3,
+        "median": 276,
+        "mad": 0
+      },
+      "delta": 0,
+      "threshold": 27.6,
+      "noiseAllowance": 0,
+      "verdict": "within-budget"
+    },
+    {
+      "page": "processes",
+      "metric": "startupTimeToInputIdleMs",
+      "unit": "milliseconds",
+      "baseline": {
+        "count": 3,
+        "median": 40.26,
+        "mad": 1.6799999999999997
+      },
+      "candidate": {
+        "count": 3,
+        "median": 39.02,
+        "mad": 0.30000000000000426
+      },
+      "delta": -1.2399999999999949,
+      "threshold": 30,
+      "noiseAllowance": 5.039999999999999,
+      "verdict": "within-budget"
+    }
+  ],
+  "limitations": [
+    "Short hidden-window Processes-page measurement; not an interactive, cold-start, or long-term leak test.",
+    "Input-idle observation includes launch overhead and is not first paint or complete data readiness.",
+    "Within-budget does not demonstrate a performance improvement.",
+    "Raw reports stay local because they include machine names and paths."
+  ]
+}

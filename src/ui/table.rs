@@ -2540,7 +2540,16 @@ impl AppRows {
             bottom: content.bottom,
             ..cells[col]
         };
-        cell_text(pt, f.mono_cell, c.fg, &service.name, at(0), DT_LEFT);
+        name_cell(
+            pt,
+            at(0),
+            0.0,
+            None,
+            &widgets::initials(&service.name),
+            false,
+            &service.name,
+            None,
+        );
         if service.pid != 0 {
             cell_text(
                 pt,
@@ -2571,7 +2580,7 @@ impl AppRows {
         if cells.len() > 4 {
             cell_text(
                 pt,
-                f.small,
+                f.body,
                 c.muted,
                 crate::services::start_type_label(service.start_type),
                 at(4),

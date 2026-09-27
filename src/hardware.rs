@@ -176,6 +176,12 @@ fn static_facts(out: &mut String, perf: &PerfSnapshot) {
         "virtualization enabled in firmware: {}",
         yes_no(perf.virtualization_firmware_enabled)
     );
+    let _ = writeln!(
+        out,
+        "temperature source: Windows Thermal Zone Information (read-only PDH); firmware zone location, not CPU package; refresh {} s, unavailable retry {} s",
+        crate::thermal::POLL_INTERVAL.as_secs(),
+        crate::thermal::RETRY_INTERVAL.as_secs()
+    );
 
     section(out, "Memory modules (SMBIOS)");
     match &perf.memory_modules {
@@ -378,7 +384,10 @@ fn dynamic_values(
         );
     }
     if perf.thermal_zones.is_empty() {
-        let _ = writeln!(out, "ACPI thermal zones: none reported");
+        let _ = writeln!(
+            out,
+            "ACPI thermal zones: unavailable (no valid firmware reading)"
+        );
     }
     for zone in &perf.thermal_zones {
         let _ = writeln!(

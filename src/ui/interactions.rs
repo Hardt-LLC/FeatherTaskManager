@@ -940,6 +940,18 @@ pub(super) unsafe fn build_extra_menu(
                 .and_then(|s| s.efficiency)
                 .is_some(),
         );
+        let identifiable =
+            has_process && selected_process(p).is_some_and(|s| s.pid > 4 && s.created != 0);
+        add(
+            navigation::FILE_PROPERTIES,
+            tr("파일 속성", "File properties"),
+            identifiable,
+        );
+        add(
+            navigation::GO_TO_SERVICES,
+            tr("서비스로 이동", "Go to services"),
+            identifiable,
+        );
         // Priority is a submenu with the current class checked.
         let priorities = CreatePopupMenu();
         if !priorities.is_null() {
@@ -1033,6 +1045,11 @@ pub(super) unsafe fn build_extra_menu(
             wide(tr("서비스 상세 정보", "Service details")).as_ptr(),
         );
         add(514, tr("서비스 관리 열기", "Open Services"), true);
+        add(
+            navigation::GO_TO_PROCESS,
+            tr("프로세스로 이동", "Go to process"),
+            service.is_some_and(|s| s.pid != 0),
+        );
     } else if (*p).page == Page::Startup {
         // Named after what it will do to the selected entry; Space runs it
         // from the table.
@@ -1065,6 +1082,24 @@ pub(super) unsafe fn build_extra_menu(
 /// when the menu opened).
 unsafe fn dispatch_extra(p: *mut App, id: usize, process: Option<Process>) {
     match id {
+        navigation::FILE_PROPERTIES => {
+            if let Some(s) = process {
+                begin_action(p, Action::Properties(s.pid, s.created));
+            }
+        }
+        navigation::GO_TO_SERVICES => {
+            if let Some(s) = process {
+                navigation::begin(p, navigation::Request::Services(ProcessIdentity::from(&s)));
+            }
+        }
+        navigation::GO_TO_PROCESS => {
+            if let Some(name) = selected_row(p)
+                .and_then(|i| (&(*p).services).get(i))
+                .map(|s| s.name.clone())
+            {
+                navigation::begin(p, navigation::Request::Process(name));
+            }
+        }
         500..=503 => {
             if let Some(s) = process {
                 begin_action(

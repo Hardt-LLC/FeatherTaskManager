@@ -8,12 +8,15 @@
 //! disk models, GPU adapter names and memory sizes) are collected once per
 //! sampler and again only when the PDH disk or GPU adapter set changes. Per
 //! sample, only GPU sensor values (`gpu::sensors`) are read in addition to
-//! the PDH counters and the interface table.
+//! the PDH counters and the interface table. Firmware temperatures have a
+//! separate cached query: at most once per five seconds, or once per minute
+//! when unavailable, independent of the process refresh rate.
 
 use crate::gpu::{self, GpuAdapter, GpuSensors};
 use crate::sampler::Process;
 use crate::smbios::{self, MemoryInventory};
 use crate::storage::{self, StorageDevice};
+use crate::thermal::{ThermalSampler, ThermalZone};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
@@ -48,9 +51,6 @@ const MAX_PDH_BYTES: usize = 8 * 1024 * 1024;
 const FMT_DOUBLE_UNCAPPED: u32 = PDH_FMT_DOUBLE | 0x8000;
 /// Minimum spacing between GPU re-enumerations triggered by unknown adapters.
 const GPU_ENUMERATION_INTERVAL: Duration = Duration::from_secs(5);
-/// ACPI thermal zone readings outside (0, 150] °C are discarded as implausible.
-const THERMAL_MAX_CELSIUS: f64 = 150.0;
-const KELVIN_OFFSET: f64 = 273.15;
 
 #[derive(Clone, Debug)]
 pub struct LogicalProcessor {
@@ -197,16 +197,6 @@ pub struct CpuCaches {
     pub l3_bytes: Option<u64>,
 }
 
-/// One ACPI thermal zone (`\Thermal Zone Information(*)`). A thermal zone is
-/// a firmware-defined sensor location, not necessarily the CPU package; the
-/// UI must label it by zone name, never as "CPU temperature".
-#[derive(Clone, Debug, PartialEq)]
-pub struct ThermalZone {
-    /// PDH instance name, e.g. `\_TZ.TZ00`.
-    pub name: String,
-    pub celsius: f64,
-}
-
 /// GPU use of one process, from PDH `GPU Engine` and `GPU Process Memory`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProcessGpu {
@@ -281,8 +271,8 @@ pub struct PerfSnapshot {
     pub gpu_adapters: Vec<Arc<GpuAdapter>>,
     /// Per-process GPU utilization and memory keyed by PID.
     pub process_gpu: ProcessGpuSample,
-    /// ACPI thermal zones with plausible readings. Empty on machines whose
-    /// firmware exposes none. Not a CPU package temperature.
+    /// ACPI thermal zones with plausible readings, refreshed every 5 seconds.
+    /// Empty when unavailable; retried every 60 seconds. Not CPU package data.
     pub thermal_zones: Vec<ThermalZone>,
     pub uptime_seconds: u64,
     pub network_rx_bytes_per_sec: f64,
@@ -391,6 +381,7 @@ pub struct PerfSampler {
     generation: u64,
     gpu: GpuInventory,
     storage: StorageInventory,
+    thermal: ThermalSampler,
     /// Collect hardware identity and sensors (false only for `baseline`).
     hardware: bool,
 }
@@ -488,6 +479,7 @@ impl PerfSampler {
             generation: 0,
             gpu: GpuInventory::default(),
             storage: StorageInventory::default(),
+            thermal: ThermalSampler::default(),
             hardware,
         })
     }
@@ -555,6 +547,7 @@ impl PerfSampler {
             pdh.sample(&mut snapshot);
         }
         if self.hardware {
+            snapshot.thermal_zones = self.thermal.sample().to_vec();
             self.attach_storage(&mut snapshot);
             let sensors_started = Instant::now();
             self.attach_gpus(&mut snapshot);
@@ -762,9 +755,6 @@ struct PdhQuery {
     gpu_shared: Option<PDH_HCOUNTER>,
     gpu_process_dedicated: Option<PDH_HCOUNTER>,
     gpu_process_shared: Option<PDH_HCOUNTER>,
-    /// `(counter, deci_kelvin)`: High Precision Temperature reports tenths of
-    /// a kelvin; the older Temperature counter reports whole kelvins.
-    thermal: Option<(PDH_HCOUNTER, bool)>,
     /// Aggregate per-process GPU values (false only for the baseline sampler).
     per_process: bool,
     // usize provides sufficient alignment for the array's pointers and f64s.
@@ -794,7 +784,6 @@ impl PdhQuery {
             gpu_shared: None,
             gpu_process_dedicated: None,
             gpu_process_shared: None,
-            thermal: None,
             per_process: hardware,
             array_buffer: vec![0; 2048],
             primed: false,
@@ -849,25 +838,6 @@ impl PdhQuery {
             "Process GPU shared memory",
             warnings,
         );
-        // Thermal zones are optional firmware objects; a missing counter set
-        // is normal and not reported as a warning.
-        let mut ignored = Vec::new();
-        query.thermal = query
-            .add(
-                r"\Thermal Zone Information(*)\High Precision Temperature",
-                "Thermal zones",
-                &mut ignored,
-            )
-            .map(|counter| (counter, true))
-            .or_else(|| {
-                query
-                    .add(
-                        r"\Thermal Zone Information(*)\Temperature",
-                        "Thermal zones",
-                        &mut ignored,
-                    )
-                    .map(|counter| (counter, false))
-            });
         Some(query)
     }
 
@@ -958,12 +928,6 @@ impl PdhQuery {
                 process_shared.as_deref(),
             );
         }
-        if let Some((counter, deci_kelvin)) = self.thermal {
-            // No instances (common on desktops) is an empty list, not an error.
-            if let Ok(values) = self.array(counter, None) {
-                snapshot.thermal_zones = thermal_zones(&values, deci_kelvin);
-            }
-        }
     }
 
     fn optional_array(
@@ -999,65 +963,71 @@ impl PdhQuery {
     fn array(
         &mut self,
         counter: PDH_HCOUNTER,
-        mut gaps: Option<&mut Vec<String>>,
+        gaps: Option<&mut Vec<String>>,
     ) -> Result<Vec<(String, f64)>, String> {
-        for _ in 0..4 {
-            let capacity = self.array_buffer.len() * size_of::<usize>();
-            let mut bytes = capacity as u32;
-            let mut count = 0;
-            let status = unsafe {
-                PdhGetFormattedCounterArrayW(
-                    counter,
-                    FMT_DOUBLE_UNCAPPED,
-                    &mut bytes,
-                    &mut count,
-                    self.array_buffer.as_mut_ptr().cast(),
-                )
-            };
-            if status == PDH_MORE_DATA {
-                let required = bytes as usize;
-                if required == 0 || required > MAX_PDH_BYTES {
-                    return Err("counter array exceeds the safety limit".into());
-                }
-                self.array_buffer
-                    .resize(required.div_ceil(size_of::<usize>()), 0);
-                continue;
-            }
-            if status != 0 {
-                return Err(format!("unavailable (PDH 0x{status:08X})"));
-            }
-            let used = bytes as usize;
-            if used > capacity || count as usize > used / size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>() {
-                return Err("invalid counter array".into());
-            }
-            let items = unsafe {
-                std::slice::from_raw_parts(
-                    self.array_buffer
-                        .as_ptr()
-                        .cast::<PDH_FMT_COUNTERVALUE_ITEM_W>(),
-                    count as usize,
-                )
-            };
-            let mut values = Vec::with_capacity(items.len());
-            if let Some(gaps) = gaps.as_deref_mut() {
-                gaps.clear();
-            }
-            for item in items {
-                let value = unsafe { item.FmtValue.Anonymous.doubleValue };
-                if valid_status(item.FmtValue.CStatus) && value.is_finite() {
-                    if let Some(name) = array_name(item.szName, &self.array_buffer, used) {
-                        values.push((name, value));
-                    }
-                } else if let Some(gaps) = gaps.as_deref_mut() {
-                    if let Some(name) = array_name(item.szName, &self.array_buffer, used) {
-                        gaps.push(name);
-                    }
-                }
-            }
-            return Ok(values);
-        }
-        Err("counter instances changed repeatedly; retrying next refresh".into())
+        counter_array(&mut self.array_buffer, counter, gaps)
     }
+}
+
+/// Shared bounded PDH array decoding for the main and throttled thermal query.
+pub(crate) fn counter_array(
+    array_buffer: &mut Vec<usize>,
+    counter: PDH_HCOUNTER,
+    mut gaps: Option<&mut Vec<String>>,
+) -> Result<Vec<(String, f64)>, String> {
+    for _ in 0..4 {
+        let capacity = array_buffer.len() * size_of::<usize>();
+        let mut bytes = capacity as u32;
+        let mut count = 0;
+        let status = unsafe {
+            PdhGetFormattedCounterArrayW(
+                counter,
+                FMT_DOUBLE_UNCAPPED,
+                &mut bytes,
+                &mut count,
+                array_buffer.as_mut_ptr().cast(),
+            )
+        };
+        if status == PDH_MORE_DATA {
+            let required = bytes as usize;
+            if required == 0 || required > MAX_PDH_BYTES {
+                return Err("counter array exceeds the safety limit".into());
+            }
+            array_buffer.resize(required.div_ceil(size_of::<usize>()), 0);
+            continue;
+        }
+        if status != 0 {
+            return Err(format!("unavailable (PDH 0x{status:08X})"));
+        }
+        let used = bytes as usize;
+        if used > capacity || count as usize > used / size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>() {
+            return Err("invalid counter array".into());
+        }
+        let items = unsafe {
+            std::slice::from_raw_parts(
+                array_buffer.as_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>(),
+                count as usize,
+            )
+        };
+        let mut values = Vec::with_capacity(items.len());
+        if let Some(gaps) = gaps.as_deref_mut() {
+            gaps.clear();
+        }
+        for item in items {
+            let value = unsafe { item.FmtValue.Anonymous.doubleValue };
+            if valid_status(item.FmtValue.CStatus) && value.is_finite() {
+                if let Some(name) = array_name(item.szName, array_buffer, used) {
+                    values.push((name, value));
+                }
+            } else if let Some(gaps) = gaps.as_deref_mut() {
+                if let Some(name) = array_name(item.szName, array_buffer, used) {
+                    gaps.push(name);
+                }
+            }
+        }
+        return Ok(values);
+    }
+    Err("counter instances changed repeatedly; retrying next refresh".into())
 }
 
 impl Drop for PdhQuery {
@@ -1404,26 +1374,6 @@ fn process_gpu(
         }
     }
     sample
-}
-
-/// Converts thermal zone readings to Celsius, dropping implausible values.
-fn thermal_zones(values: &[(String, f64)], deci_kelvin: bool) -> Vec<ThermalZone> {
-    let mut zones: Vec<_> = values
-        .iter()
-        .filter(|(name, _)| !name.is_empty() && name != "_Total")
-        .filter_map(|(name, value)| {
-            let kelvin = if deci_kelvin { value / 10.0 } else { *value };
-            let celsius = kelvin - KELVIN_OFFSET;
-            (celsius.is_finite() && celsius > 0.0 && celsius <= THERMAL_MAX_CELSIUS).then(|| {
-                ThermalZone {
-                    name: name.clone(),
-                    celsius,
-                }
-            })
-        })
-        .collect();
-    zones.sort_by(|a, b| a.name.cmp(&b.name));
-    zones
 }
 
 fn memory_stats() -> Result<MemoryStats, String> {
@@ -1952,24 +1902,6 @@ mod tests {
         let unmeasured = perf_with(ProcessGpuSample::default());
         assert!(tracker.join(&second, Some(&unmeasured)).is_empty());
         assert!(tracker.join(&second, None).is_empty());
-    }
-
-    #[test]
-    fn thermal_zones_convert_kelvin_and_drop_implausible_readings() {
-        let values = vec![
-            (r"\_TZ.TZ01".to_string(), 3131.5),
-            (r"\_TZ.TZ00".to_string(), 2731.5),
-            (r"\_TZ.HOT".to_string(), 4500.0),
-            ("_Total".to_string(), 3000.0),
-            (r"\_TZ.NAN".to_string(), f64::NAN),
-        ];
-        let zones = thermal_zones(&values, true);
-        assert_eq!(zones.len(), 1);
-        assert_eq!(zones[0].name, r"\_TZ.TZ01");
-        assert!((zones[0].celsius - 40.0).abs() < 1e-9);
-        let zones = thermal_zones(&[(r"\_TZ.A".into(), 318.15)], false);
-        assert!((zones[0].celsius - 45.0).abs() < 1e-9);
-        assert!(thermal_zones(&[(r"\_TZ.A".into(), 0.0)], false).is_empty());
     }
 
     #[test]

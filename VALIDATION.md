@@ -1,5 +1,14 @@
 # Feather Task Manager 검증 기록
 
+## 개발 브랜치: 작업 관리자 기능·온도·지속 개선 (2026-09-28)
+
+- `codex/task-manager-improvements`, Windows 11 x64 빌드 26200. `cargo test --locked --offline`: **308개 통과, 3개 제외, 실패 없음**. `cargo fmt --all -- --check`, `cargo clippy --locked --offline --all-targets -- -D warnings`, `cargo build --release --locked --offline` 통과.
+- 새 검사 수는 순증 3개다. 온도 변환 검사를 2개로 보강하고, 정확한 `pid:` 검색 및 그룹/목록/트리 왕복 이동·늦은 응답 무시를 검증했다. 기존 신원 검사에는 새 API의 거부 경로만 추가했다. 서비스 모양 변경에는 새 테스트를 추가하지 않았다.
+- `--render-previews`의 짧은 개발 모드(3개 표본, 50ms 간격) 종료 코드 0. 서비스 light/dark에서 본문 크기·폰트·앞쪽 심볼을 확인했고 CPU 화면의 펌웨어 온도 `사용 불가` 표시를 확인했다. 실제 PC 목록을 담은 이미지는 `target/improvement-previews`에만 보관한다. 첫 기본 실행은 61개 표본을 모으므로 60초 관찰 제한을 넘었으며, 성공 판정은 짧은 개발 실행의 종료 코드에 근거한다.
+- release `--dump-hardware` 종료 코드 0. 현재 PC에서는 유효한 ACPI 열 영역 온도를 노출하지 않는다. 드라이버를 설치하거나 온도를 추정하지 않았다. 센서가 있는 실장비의 숫자 표시는 아직 확인하지 못했으며 변환·폴백·캐시 실패 처리는 단위 검사로 확인했다.
+- 측정 루프의 PowerShell 5.1 실제 capture/compare와 7개 작은 비교 fixture 통과. 동일 조건의 Processes 3×5초 측정은 5개 지표 모두 `within-budget`. [공개 가능한 집계](measurements/improvements-2026-09-28.json)와 [측정 해석](BENCHMARK.md)을 참고한다. 원시 조건에는 PC 이름·경로가 있어 로컬에만 둔다.
+- native 파일 속성 창을 실제로 열고 닫는 조작, 관리자/보호된 서비스 접근, 장기 누수, 콜드 스타트는 이번 검증 범위 밖이다. main 직접 푸시, 설치, 서명, 릴리스는 수행하지 않았다.
+
 ## 2026.9.4
 
 2026-09-27, Windows 11 x64(빌드 26200).
