@@ -713,6 +713,13 @@ unsafe fn settings_page(p: *mut App, dc: HDC, l: &layout::Layout) {
                     "Replace the built-in Task Manager",
                 ),
             ),
+            (
+                tr("항상 관리자 권한으로 실행", "Always run as administrator"),
+                tr(
+                    "설치된 Feather가 매번 승인(UAC)을 요청합니다. 프로세스별 네트워크와 전체 좀비 검사에 필요합니다.",
+                    "The installed Feather asks for approval (UAC) at each start. For per-process network and full zombie scans.",
+                ),
+            ),
         ],
     ];
     let controls: Vec<RECT> = (*p)
@@ -2468,11 +2475,12 @@ unsafe fn draw_button_to(p: *mut App, item: &DRAWITEMSTRUCT, dc: HDC) {
     };
     let pt = Painter::new(dc, (*p).dpi, &(*p).fonts);
     // Settings switches keep native button focus/keyboard behavior.
-    if (136..=138).contains(&id) {
+    if (PREF_TOP..=PREF_ADMIN).contains(&id) {
         let checked = match id {
-            136 => (*p).topmost,
-            137 => (*p).prefs.tray,
-            _ => (*p).replacement_active,
+            PREF_TOP => (*p).topmost,
+            PREF_TRAY => (*p).prefs.tray,
+            PREF_REPLACE => (*p).replacement_active,
+            _ => (*p).prefs.always_admin,
         };
         (*p).anim
             .register((id, anim::part::SWITCH), item.hwndItem, None);

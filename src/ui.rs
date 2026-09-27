@@ -36,6 +36,7 @@ use windows_sys::Win32::{
 mod anim;
 mod capture;
 mod controls;
+mod elevation;
 mod fonts;
 mod frame;
 mod gfx;
@@ -96,6 +97,8 @@ const PREF_START: usize = 135;
 const PREF_TOP: usize = 136;
 const PREF_TRAY: usize = 137;
 const PREF_REPLACE: usize = 138;
+/// Settings → Window: "Always run as administrator" (`elevation.rs`).
+const PREF_ADMIN: usize = 139;
 const NAV: usize = 300;
 /// One-shot timer of the main window: prefetch the Services / Startup lists.
 const PREFETCH_TIMER: usize = 0xFE01;
@@ -169,10 +172,11 @@ struct HistoryPoint {
     network: f64,
 }
 enum Command {
+    /// Sampling interval and pause state. Every page samples the performance
+    /// counters too (see `monitor`), so there is no per-page switch.
     Configure {
         interval: u64,
         paused: bool,
-        performance: bool,
     },
     Refresh,
     Stop,
@@ -293,6 +297,9 @@ struct App {
     persist_preferences: bool,
     palette: HWND,
     prefs: Preferences,
+    /// The preferences as this window last read or saved them: a save
+    /// writes only the values changed since (`Preferences::save`).
+    stored_prefs: Preferences,
     preference_controls: Vec<HWND>,
     tray_visible: bool,
     replacement_active: bool,
@@ -420,6 +427,7 @@ impl App {
             persist_preferences: false,
             palette: null_mut(),
             prefs: Preferences::default(),
+            stored_prefs: Preferences::default(),
             preference_controls: Vec::new(),
             tray_visible: false,
             replacement_active: false,
@@ -574,6 +582,15 @@ unsafe fn create_window(p: *mut App, class: &[u16], width: i32, height: i32) -> 
     )
 }
 pub fn run() {
+    let args: Vec<String> = std::env::args().collect();
+    let prefs = Preferences::load();
+    // "Always run as administrator": before any window, so an approved
+    // prompt never shows a second, unelevated window first.
+    let elevation_notice = match elevation::relaunch(&args, &prefs) {
+        elevation::Startup::Relaunched => return,
+        elevation::Startup::Unelevated(notice) => Some(notice),
+        elevation::Startup::Continue => None,
+    };
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         init_controls();
@@ -584,7 +601,8 @@ pub fn run() {
         let p = Box::into_raw(Box::new(App::new(rx, tx, jobs, results)));
         (*p).persist_preferences = true;
         (*p).group_mode = true;
-        (*p).prefs = Preferences::load();
+        (*p).stored_prefs = prefs.clone();
+        (*p).prefs = prefs;
         (*p).interval = (*p).prefs.rate;
         (*p).topmost = (*p).prefs.topmost;
         (*p).prefs.apply_theme();
@@ -638,13 +656,16 @@ pub fn run() {
                 ),
             );
         }
-        let args: Vec<String> = std::env::args().collect();
         let requested = if args.iter().any(|a| a == "--page" || a == "--task-manager") {
             initial_page(&args)
         } else {
             Page::from_index((*p).prefs.default_page as usize)
         };
         switch_page(p, requested);
+        if let Some(notice) = elevation_notice {
+            // After switch_page, which clears the notice.
+            (*p).notice = notice;
+        }
         interactions::apply_theme(p);
         interactions::sync_settings(p);
         if (*p).topmost {
@@ -701,13 +722,17 @@ fn initial_page(args: &[String]) -> Page {
 }
 fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<MonitorSample>) {
     let mut sampler = Sampler::new();
+    // The performance counters are sampled on every page, like Windows Task
+    // Manager keeps its history while another tab is open: the Performance
+    // charts (and the Processes GPU column) continue without a gap when the
+    // user comes back. The sampler stays warm across page switches; only a
+    // pause (also minimized or modal) drops it, and that gap is recorded.
     let mut perf: Option<PerfSampler> = None;
     // One GPU attribution tracker and one network trace for the monitor's
     // lifetime; the trace (an ETW session, elevated only) ends when this
     // thread returns on Stop.
     let mut gpu_tracker = ProcessGpuTracker::default();
     let mut network = NetworkMonitor::new();
-    let mut performance = false;
     let mut interval = 1000;
     let mut paused = false;
     let mut refresh = true;
@@ -724,32 +749,28 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 Ok(s) => s.sample(),
                 Err(e) => Err(e.clone()),
             };
-            let perf_result = if performance {
-                if perf.is_none() {
-                    match PerfSampler::new() {
-                        Ok(s) => perf = Some(s),
-                        Err(e) => {
-                            let value = MonitorSample {
-                                at: Instant::now(),
-                                snapshot,
-                                performance: Some(Err(e)),
-                                process_gpu: Default::default(),
-                                process_network: Default::default(),
-                            };
-                            if snapshots.try_send(value).is_ok() {
-                                unsafe {
-                                    PostMessageW(hwnd as HWND, SNAPSHOT_READY, 0, 0);
-                                }
+            if perf.is_none() {
+                match PerfSampler::new() {
+                    Ok(s) => perf = Some(s),
+                    Err(e) => {
+                        let value = MonitorSample {
+                            at: Instant::now(),
+                            snapshot,
+                            performance: Some(Err(e)),
+                            process_gpu: Default::default(),
+                            process_network: Default::default(),
+                        };
+                        if snapshots.try_send(value).is_ok() {
+                            unsafe {
+                                PostMessageW(hwnd as HWND, SNAPSHOT_READY, 0, 0);
                             }
-                            refresh = false;
-                            continue;
                         }
+                        refresh = false;
+                        continue;
                     }
                 }
-                perf.as_mut().map(PerfSampler::sample)
-            } else {
-                None
-            };
+            }
+            let perf_result = perf.as_mut().map(PerfSampler::sample);
             // Join both per-process maps with this iteration's process list
             // (keyed by pid and creation time, so a reused PID never
             // inherits a value).
@@ -791,7 +812,6 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
             Ok(Command::Configure {
                 interval: i,
                 paused: p,
-                performance: requested,
             }) => {
                 interval = i;
                 if p && !paused {
@@ -801,21 +821,21 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                     let _ = network.sample(&[]);
                 }
                 paused = p;
-                if performance != requested || paused {
+                if paused {
+                    // Rates after a pause start over (the UI records the gap).
                     perf = None;
                 }
-                performance = requested;
                 // A sample only milliseconds after the previous one measures
                 // CPU over a sliver of time: a needle at the start of every
                 // chart (the app configures itself twice while starting). A
                 // recent sample stands; the next comes on schedule, and a
-                // newly requested performance sampler is primed now (its
+                // performance sampler dropped by a pause is primed now (its
                 // first collection has no rates anyway).
                 let recent = last.is_some_and(|at| {
                     at.elapsed() < Duration::from_millis((interval / 2).max(100))
                 });
                 refresh = !paused && !recent;
-                if !paused && recent && performance && perf.is_none() {
+                if !paused && recent && perf.is_none() {
                     if let Ok(mut sampler) = PerfSampler::new() {
                         let _ = sampler.sample();
                         perf = Some(sampler);
@@ -1090,6 +1110,12 @@ unsafe fn keyboard(p: *mut App, msg: &MSG) -> bool {
 unsafe fn state(hwnd: HWND) -> *mut App {
     GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App
 }
+/// Explorer's "TaskbarCreated" broadcast (it restarted): re-add the tray icon.
+fn taskbar_created_message() -> u32 {
+    static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TASKBAR_CREATED
+        .get_or_init(|| unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) })
+}
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         let cs = &*(l as *const CREATESTRUCTW);
@@ -1100,12 +1126,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     if p.is_null() {
         return DefWindowProcW(hwnd, msg, w, l);
     }
-    static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    if msg != 0
-        && msg
-            == *TASKBAR_CREATED
-                .get_or_init(|| unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) })
-    {
+    if msg != 0 && msg == taskbar_created_message() {
         shell::taskbar_created(p);
         return 0;
     }
@@ -1116,6 +1137,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_CREATE => {
             (*p).dpi = GetDpiForWindow(hwnd).max(96) as i32;
             (*p).anim.attach(hwnd);
+            // UIPI drops Explorer's (medium integrity) broadcast to an
+            // elevated window, so a restarted Explorer would never get the
+            // hidden tray icon back. Only this message is let through; its
+            // handler just re-adds the icon.
+            let taskbar_created = taskbar_created_message();
+            if taskbar_created != 0 {
+                ChangeWindowMessageFilterEx(hwnd, taskbar_created, MSGFLT_ALLOW, null_mut());
+            }
             update_window_icons(p);
             create_controls(p);
             frame::attach(p);
@@ -2030,6 +2059,7 @@ unsafe fn tab_order(p: *mut App) -> Vec<HWND> {
         PREF_TOP,
         PREF_TRAY,
         PREF_REPLACE,
+        PREF_ADMIN,
     ] {
         order.push(GetDlgItem((*p).hwnd, id as i32));
     }
@@ -2056,10 +2086,10 @@ unsafe fn configure(p: *mut App) {
     if (*p).paused || (*p).minimized || (*p).modal {
         (*p).perf_history.gap(Instant::now());
     }
+    // Not the page: history keeps recording while another page is open.
     let _ = (*p).tx.send(Command::Configure {
         interval: (*p).interval,
         paused: (*p).paused || (*p).minimized || (*p).modal,
-        performance: matches!((*p).page, Page::Performance | Page::Processes),
     });
 }
 unsafe fn request_list(p: *mut App, page: Page) {
@@ -2100,7 +2130,6 @@ unsafe fn switch_page(p: *mut App, page: Page) {
     // Atomic: the head, its relabelled buttons, the search placeholder and
     // the table appear together (`present_all`).
     let suspended = suspend_painting(p);
-    let previous = (*p).page;
     (*p).updating = true;
     SendMessageW((*p).list, LVM_SETITEMCOUNT, 0, 0);
     (*p).rows.clear();
@@ -2130,13 +2159,8 @@ unsafe fn switch_page(p: *mut App, page: Page) {
     match page {
         Page::Startup if !(*p).startup_loaded => request_list(p, page),
         Page::Services => request_list(p, page),
-        // Coming from Processes the performance sampler kept running: its
-        // data is current. From other pages it stopped, and old values are
-        // not shown until the next sample.
-        Page::Performance if previous != Page::Processes => {
-            (*p).performance = None;
-            (*p).performance_error = None;
-        }
+        // The performance sample is current on every page (the monitor
+        // samples it throughout), so Performance shows it at once.
         _ => {}
     }
     configure(p);
@@ -3043,7 +3067,7 @@ unsafe fn drain_snapshot(p: *mut App) {
             } else {
                 snapshot.memory_used as f64 / snapshot.memory_total as f64 * 100.0
             };
-            let (disk, network) = if matches!((*p).page, Page::Performance | Page::Processes) {
+            let (disk, network) = if fresh_performance {
                 (*p).performance
                     .as_ref()
                     .map(|s| {
@@ -5360,6 +5384,30 @@ mod tests {
             assert!((*test.p).prefs.tray);
             command(test.p, PREF_TOP, 0);
             assert!((*test.p).topmost);
+            // Always run as administrator: saved at once (not here, where
+            // preferences never persist), applied from the next launch; the
+            // hidden test window keeps the toast text in the status bar. The
+            // test harness is not the installed copy, so the toast says the
+            // setting applies to that only.
+            assert!(!(*test.p).prefs.always_admin);
+            command(test.p, PREF_ADMIN, 0);
+            assert!((*test.p).prefs.always_admin);
+            if crate::netetw::is_elevated() {
+                assert!((&(*test.p).notice).is_empty());
+            } else {
+                assert_eq!((*test.p).notice, interactions::always_admin_notice());
+                assert_eq!(
+                    (*test.p).notice,
+                    tr(
+                        "이 설정은 이 버전과 같은 설치된 Feather에만 적용됩니다",
+                        "This applies only to an installed Feather of this same version",
+                    )
+                );
+            }
+            (*test.p).notice.clear();
+            command(test.p, PREF_ADMIN, 0);
+            assert!(!(*test.p).prefs.always_admin);
+            assert!((&(*test.p).notice).is_empty(), "no toast when turned off");
             command(test.p, THEME_DARK, 0);
             assert!(colors().dark);
             command(test.p, THEME_LIGHT, 0);
@@ -5426,6 +5474,186 @@ mod tests {
             assert_eq!((*test.p).perf_target, target);
             assert!((*test.p).perf_targets.contains(&target));
         }
+    }
+    /// The reported broken chart segments: after Startup apps, Services or
+    /// Settings, the Performance charts had a gap, because only Performance
+    /// and Processes sampled the counters. Every page records the history
+    /// now and Performance shows the current sample at once; a pause (here
+    /// minimizing) still marks a gap.
+    #[test]
+    fn performance_history_continues_on_every_page_and_minimize_still_gaps() {
+        let test = TestWindow::new();
+        let mut perf = PerfSampler::new().unwrap().sample().unwrap();
+        perf.logical_processors = vec![crate::performance::LogicalProcessor {
+            id: "fixture cpu".into(),
+            group: 0,
+            index: 0,
+            percent: Some(40.),
+        }];
+        perf.disks = vec![crate::performance::DiskStats {
+            id: "fixture disk".into(),
+            read_bytes_per_sec: Some(10.),
+            write_bytes_per_sec: Some(20.),
+            active_percent: Some(30.),
+        }];
+        perf.networks.clear();
+        perf.gpus.clear();
+        // Warm rates, as every sample after the first has (the overview's
+        // disk and network history).
+        perf.disk_rates_ready = true;
+        perf.disk_read_bytes_per_sec = 10.;
+        perf.disk_write_bytes_per_sec = 20.;
+        perf.network_rates_ready = true;
+        perf.network_rx_bytes_per_sec = 1.;
+        perf.network_tx_bytes_per_sec = 2.;
+        let feed = |at: Instant| {
+            test.snapshots
+                .send(MonitorSample {
+                    at,
+                    snapshot: Ok(Snapshot {
+                        processes: rows(),
+                        cpu_percent: 12.,
+                        memory_used: 100,
+                        memory_total: 400,
+                        sample_ms: 1.,
+                    }),
+                    performance: Some(Ok(perf.clone())),
+                    process_gpu: Default::default(),
+                    process_network: Default::default(),
+                })
+                .unwrap();
+            unsafe {
+                SendMessageW((*test.p).hwnd, SNAPSHOT_READY, 0, 0);
+            }
+        };
+        // Past timestamps, so the gap recorded at "now" comes after them.
+        let start = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();
+        let pages = [
+            Page::Performance,
+            Page::Startup,
+            Page::Performance,
+            Page::Services,
+            Page::Settings,
+            Page::Performance,
+            Page::Processes,
+        ];
+        unsafe {
+            for (i, page) in pages.into_iter().enumerate() {
+                test.page(page);
+                assert_eq!((*test.p).page, page);
+                // Switching pages never pauses sampling.
+                while let Ok(command) = test.commands.try_recv() {
+                    assert!(
+                        matches!(command, Command::Configure { paused: false, .. }),
+                        "{page:?}"
+                    );
+                }
+                if i > 0 {
+                    assert!((*test.p).performance.is_some(), "{page:?} kept the sample");
+                }
+                feed(start + Duration::from_secs(i as u64));
+            }
+            let history = &(*test.p).perf_history;
+            for target in [
+                PerfTarget::Cpu,
+                PerfTarget::Memory,
+                PerfTarget::Disk("fixture disk".into()),
+            ] {
+                let trace = &history.traces[&target];
+                assert_eq!(trace.points.len(), pages.len(), "{target:?}");
+                assert!(
+                    trace.points.iter().all(|p| p.values[0].is_finite()),
+                    "{target:?} has no gap"
+                );
+            }
+            let core = &history.cores["fixture cpu"];
+            assert_eq!(core.points.len(), pages.len());
+            assert!(core.points.iter().all(|p| p.values[0] == 40.));
+            // The overview history kept its disk and network values on the
+            // other pages too (they used to be gaps there).
+            let overview = &(*test.p).history;
+            assert_eq!(overview.len(), pages.len());
+            for point in overview {
+                assert_eq!((point.disk, point.network), (30., 3.));
+            }
+            SendMessageW((*test.p).hwnd, WM_SIZE, SIZE_MINIMIZED as usize, 0);
+            assert!(matches!(
+                test.commands.try_recv().unwrap(),
+                Command::Configure { paused: true, .. }
+            ));
+            let last = |target: &PerfTarget| {
+                (&(*test.p).perf_history.traces)[target]
+                    .points
+                    .back()
+                    .unwrap()
+                    .values[0]
+            };
+            assert!(last(&PerfTarget::Cpu).is_nan(), "minimized is a gap");
+            assert!((&(*test.p).perf_history.cores)["fixture cpu"]
+                .points
+                .back()
+                .unwrap()
+                .values[0]
+                .is_nan());
+            SendMessageW((*test.p).hwnd, WM_SIZE, SIZE_RESTORED as usize, 0);
+            feed(Instant::now());
+            assert_eq!(last(&PerfTarget::Cpu), 12.);
+        }
+    }
+    /// The monitor samples the performance counters every interval whatever
+    /// the page (the command no longer names one), also after a pause, and a
+    /// page switch keeps the sampler warm (its next sample has rates).
+    #[test]
+    fn monitor_samples_performance_every_interval_and_after_a_pause() {
+        // Elevated, the monitor would start the per-process network ETW
+        // session; the default test run never starts one.
+        if crate::netetw::is_elevated() {
+            return;
+        }
+        let (tx, commands) = mpsc::channel();
+        let (snapshots, rx) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || monitor(0, commands, snapshots));
+        let configure = |paused| {
+            tx.send(Command::Configure {
+                interval: 250,
+                paused,
+            })
+            .unwrap()
+        };
+        let next = |label: &str| {
+            let sample = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            assert!(sample.snapshot.is_ok(), "{label}");
+            assert!(matches!(sample.performance, Some(Ok(_))), "{label}");
+            sample
+        };
+        // A warm sampler reports per-CPU usage; a new one's first sample
+        // has no rates at all.
+        let warm = |sample: &MonitorSample| matches!(&sample.performance, Some(Ok(s)) if !s.logical_processors.is_empty());
+        configure(false);
+        let first = next("first sample");
+        assert!(!warm(&first), "a new sampler has no rates yet");
+        next("second sample");
+        let third = next("third sample");
+        // Where the per-CPU counters work (not every machine exposes them),
+        // a page switch (Configure without a pause) must not restart the
+        // sampler: past the "recent sample" window (125 ms here) the switch
+        // samples at once, and that sample still has rates.
+        let counters_work = warm(&third);
+        std::thread::sleep(Duration::from_millis(150));
+        configure(false);
+        let after_switch = next("after a page switch");
+        if counters_work {
+            assert!(warm(&after_switch), "the page switch kept the sampler");
+        }
+        // A pause drops it (the UI records the gap); sampling resumes with
+        // performance data every interval.
+        configure(true);
+        configure(false);
+        for i in 0..2 {
+            next(&format!("after the pause {i}"));
+        }
+        tx.send(Command::Stop).unwrap();
+        thread.join().unwrap();
     }
     /// Client-relative rectangle of a child control.
     unsafe fn child(p: *mut App, h: HWND) -> RECT {
@@ -5571,6 +5799,7 @@ mod tests {
                 (PREF_TOP, 2, 0, 4),
                 (PREF_TRAY, 2, 1, 4),
                 (PREF_REPLACE, 2, 2, 4),
+                (PREF_ADMIN, 2, 3, 4),
             ] {
                 let h = GetDlgItem((*p).hwnd, id as i32);
                 let r = child(p, h);

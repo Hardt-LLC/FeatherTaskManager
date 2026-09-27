@@ -637,6 +637,12 @@ pub fn launch_task(path: &str) -> Result<(), String> {
     shell_execute("open", executable.as_os_str(), None)
 }
 
+/// Private marker on every elevated relaunch of the UI (this one-shot
+/// command and "Always run as administrator"): the instance it starts never
+/// relaunches itself again, and says so when Windows started it unelevated
+/// (a standard user with UAC turned off), instead of repeating the launch.
+pub const ELEVATED_RELAUNCH: &str = "--elevated-relaunch";
+
 /// Request elevation through the standard UAC flow; the caller may close on success.
 pub fn relaunch_elevated() -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| {
@@ -648,7 +654,10 @@ pub fn relaunch_elevated() -> Result<(), String> {
             )
         )
     })?;
-    let parameters = format!("--language {}", crate::i18n::language().code());
+    let parameters = format!(
+        "--language {} {ELEVATED_RELAUNCH}",
+        crate::i18n::language().code()
+    );
     shell_execute(
         "runas",
         executable.as_os_str(),

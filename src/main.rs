@@ -30,12 +30,25 @@ use std::path::Path;
 /// `restrict_dll_search`); the process then runs no other code.
 const DLL_SEARCH_POLICY_FAILED: i32 = 3;
 
+/// The uninstaller's helper that deletes this account's preferences.
+const REMOVE_USER_PREFERENCES: &str = "--remove-user-preferences";
+/// Everything Feather stores per user, below HKCU: the `Preferences` subkey
+/// with the window settings (ui/preferences.rs) and `Language` (i18n.rs).
+const USER_PREFERENCES_KEY: &str = r"Software\FeatherTask";
+
 fn main() {
     // First, before any other code can make Windows load a DLL (FTM-2026-05).
     if !restrict_dll_search() {
         std::process::exit(DLL_SEARCH_POLICY_FAILED);
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(REMOVE_USER_PREFERENCES) {
+        // Run by the (elevated) uninstaller before it deletes the files.
+        // Nothing else happens first: no language or preference read, no
+        // "Always run as administrator" relaunch (that is `ui::run`), no
+        // files and no UI. The result is the exit code only.
+        std::process::exit(remove_user_preferences(&args, USER_PREFERENCES_KEY));
+    }
     i18n::initialize(&args);
     if let Some(result) = match args.get(1).map(String::as_str) {
         Some("--install-task-manager") => Some(replacement::apply(true)),
@@ -189,6 +202,25 @@ fn purge_helper_argument(args: &[String]) -> Option<&str> {
         _ => None,
     }
     .map(String::as_str)
+}
+
+/// `FeatherTaskManager.exe --remove-user-preferences`, accepted only with no
+/// other argument (else exit code 1): delete the HKCU key `path` of the
+/// account running it, with every subkey, never following a registry link
+/// (`registry::delete_tree`: a link is removed as the link itself and its
+/// target is left untouched). Exit code 0 when the key is gone or never
+/// existed, 2 when it could not be removed completely.
+fn remove_user_preferences(args: &[String], path: &str) -> i32 {
+    if !matches!(args, [_, flag] if flag == REMOVE_USER_PREFERENCES) {
+        return 1;
+    }
+    match registry::delete_tree(
+        windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
+        path,
+    ) {
+        Ok(()) => 0,
+        Err(_) => 2,
+    }
 }
 
 /// The output path of a diagnostic command (the argument after it), unless
@@ -795,6 +827,53 @@ mod tests {
             output_argument(&args(&["app", flag, "--language", "en"])),
             None
         );
+    }
+
+    /// Always against a temporary test key, never the real preferences.
+    #[test]
+    fn cli_remove_user_preferences_accepts_only_the_exact_argument() {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_QUERY_VALUE};
+        let exists = |path: &str| {
+            registry::open(HKEY_CURRENT_USER, path, KEY_QUERY_VALUE)
+                .unwrap()
+                .is_some()
+        };
+        let fixture = registry::test_support::Fixture::new();
+        let path = fixture.path("FeatherTask");
+        assert_ne!(path, USER_PREFERENCES_KEY);
+        drop(fixture.key(r"FeatherTask\Preferences"));
+        let flag = REMOVE_USER_PREFERENCES;
+        for rejected in [
+            &["app"][..],
+            &["app", flag, "extra"],
+            &["app", flag, ""],
+            &["app", flag, "--language", "en"],
+            &["app", "--language", "en", flag],
+            &["app", "extra", flag],
+            &["app", "--remove-user-preferences=1"],
+            &["app", "--Remove-User-Preferences"],
+            &["app", "--remove-user-preference"],
+        ] {
+            assert_eq!(
+                remove_user_preferences(&args(rejected), &path),
+                1,
+                "{rejected:?}"
+            );
+        }
+        assert!(exists(&fixture.path(r"FeatherTask\Preferences")));
+        assert_eq!(remove_user_preferences(&args(&["app", flag]), &path), 0);
+        assert!(!exists(&path));
+        // Already gone, or never there: success as well.
+        assert_eq!(remove_user_preferences(&args(&["app", flag]), &path), 0);
+        // A key that cannot be removed safely (a link among its ancestors).
+        let target = fixture.key("UnrelatedTarget");
+        drop(fixture.key(r"UnrelatedTarget\FeatherTask"));
+        let _link = fixture.link("Link", Some(&target));
+        assert_eq!(
+            remove_user_preferences(&args(&["app", flag]), &fixture.path(r"Link\FeatherTask")),
+            2
+        );
+        assert!(exists(&fixture.path(r"UnrelatedTarget\FeatherTask")));
     }
 
     /// A private folder under %TEMP%, removed on drop.

@@ -1,4 +1,15 @@
-# Feather Task Manager 2026.9.3 검증 기록
+# Feather Task Manager 검증 기록
+
+## 2026.9.4
+
+2026-09-27, Windows 11 x64(빌드 26200).
+
+- `cargo test --locked`: **305개 통과, 3개 제외, 실패 없음**. `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --release --locked`, 배포 스크립트 검사(정상 2개 허용·잘못된 상태 6개 거부 ×2): 통과.
+- 새 검사: 모든 화면에서 성능 기록이 끊기지 않고 최소화는 여전히 끊김으로 남는지, 실제 모니터 스레드가 화면 전환 중에도 성능 샘플러를 유지하는지, 관리자 자동 실행 판단(설정·권한·표시 인수·진단 모드·인수 허용 목록)과 포터블 사본을 대상으로 삼지 않는지, 창마다 바꾼 설정만 저장하는지, 제거용 환경설정 삭제가 하위 키를 지우고 레지스트리 링크는 링크만 지우며 대상 키를 그대로 두는지(일반 `RegDeleteTreeW`는 대상을 지워 이 검사에 실패함을 확인).
+- 앱·설치 프로그램은 서명 `Valid`, 게시자 `CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US`, 타임스탬프, 버전 `2026.9.4.0`, 회사명 `HARDT`를 확인했습니다([signatures-2026.9.4.json](measurements/signatures-2026.9.4.json)). 서명된 포터블 앱의 [자체 검사](measurements/self-test-2026.9.4.txt)는 `PASS`입니다.
+- 실제 UAC 승인·거절, 설치된 사본의 관리자 자동 실행, 관리자 권한 창의 트레이 동작, 실제 제거 시 환경설정 삭제는 이 환경에서 실행하지 않았으며 별도 VM 확인이 필요합니다.
+
+## 2026.9.3
 
 2026-09-27, Windows 11 x64(빌드 26200)에서 새 디자인, 하드웨어 정보, Nuclear Zombie와 보안 수정의 회귀 검사를 수행했습니다. 보안 검토 결과와 수정 내용은 [SECURITY.md](SECURITY.md)에 정리했습니다.
 

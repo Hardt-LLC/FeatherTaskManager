@@ -339,8 +339,17 @@ enum Launch {
     ExitUnknown(std::io::Error),
 }
 
-/// Start `file` elevated (UAC "runas") with `parameters` and wait for it.
-fn runas_and_wait(file: &Path, parameters: &str) -> Launch {
+/// Why [`runas`] started no process.
+enum StartFailure {
+    Cancelled,
+    Failed(std::io::Error),
+    NoProcess,
+}
+
+/// Start `file` elevated (UAC "runas") with `parameters`. `SEE_MASK_NOASYNC`
+/// returns only once the start is complete, so a caller may exit right away,
+/// and the process handle proves that a process really started.
+fn runas(file: &Path, parameters: &str) -> Result<Process, StartFailure> {
     let file = wide(file.as_os_str());
     let verb = wide("runas");
     let parameters = wide(parameters);
@@ -356,14 +365,24 @@ fn runas_and_wait(file: &Path, parameters: &str) -> Launch {
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(ERROR_CANCELLED as i32) {
-            return Launch::Cancelled;
+            return Err(StartFailure::Cancelled);
         }
-        return Launch::StartFailed(error);
+        return Err(StartFailure::Failed(error));
     }
     if info.hProcess.is_null() {
-        return Launch::NoProcess;
+        return Err(StartFailure::NoProcess);
     }
-    let process = Process(info.hProcess);
+    Ok(Process(info.hProcess))
+}
+
+/// Start `file` elevated (UAC "runas") with `parameters` and wait for it.
+fn runas_and_wait(file: &Path, parameters: &str) -> Launch {
+    let process = match runas(file, parameters) {
+        Ok(process) => process,
+        Err(StartFailure::Cancelled) => return Launch::Cancelled,
+        Err(StartFailure::Failed(error)) => return Launch::StartFailed(error),
+        Err(StartFailure::NoProcess) => return Launch::NoProcess,
+    };
     if unsafe { WaitForSingleObject(process.0, INFINITE) } != WAIT_OBJECT_0 {
         return Launch::WaitFailed(std::io::Error::last_os_error());
     }
@@ -501,6 +520,68 @@ pub fn run_installed_helper(arguments: &str) -> Result<HelperLaunch, String> {
         )
         .into()),
     }
+}
+
+/// How [`relaunch_installed_elevated`] ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Relaunch {
+    /// The elevated instance started.
+    Started,
+    /// The UAC prompt was declined.
+    Cancelled,
+}
+
+/// The installed image that "Always run as administrator" may start
+/// elevated, with its path and image pinned: the protected Program Files
+/// copy of this very build, like the helpers. A portable current_exe() is
+/// never elevated automatically (it can be renamed and replaced while it
+/// runs, and the setting would repeat that at every start).
+fn installed_relaunch_target() -> Result<(PathBuf, InstallationLocks), String> {
+    let path = install_path().map_err(always_admin_needs_installation)?;
+    let locks = lock_existing_installation(&path).map_err(always_admin_needs_installation)?;
+    if !same_build(&path).map_err(always_admin_needs_installation)? {
+        return Err(tr(
+            "항상 관리자 권한으로 실행은 이 버전과 같은 설치된 Feather에만 적용됩니다. 이 버전을 설치하세요.",
+            "Always run as administrator applies only to an installed Feather of this same version. Install this version.",
+        )
+        .into());
+    }
+    Ok((path, locks))
+}
+
+/// Whether "Always run as administrator" can start the installed image
+/// (Settings, when the switch is turned on); Err says why not. Read-only.
+pub fn check_installed_relaunch() -> Result<(), String> {
+    installed_relaunch_target().map(|_| ())
+}
+
+/// "Always run as administrator": start the pinned installed image of this
+/// build through the UAC consent prompt with the fixed `arguments`, and
+/// return once it has started (no wait; the caller exits). The locks are
+/// held until the elevated process exists.
+pub fn relaunch_installed_elevated(arguments: &[&'static str]) -> Result<Relaunch, String> {
+    let (path, _installation) = installed_relaunch_target()?;
+    match runas(&path, &arguments.join(" ")) {
+        Ok(_process) => Ok(Relaunch::Started),
+        Err(StartFailure::Cancelled) => Ok(Relaunch::Cancelled),
+        Err(StartFailure::Failed(error)) => Err(crate::trf!(
+            "관리자 권한으로 시작할 수 없습니다: {}",
+            "Cannot start as administrator: {}",
+            error
+        )),
+        Err(StartFailure::NoProcess) => Err(tr(
+            "관리자 권한 프로세스를 확인할 수 없습니다.",
+            "Cannot verify the administrator process.",
+        )
+        .into()),
+    }
+}
+
+fn always_admin_needs_installation(detail: String) -> String {
+    crate::trf!(
+        "항상 관리자 권한으로 실행은 설치된 Feather에만 적용됩니다. 보호된 설치 파일을 확인할 수 없습니다: {detail}",
+        "Always run as administrator applies only to the installed Feather. The protected installed executable could not be verified: {detail}"
+    )
 }
 
 fn helper_installation_required(detail: String) -> String {
@@ -1234,6 +1315,17 @@ mod tests {
         .starts_with("Install or repair Feather Task Manager"));
         assert!(read_value(&key, "Debugger").unwrap().is_none());
         assert_eq!(read_value(&key, "Unrelated").unwrap(), Some(unrelated));
+    }
+
+    #[test]
+    fn always_run_as_administrator_never_targets_a_portable_copy() {
+        // The test harness is neither the installed image nor a copy of it,
+        // so the (read-only) check refuses it; no UAC prompt is involved.
+        let refused = with_language(Language::English, check_installed_relaunch).unwrap_err();
+        assert!(
+            refused.starts_with("Always run as administrator applies only to"),
+            "{refused}"
+        );
     }
 
     #[test]

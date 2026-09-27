@@ -12,7 +12,7 @@ AppId={{E5C76533-366A-4865-A845-F912B79413B6}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=Hardt LLC
+AppPublisher=HARDT
 AppPublisherURL=https://github.com/Hardt-LLC/FeatherTaskManager
 AppSupportURL=https://github.com/Hardt-LLC/FeatherTaskManager/issues
 AppUpdatesURL=https://github.com/Hardt-LLC/FeatherTaskManager/releases
@@ -222,5 +222,17 @@ begin
       MsgBox(GetExceptionMessage, mbError, MB_OK);
       Abort;
     end;
+    { Only after the Task Manager check above, and while the installed helper
+      still exists: delete HKCU\Software\FeatherTask (preferences, language).
+      This elevated uninstaller's HKCU is the account that runs it; when a
+      standard user approves UAC with an administrator's credentials, that is
+      the administrator's HKCU. Other accounts keep their preferences. The
+      helper never follows a registry link. A failure does not stop removal. }
+    if not FileExists(ExpandConstant('{app}\{#AppExe}')) then
+      Log('Feather preferences not removed: the application file is missing.')
+    else if not Exec(ExpandConstant('{app}\{#AppExe}'), '--remove-user-preferences', '', SW_HIDE, ewWaitUntilTerminated, Code) then
+      Log('Feather preferences not removed: the helper could not start.')
+    else if Code <> 0 then
+      Log(Format('Feather preferences not removed completely (helper exit code %d).', [Code]));
   end;
 end;

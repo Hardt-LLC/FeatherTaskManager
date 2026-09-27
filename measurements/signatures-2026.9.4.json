@@ -1,0 +1,24 @@
+[
+    {
+        "Name":  "FeatherTaskManager-2026.9.4-Portable-x64.exe",
+        "Status":  "Valid",
+        "Subject":  "CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US",
+        "Thumbprint":  "9EEDBB73BC0FA5A183BAB3C2013C47E5649A9837",
+        "Timestamped":  true,
+        "FileVersion":  "2026.9.4.0",
+        "CompanyName":  "HARDT",
+        "Bytes":  1900272,
+        "Sha256":  "803c06793afddc5e64395fb3131e479e25358a8a3ca5f461d98783d7d86b0de5"
+    },
+    {
+        "Name":  "FeatherTaskManager-2026.9.4-Setup-x64.exe",
+        "Status":  "Valid",
+        "Subject":  "CN=HARDT, O=HARDT, L=Casper, S=Wyoming, C=US",
+        "Thumbprint":  "9EEDBB73BC0FA5A183BAB3C2013C47E5649A9837",
+        "Timestamped":  true,
+        "FileVersion":  "2026.9.4.0          ",
+        "CompanyName":  "HARDT                                                       ",
+        "Bytes":  2834128,
+        "Sha256":  "5d24333aabb52cde92855092ffbf6473a38c2109dc275045d8f174d007fc1e5d"
+    }
+]

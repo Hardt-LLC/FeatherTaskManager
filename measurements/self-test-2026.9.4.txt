@@ -1,0 +1,20 @@
+PASS
+processes=600
+services=337
+startup_entries=34
+first_snapshot_ms=8.964
+sample_median_ms=9.124
+sample_max_ms=10.050
+executable=C:\taskmgr\dist\FeatherTaskManager-2026.9.4-Portable-x64.exe
+performance_cpu=AMD Ryzen 7 9800X3D 8-Core Processor
+performance_disk_ready=true
+performance_network_ready=true
+performance_gpu=Some(23.840533949953763)
+memory_modules=2 of Some(4), Some("DDR5"), Some("DIMM"), Some(6400) MT/s, installed Some(68719476736) B, visible Some(68305092608) B
+storage=[(0, Some("Samsung SSD 860 EVO 1TB"), Some("SATA")), (1, Some("SHPP51-2000GM"), Some("NVMe")), (2, Some("Samsung SSD 970 EVO Plus 2TB"), Some("NVMe")), (3, Some("SanDisk Cruzer Blade"), Some("USB"))]
+gpu=luid_0x00000000_0x00017717_phys_0 name=Some("NVIDIA GeForce RTX 5080") temperature_c=Some(38.2)
+gpu=luid_0x00000000_0x00018BDC_phys_0 name=Some("Microsoft Basic Render Driver") temperature_c=None
+process_gpu_attributed=600 thermal_zones=0 gpu_adapters=3
+process_network_elevated=false measured=false reason=Some("Requires administrator") interval_s=0.000 rated_processes=0 total_send_bytes_per_sec=0 total_recv_bytes_per_sec=0 etw_events=0
+performance_warnings=[]
+Checks: live snapshots, own identity, memory bounds, finite CPU/I/O, stale PID rejection, System/self protection, disposable child termination, read-only service/startup enumeration, native performance providers, hardware identity bounds (SMBIOS, storage, D3DKMT, sensors, thermal zones), per-process GPU bounds and PID-reuse attribution, per-process network availability and bounds.

@@ -46,6 +46,7 @@ Release executables and installers are signed by **HARDT** through Azure Artifac
 - Use **⋯ → Show / hide live telemetry** for selected-process CPU, memory and all-I/O history.
 - Select **Processes → Nuclear Zombie** (or `Ctrl+K` → "memory") to clean up memory and list zombie processes. Efficiency mode is in the **⋯** and right-click menus.
 - `—` means unmeasured. Per-process GPU uses Windows Task Manager's rule (the busiest engine); per-process network is measured only when Feather runs as administrator. Startup impact and CPU temperature are not collected.
+- Turn on **Settings → Always run as administrator** to start elevated every time (per-process network, full zombie scans). It applies to the installed Feather only: every start, including each `Ctrl+Shift+Esc` even while an elevated window is open, shows the Windows UAC prompt, and Feather keeps running with standard rights if you decline. A portable copy is never elevated automatically; **Processes → ⋯ → Run as administrator** elevates the running copy once.
 - To replace Windows Task Manager, install with Setup first, then select **Settings → Replace Windows Task Manager** and approve the administrator prompt. This enables `Ctrl+Shift+Esc` and `Ctrl+Alt+Delete → Task Manager`. Turn the same setting off to restore Windows Task Manager before manually deleting the app.
 
 | Shortcut | Action |
@@ -73,4 +74,4 @@ Run `target\release\FeatherTaskManager.exe`. For signed installers and release p
 
 ## License
 
-[MIT](LICENSE). Third-party licenses are listed in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) and [RUST_LIBRARY_NOTICES.html](RUST_LIBRARY_NOTICES.html).
+[MIT](LICENSE). Third-party licenses are listed in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) and [RUST_LIBRARY_NOTICES.html](RUST_LIBRARY_NOTICES.html). Feather collects no personal data; see the [privacy policy](PRIVACY.md). Report security issues privately as described in [SECURITY.md](SECURITY.md).

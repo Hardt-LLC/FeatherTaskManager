@@ -150,12 +150,20 @@ pub(super) unsafe fn component_name(p: *mut App, target: &PerfTarget) -> String 
         }
     }
 }
-unsafe fn save(p: *mut App) {
+/// Save the preferences; false (with the error shown) when that failed.
+unsafe fn save(p: *mut App) -> bool {
     if !(*p).persist_preferences {
-        return;
+        return true;
     }
-    if let Err(e) = (*p).prefs.save() {
-        (*p).set_error(ErrorSource::Action, e);
+    match (*p).prefs.save(&(*p).stored_prefs) {
+        Ok(()) => {
+            (*p).stored_prefs = (*p).prefs.clone();
+            true
+        }
+        Err(e) => {
+            (*p).set_error(ErrorSource::Action, e);
+            false
+        }
     }
 }
 pub(super) unsafe fn rate_changed(p: *mut App, control: HWND) {
@@ -205,6 +213,10 @@ pub(super) unsafe fn create_settings_controls(p: *mut App) {
         (PREF_TOP, tr("항상 위", "Always on top")),
         (PREF_TRAY, tr("트레이로 최소화", "Minimize to tray")),
         (PREF_REPLACE, tr("작업 관리자 대체", "Replace Task Manager")),
+        (
+            PREF_ADMIN,
+            tr("항상 관리자 권한으로 실행", "Always run as administrator"),
+        ),
     ] {
         let h = button(p, label, id);
         (*p).preference_controls.push(h);
@@ -318,6 +330,7 @@ pub(super) unsafe fn layout_settings(p: *mut App, l: &layout::Layout) {
             (PREF_TOP, (*p).topmost),
             (PREF_TRAY, (*p).prefs.tray),
             (PREF_REPLACE, (*p).replacement_active),
+            (PREF_ADMIN, (*p).prefs.always_admin),
         ] {
             (*p).anim.set((id, anim::part::SWITCH), on as u8 as f32);
         }
@@ -386,7 +399,12 @@ pub(super) unsafe fn layout_settings(p: *mut App, l: &layout::Layout) {
         );
     }
     ReleaseDC((*p).hwnd, dc);
-    for (id, index) in [(PREF_TOP, 0), (PREF_TRAY, 1), (PREF_REPLACE, 2)] {
+    for (id, index) in [
+        (PREF_TOP, 0),
+        (PREF_TRAY, 1),
+        (PREF_REPLACE, 2),
+        (PREF_ADMIN, 3),
+    ] {
         let h = GetDlgItem((*p).hwnd, id as i32);
         let (r, content) = row(2, index);
         let margin = l.px(4.0);
@@ -507,6 +525,22 @@ pub(super) unsafe fn command(p: *mut App, id: usize, notification: u32) -> bool 
             sync_settings(p);
             redraw(p);
         }
+        PREF_ADMIN => {
+            // Saved at once; it applies from the next launch (`elevation.rs`),
+            // to the installed copy only. "Run as administrator" in the ⋯
+            // menu still elevates this copy right now.
+            let on = !(*p).prefs.always_admin;
+            (*p).prefs.always_admin = on;
+            if !save(p) {
+                // Not saved (the error is shown): the switch keeps the
+                // stored state, and no later save stores it silently.
+                (*p).prefs.always_admin = !on;
+            } else if on && !crate::netetw::is_elevated() {
+                controls::notify_success(p, always_admin_notice().into());
+            }
+            sync_settings(p);
+            redraw(p);
+        }
         PREF_REPLACE if !(*p).busy && !(*p).modal => {
             let active = matches!(
                 crate::replacement::status(),
@@ -532,6 +566,21 @@ pub(super) unsafe fn command(p: *mut App, id: usize, notification: u32) -> bool 
         _ => return false,
     }
     true
+}
+/// The toast after "Always run as administrator" is turned on unelevated:
+/// what the next launch will really do (`replacement::check_installed_relaunch`).
+pub(super) fn always_admin_notice() -> &'static str {
+    if crate::replacement::check_installed_relaunch().is_ok() {
+        tr(
+            "다음 실행부터 관리자 권한(UAC)을 요청합니다",
+            "From the next launch, Feather asks for administrator rights (UAC)",
+        )
+    } else {
+        tr(
+            "이 설정은 이 버전과 같은 설치된 Feather에만 적용됩니다",
+            "This applies only to an installed Feather of this same version",
+        )
+    }
 }
 unsafe fn efficiency(p: *mut App) {
     if let (Some(process), Some(enabled)) = (

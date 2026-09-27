@@ -9,12 +9,18 @@
 //! This helper accepts native registry paths only; callers must explicitly map
 //! any supported redirected locations. Native NtOpenKey does not implement the
 //! Win32 WOW64 view selection, so KEY_WOW64_32KEY is rejected rather than ignored.
+//! [`delete_tree`] removes a key tree the same way and deletes a link in it as
+//! the link itself (OBJ_OPENLINK), never touching its target.
 //!
 //! https://learn.microsoft.com/windows/win32/api/ntdef/ns-ntdef-_object_attributes
 //! https://learn.microsoft.com/windows-hardware/drivers/ddi/wdm/nf-wdm-zwcreatekey
 
-use std::{ffi::c_void, mem::size_of, ptr::null_mut};
-use windows_sys::Win32::{Foundation::*, System::Registry::*};
+use std::{
+    ffi::c_void,
+    mem::size_of,
+    ptr::{null, null_mut},
+};
+use windows_sys::Win32::{Foundation::*, Storage::FileSystem::DELETE, System::Registry::*};
 
 #[repr(C)]
 struct ObjectAttributes {
@@ -38,6 +44,7 @@ unsafe extern "system" {
         options: u32,
         disposition: *mut u32,
     ) -> NTSTATUS;
+    fn NtDeleteKey(key: HKEY) -> NTSTATUS;
 }
 
 #[derive(Debug)]
@@ -50,25 +57,38 @@ impl Drop for Key {
 }
 
 fn native(parent: HKEY, name: &str, access: u32, create: bool) -> Result<Key, u32> {
-    let mut text: Vec<u16> = name.encode_utf16().collect();
+    let text: Vec<u16> = name.encode_utf16().collect();
+    native_units(parent, &text, access, OBJ_DONT_REPARSE, create)
+}
+
+/// Open or create the component `text` relative to `parent`. `flags` is
+/// OBJ_DONT_REPARSE, alone or with OBJ_OPENLINK (open a link as itself).
+fn native_units(
+    parent: HKEY,
+    text: &[u16],
+    access: u32,
+    flags: u32,
+    create: bool,
+) -> Result<Key, u32> {
     let length = text
         .len()
         .checked_mul(2)
         .filter(|len| *len <= u16::MAX as usize)
         .ok_or(ERROR_INVALID_PARAMETER)? as u16;
-    if text.is_empty() || text.contains(&0) {
+    if text.is_empty() || text.contains(&0) || flags & OBJ_DONT_REPARSE == 0 {
         return Err(ERROR_INVALID_PARAMETER);
     }
     let name = UNICODE_STRING {
         Length: length,
         MaximumLength: length,
-        Buffer: text.as_mut_ptr(),
+        // The kernel only reads the name.
+        Buffer: text.as_ptr().cast_mut(),
     };
     let attributes = ObjectAttributes {
         length: size_of::<ObjectAttributes>() as u32,
         root: parent,
         name: &name,
-        attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        attributes: OBJ_CASE_INSENSITIVE | flags,
         security_descriptor: std::ptr::null(),
         security_quality_of_service: std::ptr::null(),
     };
@@ -160,6 +180,109 @@ pub fn create(hive: HKEY, path: &str, access: u32) -> Result<Key, u32> {
     traverse(hive, path, access, true)
 }
 
+/// Levels below the key that [`delete_tree`] descends to at most.
+const DELETE_MAX_DEPTH: usize = 32;
+/// Keys (the removed key included) that one [`delete_tree`] removes at most.
+const DELETE_MAX_KEYS: usize = 10_000;
+
+/// Delete the key `path` (at least `Parent\Name`) of `hive` with all its
+/// subkeys and values. Succeeds when the key is gone, including when it or
+/// an ancestor never existed.
+///
+/// No registry link is ever followed. The ancestors are opened like
+/// [`open`], so a link among them fails the call. The key and every subkey
+/// are opened one component at a time below their pinned parent with
+/// OBJ_OPENLINK | OBJ_DONT_REPARSE, which yields the named key itself: a link
+/// (finished or not) is enumerated and deleted as the link object, and its
+/// target is never opened, enumerated or deleted. Deeper than
+/// DELETE_MAX_DEPTH levels or larger than DELETE_MAX_KEYS keys fails with
+/// ERROR_STACK_OVERFLOW / ERROR_NOT_ENOUGH_QUOTA; subtrees finished before
+/// that stay deleted.
+pub fn delete_tree(hive: HKEY, path: &str) -> Result<(), u32> {
+    delete_tree_within(hive, path, DELETE_MAX_DEPTH, DELETE_MAX_KEYS)
+}
+
+fn delete_tree_within(
+    hive: HKEY,
+    path: &str,
+    max_depth: usize,
+    max_keys: usize,
+) -> Result<(), u32> {
+    let (ancestors, name) = path.rsplit_once('\\').ok_or(ERROR_INVALID_PARAMETER)?;
+    let parent = match traverse(hive, ancestors, KEY_QUERY_VALUE, false) {
+        Ok(parent) => parent,
+        Err(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => return Ok(()),
+        Err(code) => return Err(code),
+    };
+    let name: Vec<u16> = name.encode_utf16().collect();
+    let mut budget = max_keys;
+    delete_subtree(&parent, &name, max_depth, &mut budget)
+}
+
+/// Delete the subkey `name` of `parent` (a single component) and everything
+/// below it, depth first; `depth` levels may still follow below it.
+fn delete_subtree(parent: &Key, name: &[u16], depth: usize, budget: &mut usize) -> Result<(), u32> {
+    if name.contains(&u16::from(b'\\')) {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    let key = match native_units(
+        parent.0,
+        name,
+        DELETE | KEY_ENUMERATE_SUB_KEYS,
+        OBJ_OPENLINK | OBJ_DONT_REPARSE,
+        false,
+    ) {
+        Ok(key) => key,
+        Err(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => return Ok(()),
+        Err(code) => return Err(code),
+    };
+    *budget = budget.checked_sub(1).ok_or(ERROR_NOT_ENOUGH_QUOTA)?;
+    let children = subkey_names(&key, *budget)?;
+    if !children.is_empty() {
+        let below = depth.checked_sub(1).ok_or(ERROR_STACK_OVERFLOW)?;
+        for child in &children {
+            delete_subtree(&key, child, below, budget)?;
+        }
+    }
+    match unsafe { NtDeleteKey(key.0) } {
+        // Deleted concurrently: gone all the same.
+        STATUS_KEY_DELETED => Ok(()),
+        status if status < 0 => Err(unsafe { RtlNtStatusToDosError(status) }),
+        _ => Ok(()),
+    }
+}
+
+/// The names of the direct subkeys of `key`, at most `limit` of them.
+fn subkey_names(key: &Key, limit: usize) -> Result<Vec<Vec<u16>>, u32> {
+    let mut names = Vec::new();
+    loop {
+        // A key name has at most 255 characters.
+        let mut buffer = [0u16; 256];
+        let mut length = buffer.len() as u32;
+        match unsafe {
+            RegEnumKeyExW(
+                key.0,
+                names.len() as u32,
+                buffer.as_mut_ptr(),
+                &mut length,
+                null(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        } {
+            ERROR_SUCCESS => {}
+            ERROR_NO_MORE_ITEMS => return Ok(names),
+            code => return Err(code),
+        }
+        if names.len() == limit {
+            return Err(ERROR_NOT_ENOUGH_QUOTA);
+        }
+        let name = buffer.get(..length as usize).ok_or(ERROR_INVALID_DATA)?;
+        names.push(name.to_vec());
+    }
+}
+
 #[cfg(test)]
 pub mod test_support {
     use super::*;
@@ -171,7 +294,6 @@ pub mod test_support {
 
     #[link(name = "ntdll")]
     unsafe extern "system" {
-        fn NtDeleteKey(key: HKEY) -> NTSTATUS;
         fn NtQueryKey(
             key: HKEY,
             class: u32,
@@ -274,8 +396,10 @@ pub mod test_support {
     pub struct Link(Key);
     impl Drop for Link {
         fn drop(&mut self) {
-            // Delete the link object by its handle, never recursively follow it.
-            assert_eq!(unsafe { NtDeleteKey(self.0 .0) }, 0);
+            // Delete the link object by its handle, never recursively follow it
+            // (a test may already have deleted it through `delete_tree`).
+            let status = unsafe { NtDeleteKey(self.0 .0) };
+            assert!(status == 0 || status == STATUS_KEY_DELETED, "{status:#x}");
         }
     }
 }
@@ -368,6 +492,145 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    const MARKER: u32 = 0x5EED_F00D;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    fn set_marker(key: &Key) {
+        let value = MARKER;
+        let code = unsafe {
+            RegSetValueExW(
+                key.0,
+                wide("Marker").as_ptr(),
+                0,
+                REG_DWORD,
+                (&raw const value).cast(),
+                4,
+            )
+        };
+        assert_eq!(code, ERROR_SUCCESS);
+    }
+
+    /// The `Marker` value of the ordinary test key `path`.
+    fn marker(path: &str) -> Option<u32> {
+        let mut value = 0u32;
+        let mut bytes = 4;
+        let code = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                wide(path).as_ptr(),
+                wide("Marker").as_ptr(),
+                RRF_RT_REG_DWORD,
+                null_mut(),
+                (&raw mut value).cast(),
+                &mut bytes,
+            )
+        };
+        (code == ERROR_SUCCESS).then_some(value)
+    }
+
+    /// Whether the key `path` exists as itself (a link is not followed).
+    fn exists_itself(path: &str) -> bool {
+        let mut key = null_mut();
+        let code = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                wide(path).as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                KEY_QUERY_VALUE,
+                &mut key,
+            )
+        };
+        if code == ERROR_SUCCESS {
+            drop(Key(key));
+            return true;
+        }
+        assert_eq!(code, ERROR_FILE_NOT_FOUND, "{path}");
+        false
+    }
+
+    #[test]
+    fn delete_tree_removes_nested_subkeys_and_succeeds_when_missing() {
+        let fixture = Fixture::new();
+        set_marker(&fixture.key(r"FeatherTask\Preferences"));
+        drop(fixture.key(r"FeatherTask\A\B\C"));
+        drop(fixture.key(r"FeatherTask\A\Sibling"));
+        set_marker(&fixture.key("Kept"));
+        delete_tree(HKEY_CURRENT_USER, &fixture.path("FeatherTask")).unwrap();
+        assert!(!exists_itself(&fixture.path("FeatherTask")));
+        // Only that key: its sibling and parent remain.
+        assert_eq!(marker(&fixture.path("Kept")), Some(MARKER));
+        assert!(exists_itself(&fixture.path));
+        // Already gone, or a missing ancestor: nothing to do.
+        delete_tree(HKEY_CURRENT_USER, &fixture.path("FeatherTask")).unwrap();
+        delete_tree(HKEY_CURRENT_USER, &fixture.path(r"Missing\FeatherTask")).unwrap();
+        // An empty component is invalid, never the parent itself.
+        assert_eq!(
+            delete_tree(HKEY_CURRENT_USER, &fixture.path("")),
+            Err(ERROR_INVALID_PARAMETER)
+        );
+        assert!(exists_itself(&fixture.path("Kept")));
+    }
+
+    #[test]
+    fn delete_tree_removes_links_as_links_and_keeps_their_targets() {
+        let fixture = Fixture::new();
+        let target = fixture.key("UnrelatedTarget");
+        set_marker(&target);
+        set_marker(&fixture.key(r"UnrelatedTarget\Existing"));
+        drop(fixture.key(r"FeatherTask\Preferences"));
+        let _nested = fixture.link(r"FeatherTask\Preferences\Link", Some(&target));
+        let _leaf = fixture.link(r"FeatherTask\Link", Some(&target));
+        let _unfinished = fixture.link(r"FeatherTask\UnfinishedLink", None);
+        // The links are live: an ordinary open reaches the target's subtree.
+        assert_eq!(
+            marker(&fixture.path(r"FeatherTask\Preferences\Link\Existing")),
+            Some(MARKER)
+        );
+        delete_tree(HKEY_CURRENT_USER, &fixture.path("FeatherTask")).unwrap();
+        assert!(!exists_itself(&fixture.path("FeatherTask")));
+        // The removed key itself is a link.
+        let _root = fixture.link("RootLink", Some(&target));
+        assert_eq!(marker(&fixture.path("RootLink")), Some(MARKER));
+        delete_tree(HKEY_CURRENT_USER, &fixture.path("RootLink")).unwrap();
+        assert!(!exists_itself(&fixture.path("RootLink")));
+        // A link among the ancestors fails the call.
+        let _ancestor = fixture.link("AncestorLink", Some(&target));
+        assert!(delete_tree(HKEY_CURRENT_USER, &fixture.path(r"AncestorLink\Existing")).is_err());
+        assert!(exists_itself(&fixture.path("AncestorLink")));
+        // The target, its value and its subkey were never touched.
+        assert_eq!(marker(&fixture.path("UnrelatedTarget")), Some(MARKER));
+        assert_eq!(
+            marker(&fixture.path(r"UnrelatedTarget\Existing")),
+            Some(MARKER)
+        );
+    }
+
+    #[test]
+    fn delete_tree_stops_at_its_depth_and_key_bounds() {
+        let fixture = Fixture::new();
+        drop(fixture.key(r"Deep\1\2\3"));
+        assert_eq!(
+            delete_tree_within(HKEY_CURRENT_USER, &fixture.path("Deep"), 2, 100),
+            Err(ERROR_STACK_OVERFLOW)
+        );
+        assert!(exists_itself(&fixture.path(r"Deep\1\2\3")));
+        delete_tree_within(HKEY_CURRENT_USER, &fixture.path("Deep"), 3, 100).unwrap();
+        assert!(!exists_itself(&fixture.path("Deep")));
+        for child in ["a", "b", "c", "d"] {
+            drop(fixture.key(&format!(r"Wide\{child}")));
+        }
+        assert_eq!(
+            delete_tree_within(HKEY_CURRENT_USER, &fixture.path("Wide"), 1, 4),
+            Err(ERROR_NOT_ENOUGH_QUOTA)
+        );
+        assert!(exists_itself(&fixture.path(r"Wide\d")));
+        delete_tree_within(HKEY_CURRENT_USER, &fixture.path("Wide"), 1, 5).unwrap();
+        assert!(!exists_itself(&fixture.path("Wide")));
     }
 
     #[test]

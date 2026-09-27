@@ -93,8 +93,17 @@ pub(super) const SETTINGS_ROW_PAD_X: f32 = 16.0;
 pub(super) const SETTINGS_ROW_TITLE: f32 = 18.843_75;
 pub(super) const SETTINGS_ROW_TEXT: f32 = 17.390_625;
 /// Rows per settings group: Appearance (theme, language), Updates (refresh
-/// rate, start page), Window (always on top, tray, Task Manager replacement).
-pub(super) const SETTINGS_GROUPS: [usize; 3] = [2, 2, 3];
+/// rate, start page), Window (always on top, tray, Task Manager replacement,
+/// always run as administrator).
+///
+/// Eight rows use all the room the minimum window (980 × 660) has: there the
+/// rows are at their tightest padding (6) and the group gap is about 12.3,
+/// just above its floor of 12. A ninth row would push the last one off
+/// screen (`settings` compacts, it does not scroll), so another setting
+/// needs a new layout first; the minimum-window test checks the fit. The
+/// version line under the groups (`Settings::footer`) no longer fits the
+/// default 1200 × 820 window and is drawn only on taller ones.
+pub(super) const SETTINGS_GROUPS: [usize; 3] = [2, 2, 4];
 
 /// Height of the page head's content box: the tallest of the h1 line (24) and
 /// the page's actions (32 px buttons incl. the more button, 28 px selects),
@@ -739,8 +748,8 @@ mod tests {
         let g2 = &s.groups[1];
         assert_eq!(g2.frame.top, 328);
         let g3 = &s.groups[2];
-        assert_eq!(g3.rows.len(), 3);
-        assert_eq!(g3.frame.bottom, g3.rows[2].bottom + 1);
+        assert_eq!(g3.rows.len(), 4);
+        assert_eq!(g3.frame.bottom, g3.rows[3].bottom + 1);
         // Reference-shaped window (1198 × 818): its first two frames line up.
         let reference = Layout::new(1198, 818, 96, Page::Settings);
         let s = reference.settings();

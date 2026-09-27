@@ -44,6 +44,7 @@
 - 프로세스의 **⋯ → 실시간 그래프 표시/숨김**으로 CPU·메모리·전체 I/O 추이를 확인합니다.
 - **프로세스 → Nuclear Zombie**(또는 `Ctrl+K` → "메모리")로 메모리를 정리하고 좀비 프로세스를 확인합니다. 효율 모드는 **⋯** 메뉴와 오른쪽 클릭 메뉴에 있습니다.
 - `—`는 미측정 값입니다. 프로세스별 GPU는 Windows 작업 관리자와 같은 규칙(가장 바쁜 엔진)으로 측정하고, 프로세스별 네트워크는 관리자 권한으로 실행할 때만 측정합니다. 시작 영향도와 CPU 온도는 측정하지 않습니다.
+- **설정 → 항상 관리자 권한으로 실행**을 켜면 매번 관리자 권한으로 시작합니다(프로세스별 네트워크, 전체 좀비 검사). 설치된 Feather에만 적용되며, 시작할 때마다(관리자 창이 열려 있어도 `Ctrl+Shift+Esc`를 누를 때마다) Windows UAC 확인 창이 나타나고, 거부하면 일반 권한으로 계속 실행합니다. 포터블 복사본은 자동으로 상승하지 않습니다. 실행 중인 복사본을 한 번만 전환하려면 **프로세스 → ⋯ → 관리자로 실행**을 사용하세요.
 
 | 단축키 | 동작 |
 | --- | --- |
@@ -72,4 +73,4 @@ cargo build --release --locked
 
 ## 라이선스
 
-[MIT License](LICENSE). 사용한 라이브러리의 고지는 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)와 [RUST_LIBRARY_NOTICES.html](RUST_LIBRARY_NOTICES.html)에 있습니다.
+[MIT License](LICENSE). 사용한 라이브러리의 고지는 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)와 [RUST_LIBRARY_NOTICES.html](RUST_LIBRARY_NOTICES.html)에 있습니다. Feather는 개인정보를 수집하지 않습니다([개인정보 처리방침](PRIVACY.md)). 보안 문제는 [SECURITY.md](SECURITY.md)의 방법으로 비공개 제보해 주세요.
