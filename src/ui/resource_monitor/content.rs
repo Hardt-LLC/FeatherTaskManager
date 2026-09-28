@@ -779,14 +779,28 @@ impl table::Model for Model {
         self.row_height(0)
     }
     unsafe fn key(&self, row: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
         let state = &*self.0;
-        state.panels[self.1]
-            .rows
-            .get(row)
-            .and_then(|r| r.identity)
-            .map_or(row as u64, |(pid, created)| {
-                created.rotate_left(13) ^ pid as u64
-            })
+        let panel = &state.panels[self.1];
+        let Some(entry) = panel.rows.get(row) else {
+            return row as u64;
+        };
+        let Some((pid, created)) = entry.identity else {
+            return row as u64;
+        };
+        let process = created.rotate_left(13) ^ pid as u64;
+        if panel.kind.check() {
+            return process;
+        }
+        // One process owns several rows here (modules, endpoints, files,
+        // services); their text cells tell them apart, so a screen reader
+        // announces each row instead of only the first of a process.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        process.hash(&mut hasher);
+        for cell in entry.cells.iter().filter(|cell| cell.number.is_none()) {
+            cell.text.hash(&mut hasher);
+        }
+        hasher.finish()
     }
     unsafe fn header(&self, col: usize) -> table::HeaderCell {
         let state = &*self.0;

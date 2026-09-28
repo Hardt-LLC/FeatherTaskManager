@@ -10,7 +10,7 @@ pub(super) struct Chrome {
     hot: Option<frame::Button>,
     pressed: Option<frame::Button>,
     active: bool,
-    top: i32,
+    pub(super) top: i32,
     extend: i32,
 }
 
@@ -171,6 +171,24 @@ pub(super) unsafe fn message(
                 autohide,
             );
             Some(0)
+        }
+        WM_GETDPISCALEDSIZE if IsZoomed(hwnd) == 0 && IsIconic(hwnd) == 0 && l != 0 => {
+            // As for the main window: scale the client, not the captionless
+            // window, or each monitor change adds a native caption's height.
+            let (old, new) = (i64::from((*s).dpi.max(96)), i64::from((w as u32).max(96)));
+            let mut client: RECT = zeroed();
+            GetClientRect(hwnd, &mut client);
+            let scale = |v: i32| ((i64::from(v) * new + old / 2) / old) as i32;
+            let (width, height) = frame::outer_size(
+                new as u32,
+                scale(client.right),
+                scale(client.bottom),
+                (*s).chrome.top,
+            );
+            let size = &mut *(l as *mut SIZE);
+            size.cx = width;
+            size.cy = height;
+            Some(1)
         }
         WM_SIZE => {
             let margin = MARGINS {

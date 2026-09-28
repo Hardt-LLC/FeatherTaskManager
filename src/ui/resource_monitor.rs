@@ -240,8 +240,7 @@ unsafe fn create(owner: *mut App, visible: bool) {
     if !(*owner).resource_window.is_null() {
         if visible {
             settings_changed(owner);
-            ShowWindow((*owner).resource_window, SW_RESTORE);
-            SetForegroundWindow((*owner).resource_window);
+            super::shell::reveal((*owner).resource_window);
             configure(owner);
         }
         return;
@@ -1034,8 +1033,7 @@ unsafe fn context(s: *mut State, hwnd: HWND, l: LPARAM) {
         }
         3 => {
             let owner = (*s).owner;
-            ShowWindow((*owner).hwnd, SW_RESTORE);
-            SetForegroundWindow((*owner).hwnd);
+            super::shell::show_main(owner);
             super::switch_page(owner, Page::Processes);
             SendMessageW(
                 (*owner).search,
@@ -1213,8 +1211,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         changed(s, true);
                     }
                     BACK => {
-                        ShowWindow((*(*s).owner).hwnd, SW_RESTORE);
-                        SetForegroundWindow((*(*s).owner).hwnd);
+                        super::shell::show_main((*s).owner);
                     }
                     TRACE => {
                         (*s).detailed = !(*s).detailed;
@@ -1440,6 +1437,51 @@ pub(super) unsafe fn assert_snapshot_lifecycle(owner: *mut App) {
         "a reused PID cannot inherit selection"
     );
     assert!(!Arc::ptr_eq(&first, (*s).snapshot.as_ref().unwrap()));
+    // Rows of one process (here: two modules) keep distinct accessible keys,
+    // so moving between them is announced; process rows stay keyed by process.
+    {
+        use table::Model as _;
+        let panels = &mut (*s).panels;
+        let index = panels.iter().position(|p| !p.kind.check()).unwrap();
+        let saved = std::mem::take(&mut panels[index].rows);
+        panels[index].rows = ["a.dll", "b.dll"]
+            .iter()
+            .map(|name| Row {
+                identity: Some(id),
+                cells: vec![Cell::text(*name)],
+            })
+            .collect();
+        let model = content::Model(s, index);
+        assert_ne!(model.key(0), model.key(1));
+        (&mut (*s).panels)[index].rows = saved;
+    }
+    // Moving to a 150 % monitor keeps the client proportional instead of
+    // letting Windows add a native caption's height to the captionless window.
+    let (base, target) = ((*s).dpi, (*s).dpi * 3 / 2);
+    let mut client: RECT = zeroed();
+    GetClientRect((*s).hwnd, &mut client);
+    let mut size = SIZE { cx: 0, cy: 0 };
+    assert_eq!(
+        SendMessageW(
+            (*s).hwnd,
+            WM_GETDPISCALEDSIZE,
+            target as usize,
+            &mut size as *mut _ as isize
+        ),
+        1
+    );
+    let scale = |v: i32| {
+        ((i64::from(v) * i64::from(target) + i64::from(base) / 2) / i64::from(base)) as i32
+    };
+    assert_eq!(
+        (size.cx, size.cy),
+        frame::outer_size(
+            target as u32,
+            scale(client.right),
+            scale(client.bottom),
+            (*s).chrome.top
+        )
+    );
     close(owner);
     assert!((*owner).resource_window.is_null());
     assert!((*owner).resource_data.is_none());
