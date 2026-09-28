@@ -529,8 +529,9 @@ enum Kind {
 
 pub(super) struct Popup {
     hwnd: HWND,
-    app: *mut App,
     dpi: i32,
+    /// The host window's fonts (the field, so a replaced set is followed).
+    fonts: *const fonts::Fonts,
     palette: Palette,
     kind: Kind,
     surface: gfx::LayeredSurface,
@@ -552,6 +553,25 @@ pub(super) struct Popup {
     /// A shown menu or dropdown announced to assistive technology
     /// (EVENT_SYSTEM_MENUPOPUPSTART; the END event is still due).
     announced: bool,
+}
+
+/// The window a popup belongs to, with the DPI and fonts it is drawn in: the
+/// main window, or another Feather window (the Resource Monitor) that shows
+/// the same confirm dialog over itself.
+#[derive(Clone, Copy)]
+pub(super) struct Host {
+    pub hwnd: HWND,
+    pub dpi: i32,
+    pub fonts: *const fonts::Fonts,
+}
+impl Host {
+    pub(super) unsafe fn main(app: *mut App) -> Self {
+        Self {
+            hwnd: (*app).hwnd,
+            dpi: (*app).dpi,
+            fonts: &(*app).fonts,
+        }
+    }
 }
 
 unsafe fn register() -> bool {
@@ -584,7 +604,7 @@ unsafe fn state(hwnd: HWND) -> *mut Popup {
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn create(
-    app: *mut App,
+    host: Host,
     kind: Kind,
     size: SIZE,
     origin: POINT,
@@ -594,11 +614,11 @@ unsafe fn create(
     extra: u32,
     fade: Duration,
 ) -> HWND {
-    let owner = (*app).hwnd;
+    let owner = host.hwnd;
     if owner.is_null() || !register() {
         return null_mut();
     }
-    let dpi = (*app).dpi;
+    let dpi = host.dpi;
     let layers = if shadow {
         gfx::popup_shadow(dpi).to_vec()
     } else {
@@ -631,8 +651,8 @@ unsafe fn create(
     }
     let popup = Box::into_raw(Box::new(Popup {
         hwnd,
-        app,
         dpi,
+        fonts: host.fonts,
         palette: theme::colors(),
         kind,
         surface,
@@ -720,7 +740,7 @@ impl Popup {
         let dpi = self.dpi;
         let hair = gfx::hairline(dpi);
         let radius = self.radius;
-        let fonts = &(*self.app).fonts;
+        let fonts = &*self.fonts;
         let Popup {
             kind,
             surface,
@@ -1389,7 +1409,7 @@ pub(super) unsafe fn open_list(
         open: None,
     };
     let hwnd = create(
-        app,
+        Host::main(app),
         Kind::Menu(view),
         size,
         origin,
@@ -2213,9 +2233,9 @@ pub(super) unsafe fn wrap(dc: HDC, font: HFONT, text: &str, width: i32) -> Vec<S
 
 /// Lay out `.dialog` (`.body` padding 22 24 18, h2 18/1.3 + 8, p 13/1.45,
 /// `.warn-line` margin-top 12, `.foot` padding 14 24 with a top border).
-unsafe fn layout_dialog(app: *mut App, spec: &ConfirmSpec, width: i32) -> (DialogView, SIZE) {
-    let dpi = (*app).dpi;
-    let f = &(*app).fonts;
+unsafe fn layout_dialog(host: Host, spec: &ConfirmSpec, width: i32) -> (DialogView, SIZE) {
+    let dpi = host.dpi;
+    let f = &*host.fonts;
     let px = |v: f32| gfx::px(dpi, v);
     let hair = gfx::hairline(dpi) as i32;
     let dc = MeasureDc::new();
@@ -2392,17 +2412,22 @@ unsafe fn paint_dialog(
 /// Open the scrim (fg @ 22 % over the owner window) and the centred dialog
 /// without running the modal loop (previews; [`confirm_dialog`] runs it).
 pub(super) unsafe fn stage_confirm(p: *mut App, spec: &ConfirmSpec) -> Option<(HWND, HWND)> {
-    let owner = (*p).hwnd;
+    stage_confirm_on(Host::main(p), spec)
+}
+
+/// [`stage_confirm`] over `host`.
+pub(super) unsafe fn stage_confirm_on(host: Host, spec: &ConfirmSpec) -> Option<(HWND, HWND)> {
+    let owner = host.hwnd;
     if owner.is_null() {
         return None;
     }
-    let dpi = (*p).dpi;
-    let scrim = open_scrim(p, null_mut());
+    let dpi = host.dpi;
+    let scrim = open_scrim_on(host, null_mut());
     let client = client_screen(owner);
     let width = gfx::pxi(dpi, DIALOG_WIDTH)
         .min(client.right - client.left - gfx::pxi(dpi, 32.0))
         .max(gfx::pxi(dpi, 280.0));
-    let (mut view, size) = layout_dialog(p, spec, width);
+    let (mut view, size) = layout_dialog(host, spec, width);
     // `:focus-visible` after a keyboard trigger (Del, Enter, Space) or
     // while keyboard cues are shown; hidden after a mouse click.
     view.ring = !super::controls::cues_hidden(owner)
@@ -2418,7 +2443,7 @@ pub(super) unsafe fn stage_confirm(p: *mut App, spec: &ConfirmSpec) -> Option<(H
         0,
     );
     let dialog = create(
-        p,
+        host,
         Kind::Dialog(view),
         size,
         origin,
@@ -2442,15 +2467,19 @@ pub(super) unsafe fn stage_confirm(p: *mut App, spec: &ConfirmSpec) -> Option<(H
 /// kept), fading in with the popup above it. A press on it closes
 /// `dismiss` (WM_CLOSE) when given; modal loops handle it themselves.
 pub(super) unsafe fn open_scrim(p: *mut App, dismiss: HWND) -> HWND {
-    let owner = (*p).hwnd;
+    open_scrim_on(Host::main(p), dismiss)
+}
+
+unsafe fn open_scrim_on(host: Host, dismiss: HWND) -> HWND {
+    let owner = host.hwnd;
     let bounds = visible_bounds(owner);
     let corner = if IsZoomed(owner) != 0 {
         0.0
     } else {
-        gfx::px((*p).dpi, theme::RADIUS)
+        gfx::px(host.dpi, theme::RADIUS)
     };
     let scrim = create(
-        p,
+        host,
         Kind::Scrim,
         SIZE {
             cx: bounds.right - bounds.left,
@@ -2480,7 +2509,11 @@ pub(super) unsafe fn open_scrim(p: *mut App, dismiss: HWND) -> HWND {
 /// restore) still move and resize it. A minimized owner hides its owned
 /// popups by itself and is skipped.
 pub(super) unsafe fn refit_confirm(p: *mut App, scrim: HWND, dialog: HWND) {
-    let owner = (*p).hwnd;
+    refit_confirm_on(Host::main(p), scrim, dialog);
+}
+
+unsafe fn refit_confirm_on(host: Host, scrim: HWND, dialog: HWND) {
+    let owner = host.hwnd;
     if owner.is_null() || IsIconic(owner) != 0 {
         return;
     }
@@ -2573,7 +2606,7 @@ pub(super) unsafe fn dialog_state(hwnd: HWND, focus: usize, ring: bool, pressed:
 #[cfg(test)]
 pub(super) unsafe fn dialog_lines(hwnd: HWND) -> Option<(Vec<(String, i32)>, i32)> {
     let (popup, view) = dialog_view(hwnd)?;
-    let fonts = &(*(*popup).app).fonts;
+    let fonts = &*(*popup).fonts;
     let dc = MeasureDc::new();
     let mut lines = Vec::new();
     for line in &(*view).title {
@@ -2594,8 +2627,13 @@ pub(super) unsafe fn dialog_lines(hwnd: HWND) -> Option<(Vec<(String, i32)>, i32
 /// initial focus; Enter / Space activate the focused button, Esc / Alt+F4 /
 /// a click on the scrim cancel, Tab / arrows move the focus.
 pub(super) unsafe fn confirm_dialog(p: *mut App, spec: &ConfirmSpec) -> bool {
-    let owner = (*p).hwnd;
-    let Some((scrim, dialog)) = stage_confirm(p, spec) else {
+    confirm_dialog_on(Host::main(p), spec)
+}
+
+/// [`confirm_dialog`] over `host` (another Feather window).
+pub(super) unsafe fn confirm_dialog_on(host: Host, spec: &ConfirmSpec) -> bool {
+    let owner = host.hwnd;
+    let Some((scrim, dialog)) = stage_confirm_on(host, spec) else {
         return false;
     };
     let mut result = false;
@@ -2611,7 +2649,7 @@ pub(super) unsafe fn confirm_dialog(p: *mut App, spec: &ConfirmSpec) -> bool {
                 let now = geometry();
                 if now != placed {
                     placed = now;
-                    refit_confirm(p, scrim, dialog);
+                    refit_confirm_on(host, scrim, dialog);
                 }
             }
             let Some((popup, view)) = dialog_view(dialog) else {
@@ -2760,7 +2798,7 @@ pub(super) unsafe fn stage_panel(
         0,
     );
     let hwnd = create(
-        p,
+        Host::main(p),
         Kind::Panel(panel),
         size,
         origin,
@@ -2878,7 +2916,7 @@ pub(super) unsafe fn show_toast(p: *mut App, text: &str) -> HWND {
         y: client.bottom - gfx::pxi(dpi, 44.0) - height,
     };
     let hwnd = create(
-        p,
+        Host::main(p),
         Kind::Toast(text.to_owned()),
         SIZE {
             cx: width.max(1),

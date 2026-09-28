@@ -4443,6 +4443,14 @@ mod tests {
         }
     }
     #[test]
+    fn resource_monitor_confirms_ending_processes_over_its_own_window() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_end_confirmation(test.p);
+        }
+    }
+    #[test]
     fn resource_monitor_rows_keep_their_identity_across_refreshes() {
         let test = TestWindow::new();
         test.snapshot(rows());

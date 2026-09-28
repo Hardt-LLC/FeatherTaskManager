@@ -878,6 +878,48 @@ unsafe fn toggle(s: *mut State, id: (u32, u64)) {
     }
     changed(s, true);
 }
+/// Most processes the End processes confirmation names; the rest are counted.
+const LISTED: usize = 12;
+
+/// The End processes confirmation for `names` (`name (PID n)`): heading,
+/// text and a warn line when `warnings` (the main window's End task line of
+/// each Windows process among them) is not empty.
+fn end_prompt(names: &[String], warnings: &[&str]) -> (String, String, Option<String>) {
+    let notice = tr(
+        "저장하지 않은 작업은 사라질 수 있습니다. 시스템 프로세스 보호는 그대로 적용됩니다.",
+        "Unsaved work may be lost. System process protections remain in effect.",
+    );
+    let (heading, body) = if let [name] = names {
+        (
+            tf!("{} 프로세스를 종료할까요?", "End {}?", name),
+            notice.to_owned(),
+        )
+    } else {
+        let mut list = names[..names.len().min(LISTED)].join("\n");
+        if names.len() > LISTED {
+            list.push('\n');
+            list.push_str(&tf!("외 {}개", "and {} more", names.len() - LISTED));
+        }
+        (
+            tf!(
+                "프로세스 {}개를 종료할까요?",
+                "End {} processes?",
+                names.len()
+            ),
+            format!("{list}\n\n{notice}"),
+        )
+    };
+    let warn = match warnings {
+        [] => None,
+        [one] if names.len() == 1 => Some((*one).to_owned()),
+        _ => Some(tf!(
+            "Windows 프로세스 {}개가 포함되어 있습니다. 종료하면 Windows가 불안정해지거나 로그아웃될 수 있습니다.",
+            "Includes {} Windows processes. Ending them can make Windows unstable or sign you out.",
+            warnings.len()
+        )),
+    };
+    (heading, body, warn)
+}
 unsafe fn end_processes(s: *mut State, ids: Vec<(u32, u64)>) {
     if ids.is_empty() || (*(*s).owner).busy || (*(*s).owner).modal {
         return;
@@ -890,35 +932,47 @@ unsafe fn end_processes(s: *mut State, ids: Vec<(u32, u64)>) {
                 .processes
                 .iter()
                 .find(|p| (p.pid, p.created) == *id)
-                .map(|p| format!("{} ({})", p.name, p.pid))
+                .map(|p| format!("{} (PID {})", p.name, p.pid))
         })
         .collect();
     if names.is_empty() {
         return;
     }
-    let message=format!("{}\n\n{}",names.iter().take(12).cloned().collect::<Vec<_>>().join("\n"),
-        tr("선택한 프로세스를 종료하시겠습니까? 저장하지 않은 작업은 사라집니다. 시스템 보호 정책이 적용됩니다.",
-           "End the selected processes? Unsaved work will be lost. System process protections remain in effect."));
+    // Only images that really live in the Windows directory, never a guess
+    // from the name (as for the main window's End task).
+    let warnings: Vec<_> = ids
+        .iter()
+        .filter_map(|&(pid, created)| controls::windows_image_warning(pid, created))
+        .collect();
+    let (heading, body, warn) = end_prompt(&names, &warnings);
     let owner = (*s).owner;
+    let focus = GetFocus();
     (*owner).modal = true;
     configure(owner);
-    EnableWindow((*owner).hwnd, 0);
-    let confirmed = MessageBoxW(
-        (*s).hwnd,
-        wide(&message).as_ptr(),
-        wide(&format!(
-            "{} ({})",
-            tr("프로세스 종료", "End processes"),
-            ids.len()
-        ))
-        .as_ptr(),
-        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-    ) == IDYES;
-    EnableWindow((*owner).hwnd, 1);
+    // Feather's confirm dialog over this window (not a MessageBox): Cancel
+    // has the focus; the window's input waits until it closes.
+    let confirmed = popup::confirm_dialog_on(
+        popup::Host {
+            hwnd: (*s).hwnd,
+            dpi: (*s).dpi,
+            fonts: &(*s).fonts,
+        },
+        &popup::ConfirmSpec {
+            title: &heading,
+            body: &body,
+            warn: warn.as_deref(),
+            action: tr("프로세스 종료", "End processes"),
+            cancel: tr("취소", "Cancel"),
+            danger: true,
+        },
+    );
     (*owner).modal = false;
     configure(owner);
     PostMessageW((*owner).hwnd, SNAPSHOT_READY, 0, 0);
     PostMessageW((*owner).hwnd, JOB_READY, 0, 0);
+    if IsWindow(focus) != 0 && IsChild((*s).hwnd, focus) != 0 {
+        SetFocus(focus);
+    }
     if confirmed {
         begin_action(owner, Action::EndMany(ids));
         invalidate(s);
@@ -1415,6 +1469,66 @@ pub(super) unsafe fn render_previews(owner: *mut App, dir: &std::path::Path) -> 
     (*owner).prefs.theme = theme_before;
     (*owner).prefs.apply_theme();
     result
+}
+
+#[cfg(test)]
+pub(super) unsafe fn assert_end_confirmation(owner: *mut App) {
+    use crate::i18n::{with_language, Language};
+    with_language(Language::English, || {
+        let names: Vec<String> = (0..14).map(|i| format!("app{i}.exe (PID {i})")).collect();
+        let (heading, body, warn) = end_prompt(&names[..1], &[]);
+        assert_eq!(heading, "End app0.exe (PID 0)?");
+        assert!(!body.contains("app0") && warn.is_none());
+        let windows = "This is a Windows process.";
+        let (_, _, warn) = end_prompt(&names[..1], &[windows]);
+        assert_eq!(warn.as_deref(), Some(windows));
+        let (heading, body, warn) = end_prompt(&names, &[windows, windows]);
+        assert_eq!(heading, "End 14 processes?");
+        let lines: Vec<_> = body.lines().collect();
+        assert_eq!(
+            lines[..12],
+            names[..12].iter().map(String::as_str).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(lines[12], "and 2 more");
+        assert!(warn.unwrap().starts_with("Includes 2 Windows processes."));
+        assert!(!end_prompt(&names[..12], &[]).1.contains("more"));
+    });
+    // The dialog belongs to this window: its scrim and card are owned by it
+    // and centred on its client, not on the main window.
+    create(owner, false);
+    let s = owner_state(owner);
+    assert!(!s.is_null());
+    let host = popup::Host {
+        hwnd: (*s).hwnd,
+        dpi: (*s).dpi,
+        fonts: &(*s).fonts,
+    };
+    let spec = popup::ConfirmSpec {
+        title: "End 2 processes?",
+        body: "a
+b",
+        warn: None,
+        action: "End processes",
+        cancel: "Cancel",
+        danger: true,
+    };
+    let (scrim, dialog) = popup::stage_confirm_on(host, &spec).unwrap();
+    for popup in [scrim, dialog] {
+        assert_eq!(GetWindow(popup, GW_OWNER), (*s).hwnd);
+    }
+    let mut client: RECT = zeroed();
+    GetClientRect((*s).hwnd, &mut client);
+    MapWindowPoints((*s).hwnd, null_mut(), (&mut client as *mut RECT).cast(), 2);
+    // (The layered window also holds the card's shadow, deeper below.)
+    popup::settle(dialog);
+    let mut card: RECT = zeroed();
+    GetWindowRect(dialog, &mut card);
+    let centre = |a: i32, b: i32| (a + b) / 2;
+    assert!((centre(card.left, card.right) - centre(client.left, client.right)).abs() <= 2);
+    assert!(card.top > client.top && card.bottom < client.bottom);
+    popup::destroy(dialog);
+    popup::destroy(scrim);
+    close(owner);
 }
 
 /// Open the window with tracing on, shown (so it counts as active) without
