@@ -280,6 +280,52 @@ pub(super) unsafe fn message(
             release(s, frame::Button::from_hit(w as u32));
             Some(0)
         }
+        // The strip's system menu, as in the main window: right-click on
+        // the caption or a caption button, Alt+Space below the strip.
+        WM_NCRBUTTONDOWN
+            if w as u32 == HTCAPTION || frame::Button::from_hit(w as u32).is_some() =>
+        {
+            Some(0)
+        }
+        WM_NCRBUTTONUP if w as u32 == HTCAPTION || frame::Button::from_hit(w as u32).is_some() => {
+            let at = point(l);
+            frame::system_menu(hwnd, at.x, at.y, false);
+            Some(0)
+        }
+        WM_RBUTTONDOWN if button_at(s, point(l)).is_some() => Some(0),
+        WM_RBUTTONUP if button_at(s, point(l)).is_some() => {
+            let mut at = point(l);
+            ClientToScreen(hwnd, &mut at);
+            frame::system_menu(hwnd, at.x, at.y, false);
+            Some(0)
+        }
+        WM_SYSCOMMAND if (w & 0xfff0) as u32 == SC_KEYMENU && l == VK_SPACE as isize => {
+            // DefWindowProc would place it below a native caption, over
+            // the strip.
+            let mut at = POINT {
+                x: 0,
+                y: gfx::pxi((*s).dpi, 44.0),
+            };
+            ClientToScreen(hwnd, &mut at);
+            frame::system_menu(hwnd, at.x, at.y, true);
+            Some(0)
+        }
+        // Alt / F10 alone: without a menu bar DefWindowProc would enter an
+        // invisible menu mode that swallows the next key (like frame.rs).
+        WM_SYSCOMMAND if (w & 0xfff0) as u32 == SC_KEYMENU && l == 0 => Some(0),
+        WM_SETTINGCHANGE if w as u32 == SPI_SETWORKAREA && IsZoomed(hwnd) != 0 => {
+            // The taskbar moved or its auto-hide changed: recompute the insets.
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            None
+        }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             if (*s).chrome.pressed.take().is_some() {
                 hot(s, None);

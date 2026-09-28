@@ -191,6 +191,8 @@ struct State {
     pid_index: HashMap<u32, usize>,
     preview: bool,
     creating: bool,
+    /// The control that had the focus when the window was deactivated.
+    focus: HWND,
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -300,6 +302,7 @@ unsafe fn create(owner: *mut App, visible: bool) {
         pid_index: HashMap::new(),
         preview: !visible,
         creating: true,
+        focus: null_mut(),
     }));
     let mut rect: RECT = zeroed();
     GetWindowRect((*owner).hwnd, &mut rect);
@@ -1171,7 +1174,13 @@ pub(super) unsafe fn keyboard(owner: *mut App, msg: &MSG) -> bool {
             }
         }
     }
+    let before = GetFocus();
     if IsDialogMessageW((*s).hwnd, msg as *const MSG) != 0 {
+        // Tab into a panel scrolled out of the list brings it into view.
+        let focus = GetFocus();
+        if focus != before {
+            body_scroll::reveal(s, focus);
+        }
         return true;
     }
     false
@@ -1254,8 +1263,32 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             1
         }
         WM_NOTIFY => notify(s, l),
-        WM_CONTEXTMENU => {
+        // A panel's rows; anything else (the caption strip's system menu)
+        // keeps the default handling.
+        WM_CONTEXTMENU if (*s).panels.iter().any(|p| p.table == w as HWND) => {
             context(s, w as HWND, l);
+            0
+        }
+        WM_ACTIVATE if (w >> 16) & 0xffff == 0 => {
+            if (w & 0xffff) as u32 == WA_INACTIVE {
+                let focus = GetFocus();
+                if !focus.is_null() && IsChild(hwnd, focus) != 0 {
+                    (*s).focus = focus;
+                }
+            } else {
+                // Back to the control that had the focus (DefWindowProc
+                // would focus the frame), else the current tab.
+                let saved = (*s).focus;
+                let usable = IsWindow(saved) != 0
+                    && IsChild(hwnd, saved) != 0
+                    && IsWindowVisible(saved) != 0
+                    && IsWindowEnabled(saved) != 0;
+                SetFocus(if usable {
+                    saved
+                } else {
+                    (*s).nav[(*s).tab as usize]
+                });
+            }
             0
         }
         WM_COMMAND => {
@@ -1531,10 +1564,10 @@ b",
     close(owner);
 }
 
-/// Open the window with tracing on, shown (so it counts as active) without
-/// appearing on screen: transparent, non-activating, not in the taskbar.
+/// Open the window shown (so it counts as active and its controls take the
+/// focus) without appearing on screen: transparent, not in the taskbar.
 #[cfg(test)]
-pub(super) unsafe fn show_traced(owner: *mut App) {
+unsafe fn show_invisibly(owner: *mut App) -> *mut State {
     create(owner, false);
     let s = owner_state(owner);
     assert!(!s.is_null());
@@ -1547,8 +1580,69 @@ pub(super) unsafe fn show_traced(owner: *mut App) {
     );
     SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    s
+}
+
+/// [`show_invisibly`] with tracing on.
+#[cfg(test)]
+pub(super) unsafe fn show_traced(owner: *mut App) {
+    let s = show_invisibly(owner);
     (*s).detailed = true;
     changed(s, true);
+}
+
+#[cfg(test)]
+pub(super) unsafe fn assert_keyboard_focus(owner: *mut App) {
+    let s = show_invisibly(owner);
+    let hwnd = (*s).hwnd;
+    // Alt alone is consumed: DefWindowProc would enter an invisible menu
+    // mode that eats the next key.
+    assert_eq!(
+        chrome::message(s, hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0),
+        Some(0)
+    );
+    // A short window: the last panel starts below the visible list.
+    super::fit_client(hwnd, 780, 560);
+    view::layout(s);
+    (*s).scroll = 0;
+    view::layout_body(s);
+    let last = (*s).panels.last().unwrap();
+    let (header, table) = (last.header, last.table);
+    let mut body: RECT = zeroed();
+    GetClientRect((*s).body, &mut body);
+    assert!(
+        last.bounds.bottom > body.bottom,
+        "precondition: out of view"
+    );
+    SetFocus(header);
+    let tab = MSG {
+        hwnd: header,
+        message: WM_KEYDOWN,
+        wParam: VK_TAB as usize,
+        ..zeroed()
+    };
+    assert!(keyboard(owner, &tab));
+    assert_eq!(GetFocus(), table, "Tab moves from the header to its table");
+    let mut shown: RECT = zeroed();
+    GetWindowRect(table, &mut shown);
+    MapWindowPoints(null_mut(), (*s).body, (&mut shown as *mut RECT).cast(), 2);
+    assert!(
+        shown.top >= 0 && shown.top < body.bottom,
+        "the focused table is scrolled into view: {} in 0..{}",
+        shown.top,
+        body.bottom
+    );
+    assert!((*s).scroll > 0);
+    // Deactivating keeps the focused control; activating returns to it.
+    SendMessageW(hwnd, WM_ACTIVATE, WA_INACTIVE as usize, 0);
+    SetFocus((*s).search);
+    SendMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE as usize, 0);
+    assert_eq!(GetFocus(), table);
+    // A control that no longer exists falls back to the current tab.
+    (*s).focus = null_mut();
+    SendMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE as usize, 0);
+    assert_eq!(GetFocus(), (*s).nav[(*s).tab as usize]);
+    close(owner);
 }
 
 #[cfg(test)]

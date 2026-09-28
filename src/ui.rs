@@ -4451,6 +4451,14 @@ mod tests {
         }
     }
     #[test]
+    fn resource_monitor_keyboard_focus_scrolls_into_view_and_survives_activation() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_keyboard_focus(test.p);
+        }
+    }
+    #[test]
     fn resource_monitor_rows_keep_their_identity_across_refreshes() {
         let test = TestWindow::new();
         test.snapshot(rows());
