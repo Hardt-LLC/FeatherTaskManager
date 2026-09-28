@@ -1,6 +1,6 @@
 [package]
 name = "feather-task"
-version = "2026.9.4"
+version = "2026.9.5"
 edition = "2021"
 description = "Feather Task Manager - a small, responsive native Windows task manager"
 license = "MIT"
