@@ -1479,6 +1479,7 @@ mod tests {
             network_bytes_per_sec: None,
             threads: 1,
             handles: 1,
+            ..Process::default()
         }
     }
 

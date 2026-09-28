@@ -144,6 +144,12 @@ pub(super) trait Model {
     unsafe fn header(&self, _col: usize) -> HeaderCell {
         HeaderCell::default()
     }
+    unsafe fn editable_columns(&self) -> bool {
+        false
+    }
+    unsafe fn resize_column(&self, _column: usize, _width: f32) {}
+    unsafe fn reorder_column(&self, _from: usize, _to: usize) {}
+    unsafe fn column_menu(&self, _column: usize, _point: POINT) {}
     /// Clickable parts of `row` laid out in the row rectangle `r` with the
     /// column cells `cells` (same geometry the painter uses).
     unsafe fn parts(&self, _row: usize, _r: RECT, _cells: &[RECT]) -> Parts {
@@ -325,6 +331,13 @@ struct State {
     tracking: bool,
     pressed: Option<usize>,
     pressed_header: Option<usize>,
+    header_origin: i32,
+    header_dragged: bool,
+    resizing: Option<(usize, i32, f32)>,
+    horizontal_offset: i32,
+    horizontal_max: i32,
+    horizontal_page: i32,
+    horizontal_syncing: bool,
     redraw: bool,
     typed: String,
     typed_at: Option<Instant>,
@@ -399,9 +412,7 @@ pub(super) unsafe fn create_devices(p: *mut App, id: usize, label: &str) -> HWND
 }
 
 unsafe fn state(hwnd: HWND) -> *mut State {
-    if hwnd.is_null()
-        || GetWindowLongPtrW(hwnd, GWLP_WNDPROC) != proc as *const () as usize as isize
-    {
+    if hwnd.is_null() || GetClassLongPtrW(hwnd, GCLP_WNDPROC) != proc as *const () as usize {
         return null_mut();
     }
     GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State
@@ -425,6 +436,13 @@ impl State {
             tracking: false,
             pressed: None,
             pressed_header: None,
+            header_origin: 0,
+            header_dragged: false,
+            resizing: None,
+            horizontal_offset: 0,
+            horizontal_max: 0,
+            horizontal_page: 0,
+            horizontal_syncing: false,
             redraw: true,
             typed: String::new(),
             typed_at: None,
@@ -508,8 +526,7 @@ pub(super) unsafe fn part_at(hwnd: HWND, pt: POINT) -> Option<(usize, Part)> {
     }
 }
 
-/// The client rectangle of a row's part (tests).
-#[cfg(test)]
+/// The client rectangle of a row's part (device drag target or tests).
 pub(super) unsafe fn part_rect(hwnd: HWND, row: usize, part: Part) -> Option<RECT> {
     let s = state(hwnd);
     if s.is_null() {
@@ -617,7 +634,6 @@ pub(super) unsafe fn settle(hwnd: HWND) {
 }
 
 /// The displayed scroll offset (device px).
-#[cfg(test)]
 pub(super) unsafe fn scroll_offset(hwnd: HWND) -> f32 {
     let s = state(hwnd);
     if s.is_null() {
@@ -694,6 +710,83 @@ unsafe fn client(s: *mut State) -> RECT {
     r
 }
 
+/// Process layouts keep explicit widths; overflow uses a horizontal bar.
+/// Other pages retain their original compact, proportionally fitted columns.
+unsafe fn column_spans(s: *mut State) -> Vec<(i32, i32)> {
+    let area = client(s);
+    let dpi = (*s).model.dpi();
+    let width = if (*s).model.editable_columns() {
+        area.right.max(
+            (*s).columns
+                .iter()
+                .map(|c| gfx::pxi(dpi, if c.flex { FLEX_MIN } else { c.width }))
+                .sum(),
+        )
+    } else {
+        area.right
+    };
+    spans(&(*s).columns, width, dpi)
+        .into_iter()
+        .map(|(left, right)| {
+            (
+                left - (*s).horizontal_offset,
+                right - (*s).horizontal_offset,
+            )
+        })
+        .collect()
+}
+
+unsafe fn sync_horizontal(s: *mut State) {
+    if (*s).horizontal_syncing {
+        return;
+    }
+    let area = client(s);
+    let maximum = if (*s).model.editable_columns() {
+        (column_spans(s)
+            .last()
+            .map_or(0, |span| span.1 + (*s).horizontal_offset)
+            - area.right)
+            .max(0)
+    } else {
+        0
+    };
+    if maximum == (*s).horizontal_max && area.right == (*s).horizontal_page {
+        return;
+    }
+    (*s).horizontal_max = maximum;
+    (*s).horizontal_page = area.right;
+    (*s).horizontal_offset = (*s).horizontal_offset.clamp(0, maximum);
+    (*s).horizontal_syncing = true;
+    let info = SCROLLINFO {
+        cbSize: size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+        nMin: 0,
+        nMax: (maximum + area.right - 1).max(0),
+        nPage: area.right.max(0) as u32,
+        nPos: (*s).horizontal_offset,
+        ..zeroed()
+    };
+    SetScrollInfo((*s).hwnd, SB_HORZ, &info, 1);
+    (*s).horizontal_syncing = false;
+}
+
+unsafe fn horizontal_to(s: *mut State, position: i32) {
+    let next = position.clamp(0, (*s).horizontal_max);
+    if next == (*s).horizontal_offset {
+        return;
+    }
+    (*s).horizontal_offset = next;
+    let info = SCROLLINFO {
+        cbSize: size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_POS,
+        nPos: next,
+        ..zeroed()
+    };
+    SetScrollInfo((*s).hwnd, SB_HORZ, &info, 1);
+    (*s).painted_offset = None;
+    InvalidateRect((*s).hwnd, null(), 0);
+}
+
 /// Recompute row offsets, the scroll extent and the scrollbar lane (after a
 /// row count, size, DPI or header change). A DPI change rescales the offset.
 unsafe fn relayout(s: *mut State) {
@@ -705,6 +798,7 @@ unsafe fn relayout(s: *mut State) {
         }
         (*s).dpi = dpi;
     }
+    sync_horizontal(s);
     let count = (*s).count;
     let (_, pad) = (*s).model.padding();
     let tops = &mut (*s).tops;
@@ -890,7 +984,7 @@ unsafe fn row_rect(s: *mut State, row: usize) -> Option<RECT> {
 }
 
 unsafe fn cells(s: *mut State, r: RECT) -> Vec<RECT> {
-    spans(&(*s).columns, r.right, (*s).model.dpi())
+    column_spans(s)
         .into_iter()
         .map(|(left, right)| RECT { left, right, ..r })
         .collect()
@@ -909,7 +1003,7 @@ unsafe fn hit(s: *mut State, pt: POINT) -> Hit {
     }
     let header = (*s).model.header_height();
     if pt.y < header {
-        return spans(&(*s).columns, area.right, (*s).model.dpi())
+        return column_spans(s)
             .iter()
             .position(|&(l, r)| pt.x >= l && pt.x < r)
             .filter(|&col| col < (*s).columns.len())
@@ -947,8 +1041,7 @@ unsafe fn on_part(s: *mut State, pt: POINT) -> bool {
 }
 
 unsafe fn column_at(s: *mut State, x: i32) -> i32 {
-    let area = client(s);
-    spans(&(*s).columns, area.right, (*s).model.dpi())
+    column_spans(s)
         .iter()
         .position(|&(l, r)| x >= l && x < r)
         .map_or(-1, |c| c as i32)
@@ -1124,9 +1217,8 @@ unsafe fn key_region(s: *mut State, key: Key) -> Option<RECT> {
     match key {
         Key::Row(row) | Key::ChevronHover(row) => row_rect(s, row),
         Key::Header(col) => {
-            let area = client(s);
             let bottom = (*s).model.header_height();
-            spans(&(*s).columns, area.right, (*s).model.dpi())
+            column_spans(s)
                 .get(col)
                 .filter(|_| col < (*s).columns.len())
                 .map(|&(left, right)| RECT {
@@ -1173,7 +1265,43 @@ unsafe fn set_chevron_hover_with(s: *mut State, row: Option<usize>, snap: bool) 
 }
 
 unsafe fn mouse_move(s: *mut State, pt: POINT) {
+    if let Some((column, origin, original)) = (*s).resizing {
+        let width =
+            (original + (pt.x - origin) as f32 * 96.0 / (*s).model.dpi() as f32).clamp(48.0, 800.0);
+        if let Some(entry) = (&mut (*s).columns).get_mut(column) {
+            entry.width = width;
+            entry.flex = false;
+        }
+        sync_horizontal(s);
+        (*s).painted_offset = None;
+        InvalidateRect((*s).hwnd, null(), 0);
+        return;
+    }
+    if (*s).pressed_header.is_some()
+        && (*s).model.editable_columns()
+        && (pt.x - (*s).header_origin).abs() > gfx::pxi((*s).model.dpi(), 5.0)
+    {
+        (*s).header_dragged = true;
+        invalidate_header((*s).hwnd);
+        // Reveal adjacent columns without a timer; movement drives scrolling.
+        let width = client(s).right;
+        if pt.x < 20 {
+            horizontal_to(s, (*s).horizontal_offset - 18);
+        } else if pt.x > width - 20 {
+            horizontal_to(s, (*s).horizontal_offset + 18);
+        }
+    }
     hover_at(s, pt, false);
+}
+
+unsafe fn resize_edge(s: *mut State, pt: POINT) -> Option<usize> {
+    if !(*s).model.editable_columns() || pt.y < 0 || pt.y >= (*s).model.header_height() {
+        return None;
+    }
+    let radius = gfx::pxi((*s).model.dpi(), 5.0);
+    column_spans(s)
+        .iter()
+        .position(|&(_, right)| (pt.x - right).abs() <= radius)
 }
 
 /// Update hover (rows, header, chevron, scrollbar lane) for the pointer at
@@ -1254,6 +1382,16 @@ unsafe fn button_down(s: *mut State, pt: POINT, double: bool) {
     if GetFocus() != hwnd {
         SetFocus(hwnd);
     }
+    if let Some(column) = resize_edge(s, pt) {
+        let span = column_spans(s)[column];
+        (*s).resizing = Some((
+            column,
+            pt.x,
+            (span.1 - span.0) as f32 * 96.0 / (*s).model.dpi() as f32,
+        ));
+        SetCapture(hwnd);
+        return;
+    }
     let area = client(s);
     let lane = lane(s, area);
     let min = gfx::px((*s).model.dpi(), widgets::SCROLL_THUMB_MIN);
@@ -1264,6 +1402,8 @@ unsafe fn button_down(s: *mut State, pt: POINT, double: bool) {
     match hit(s, pt) {
         Hit::Header(col) if (*s).mode == Mode::Table => {
             (*s).pressed_header = Some(col);
+            (*s).header_origin = pt.x;
+            (*s).header_dragged = false;
             SetCapture(hwnd);
         }
         Hit::Row(row) => {
@@ -1286,18 +1426,30 @@ unsafe fn button_down(s: *mut State, pt: POINT, double: bool) {
 }
 
 unsafe fn button_up(s: *mut State, pt: POINT) {
+    let resizing = (*s).resizing.take();
     let header = (*s).pressed_header.take();
+    let header_dragged = std::mem::take(&mut (*s).header_dragged);
     let pressed = (*s).pressed.take();
     let dragging = (*s).scroll.is_dragging();
     if GetCapture() == (*s).hwnd {
         ReleaseCapture();
+    }
+    if let Some((column, _, _)) = resizing {
+        let width = (&(*s).columns)[column].width;
+        (*s).model.resize_column(column, width);
+        return;
     }
     if dragging {
         (*s).scroll.release(&mut (*s).anim);
         return;
     }
     if let Some(col) = header {
-        if hit(s, pt) == Hit::Header(col) {
+        if header_dragged {
+            if let Hit::Header(target) = hit(s, pt) {
+                (*s).model.reorder_column(col, target);
+            }
+            invalidate_header((*s).hwnd);
+        } else if hit(s, pt) == Hit::Header(col) {
             notify(s, LVN_COLUMNCLICK, None, col as i32, pt, 0, 0);
         }
         return;
@@ -1514,7 +1666,7 @@ unsafe fn paint_to(s: *mut State, dc: HDC) -> (i32, RECT) {
     let pt = Painter::new(dc, dpi, model.fonts());
     pt.fill(area, pt.c.surface);
     let header = model.header_height().clamp(0, area.bottom.max(0));
-    let spans = spans(&(*s).columns, area.right, dpi);
+    let spans = column_spans(s);
     let offset = offset_px(s);
     // Rows outside the update region are not drawn (a hover fade repaints
     // one row); their animation state is still tracked below.
@@ -1607,6 +1759,25 @@ unsafe fn paint_to(s: *mut State, dc: HDC) -> (i32, RECT) {
         // After every cell: an overflowing total reaches into a neighbour.
         for (total, r, align) in overflow {
             widgets::header_total(&pt, pt.fonts.mono_total, &total, r, align);
+        }
+        if (*s).header_dragged {
+            if let (Some(source), Some(target)) = ((*s).pressed_header, (*s).hover_header) {
+                if source > 0 && target > 0 && source != target {
+                    let edge = if target > source {
+                        spans[target].1
+                    } else {
+                        spans[target].0
+                    };
+                    pt.fill(
+                        RECT {
+                            left: edge - pt.pxi(1.0),
+                            right: edge + pt.pxi(1.0),
+                            ..band
+                        },
+                        pt.c.accent,
+                    );
+                }
+            }
         }
         if right < band.right {
             widgets::header_cell(
@@ -1885,13 +2056,10 @@ unsafe fn list_view_message(s: *mut State, msg: u32, w: WPARAM, l: LPARAM) -> Op
             }
             1
         }
-        LVM_GETCOLUMNWIDTH => {
-            let area = client(s);
-            spans(&(*s).columns, area.right, (*s).model.dpi())
-                .get(w)
-                .filter(|_| w < (*s).columns.len())
-                .map_or(0, |&(l, r)| (r - l) as isize)
-        }
+        LVM_GETCOLUMNWIDTH => column_spans(s)
+            .get(w)
+            .filter(|_| w < (*s).columns.len())
+            .map_or(0, |&(l, r)| (r - l) as isize),
         LVM_GETHEADER => 0,
         LVM_GETTOPINDEX => row_at(&(*s).tops, offset_px(s).max(0)).map_or(0, |r| r as isize),
         LVM_GETCOUNTPERPAGE => page_rows(s) as isize + 1,
@@ -2076,6 +2244,14 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             let mut pt: POINT = zeroed();
             GetCursorPos(&mut pt);
             ScreenToClient(hwnd, &mut pt);
+            if (*s).resizing.is_some() || resize_edge(s, pt).is_some() {
+                SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                return 1;
+            }
+            if (*s).header_dragged {
+                SetCursor(LoadCursorW(null_mut(), IDC_SIZEALL));
+                return 1;
+            }
             let lane = lane(s, client(s));
             let hand = match hit(s, pt) {
                 _ if contains(&lane, pt)
@@ -2116,14 +2292,61 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             }
             0
         }
+        WM_CONTEXTMENU if (*s).model.editable_columns() => {
+            let mut pt = point(l);
+            if l != -1 {
+                ScreenToClient(hwnd, &mut pt);
+                if let Hit::Header(column) = hit(s, pt) {
+                    (*s).model.column_menu(column, point(l));
+                    return 0;
+                }
+            }
+            DefWindowProcW(hwnd, msg, w, l)
+        }
         WM_CAPTURECHANGED => {
             (*s).scroll.release(&mut (*s).anim);
             (*s).pressed = None;
             (*s).pressed_header = None;
+            (*s).header_dragged = false;
+            if let Some((column, _, _)) = (*s).resizing.take() {
+                let width = (&(*s).columns)[column].width;
+                (*s).model.resize_column(column, width);
+            }
+            0
+        }
+        WM_HSCROLL => {
+            let mut info = SCROLLINFO {
+                cbSize: size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_TRACKPOS,
+                ..zeroed()
+            };
+            GetScrollInfo(hwnd, SB_HORZ, &mut info);
+            let now = (*s).horizontal_offset;
+            let page = client(s).right.max(1);
+            let next = match (w & 0xffff) as i32 {
+                SB_LINELEFT => now - gfx::pxi((*s).model.dpi(), 32.0),
+                SB_LINERIGHT => now + gfx::pxi((*s).model.dpi(), 32.0),
+                SB_PAGELEFT => now - page,
+                SB_PAGERIGHT => now + page,
+                SB_LEFT => 0,
+                SB_RIGHT => (*s).horizontal_max,
+                SB_THUMBPOSITION | SB_THUMBTRACK => info.nTrackPos,
+                _ => now,
+            };
+            horizontal_to(s, next);
+            0
+        }
+        WM_MOUSEHWHEEL => {
+            let delta = ((w >> 16) & 0xffff) as u16 as i16 as i32;
+            horizontal_to(s, (*s).horizontal_offset + delta);
             0
         }
         WM_MOUSEWHEEL => {
             let delta = ((w >> 16) & 0xffff) as u16 as i16 as i32;
+            if w & 0x0004 != 0 && (*s).horizontal_max > 0 {
+                horizontal_to(s, (*s).horizontal_offset - delta);
+                return 0;
+            }
             if wheel(s, delta) {
                 0
             } else {
@@ -2131,6 +2354,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             }
         }
         WM_KEYDOWN => {
+            if (*s).model.editable_columns()
+                && w as u16 == b'C' as u16
+                && GetKeyState(VK_CONTROL as i32) < 0
+                && GetKeyState(VK_SHIFT as i32) < 0
+            {
+                let mut at = POINT {
+                    x: 16,
+                    y: (*s).model.header_height(),
+                };
+                ClientToScreen(hwnd, &mut at);
+                (*s).model.column_menu(0, at);
+                return 0;
+            }
             if key_down(s, w as u16) {
                 0
             } else {
@@ -2368,7 +2604,7 @@ impl AppRows {
         };
         let process = &process;
         let (content, bg) = row_frame(pt, r, st);
-        if cells.len() < 7 {
+        if cells.is_empty() {
             return;
         }
         let c = pt.c;
@@ -2397,14 +2633,6 @@ impl AppRows {
             &process.name,
             suffix.as_deref(),
         );
-        cell_text(
-            pt,
-            f.mono_cell,
-            c.fg,
-            &process.pid.to_string(),
-            at(1),
-            DT_RIGHT,
-        );
         // Design heat thresholds: CPU 20 %, memory 2400 MB, All I/O 3 MB/s,
         // network 8 Mbps, GPU 12 %, composited over the row background
         // (hover/selection stay visible). Unmeasured network / GPU cells read
@@ -2412,43 +2640,38 @@ impl AppRows {
         let optional = |value: Option<f64>, threshold: f64| {
             value.map_or(0.0, |v| widgets::heat_alpha(v, threshold))
         };
-        for (col, alpha) in [
-            (
-                2,
-                widgets::heat_alpha(process.cpu_percent, widgets::HEAT_CPU_PERCENT),
-            ),
-            (
-                3,
-                widgets::heat_alpha(process.working_set as f64, widgets::HEAT_MEMORY_BYTES),
-            ),
-            (
-                4,
-                widgets::heat_alpha(process.io_bytes_per_sec, widgets::HEAT_IO_BYTES_PER_SEC),
-            ),
-            (
-                5,
-                optional(
+        use process_columns::ProcessColumn::*;
+        for (col, id) in (*p).process_columns.shown().enumerate().skip(1) {
+            if cells[col].right <= cells[col].left {
+                continue;
+            }
+            let alpha = match id {
+                Cpu => widgets::heat_alpha(process.cpu_percent, widgets::HEAT_CPU_PERCENT),
+                Memory => {
+                    widgets::heat_alpha(process.working_set as f64, widgets::HEAT_MEMORY_BYTES)
+                }
+                AllIo => {
+                    widgets::heat_alpha(process.io_bytes_per_sec, widgets::HEAT_IO_BYTES_PER_SEC)
+                }
+                Network => optional(
                     process.network_bytes_per_sec,
                     widgets::HEAT_NETWORK_BYTES_PER_SEC,
                 ),
-            ),
-            (6, optional(process.gpu_percent, widgets::HEAT_GPU_PERCENT)),
-        ] {
+                Gpu => optional(process.gpu_percent, widgets::HEAT_GPU_PERCENT),
+                _ => 0.0,
+            };
             if alpha > 0.0 {
                 widgets::heat_cell_bg(pt, at(col), bg, alpha);
             }
-            let unmeasured = match col {
-                5 => process.network_bytes_per_sec.is_none(),
-                6 => process.gpu_percent.is_none(),
-                _ => false,
-            };
+            let text = super::cell(process, id as i32);
+            let unmeasured = text == "—";
             cell_text(
                 pt,
-                f.mono_cell,
+                if id.numeric() { f.mono_cell } else { f.body },
                 if unmeasured { c.muted } else { c.fg },
-                &super::cell(process, col as i32),
+                &text,
                 at(col),
-                DT_RIGHT,
+                if id.numeric() { DT_RIGHT } else { DT_LEFT },
             );
         }
     }
@@ -2657,6 +2880,13 @@ impl Model for AppRows {
     unsafe fn header(&self, col: usize) -> HeaderCell {
         let p = self.0;
         let processes = (*p).page == Page::Processes;
+        let col = if processes {
+            (*p).process_columns
+                .at(col)
+                .map_or(usize::MAX, |id| id as usize)
+        } else {
+            col
+        };
         let total = if processes {
             (*p).snapshot.as_ref().and_then(|s| match col {
                 2 => Some(format!("{:.1}%", s.cpu_percent)),
@@ -2701,6 +2931,18 @@ impl Model for AppRows {
             sort: (col == (*p).sort && (processes || (*p).sort_chosen)).then_some((*p).descending),
             two_line: processes,
         }
+    }
+    unsafe fn editable_columns(&self) -> bool {
+        (*self.0).page == Page::Processes
+    }
+    unsafe fn resize_column(&self, column: usize, width: f32) {
+        process_columns::resize(self.0, column, width);
+    }
+    unsafe fn reorder_column(&self, from: usize, to: usize) {
+        process_columns::reorder(self.0, from, to);
+    }
+    unsafe fn column_menu(&self, column: usize, point: POINT) {
+        process_columns::menu(self.0, column, point);
     }
     unsafe fn parts(&self, row: usize, r: RECT, cells: &[RECT]) -> Parts {
         let p = self.0;

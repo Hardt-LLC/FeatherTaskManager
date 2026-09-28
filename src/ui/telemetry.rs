@@ -201,6 +201,7 @@ mod tests {
             network_bytes_per_sec: None,
             threads: 1,
             handles: 2,
+            ..Process::default()
         };
         let mut selected = ProcessTelemetry::default();
         selected.select(Some(&process));

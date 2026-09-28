@@ -27,7 +27,7 @@ const INITIAL_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Process {
     pub pid: u32,
     pub parent_pid: u32,
@@ -51,6 +51,18 @@ pub struct Process {
     pub network_bytes_per_sec: Option<f64>,
     pub threads: u32,
     pub handles: u32,
+    pub session_id: u32,
+    pub cpu_time_100ns: u64,
+    /// All live threads are waiting for suspension; unknown on an incomplete record.
+    pub suspended: Option<bool>,
+    pub user_name: Option<String>,
+    pub command_line: Option<String>,
+    /// Windows' nonblocking hung-window classification; no window means unknown.
+    pub responsiveness: Option<bool>,
+    pub efficiency: Option<bool>,
+    pub gpu_engine: Option<String>,
+    pub gpu_dedicated_bytes: Option<u64>,
+    pub gpu_shared_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -360,6 +372,10 @@ fn parse_processes(bytes: &[u8], previous_count: usize) -> Result<Vec<ProcessSam
                 network_bytes_per_sec: None,
                 threads: u32_at(4),
                 handles: u32_at(96),
+                session_id: u32_at(100),
+                cpu_time_100ns: u64_at(40).saturating_add(u64_at(48)),
+                suspended: suspended_threads(&remaining[..entry_size], u32_at(4)),
+                ..Process::default()
             },
             counters: Counters {
                 created,
@@ -378,9 +394,43 @@ fn parse_processes(bytes: &[u8], previous_count: usize) -> Result<Vec<ProcessSam
     Ok(samples)
 }
 
+/// SYSTEM_THREAD_INFORMATION is 80 bytes on x64. KTHREAD_STATE Waiting=5,
+/// Terminated=4; KWAIT_REASON Suspended=5, WrSuspended=12 (phnt/ntkeapi.h).
+fn suspended_threads(record: &[u8], count: u32) -> Option<bool> {
+    let length = (count as usize).checked_mul(80)?;
+    let threads = record.get(HEADER_BYTES..HEADER_BYTES.checked_add(length)?)?;
+    let mut live = false;
+    for thread in threads.as_chunks::<80>().0 {
+        let state = u32::from_le_bytes(thread[68..72].try_into().ok()?);
+        let reason = u32::from_le_bytes(thread[72..76].try_into().ok()?);
+        if state == 4 {
+            continue;
+        }
+        live = true;
+        if state != 5 || !matches!(reason, 5 | 12) {
+            return Some(false);
+        }
+    }
+    live.then_some(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspension_requires_all_live_threads_and_complete_payload() {
+        let mut record = vec![0u8; HEADER_BYTES + 160];
+        for start in [HEADER_BYTES, HEADER_BYTES + 80] {
+            record[start + 68..start + 72].copy_from_slice(&5u32.to_le_bytes());
+            record[start + 72..start + 76].copy_from_slice(&12u32.to_le_bytes());
+        }
+        assert_eq!(suspended_threads(&record, 2), Some(true));
+        record[HEADER_BYTES + 68..HEADER_BYTES + 72].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(suspended_threads(&record, 2), Some(false));
+        assert_eq!(suspended_threads(&record[..HEADER_BYTES + 80], 2), None);
+        assert_eq!(suspended_threads(&record, 0), None);
+    }
 
     fn counter(created: u64, cpu: u64, io: u64) -> Counters {
         Counters {

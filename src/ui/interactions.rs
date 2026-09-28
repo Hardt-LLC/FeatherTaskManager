@@ -1,7 +1,10 @@
 //! Native controls and explicit actions for the supplied Feather layout.
 use super::*;
 use windows_sys::Win32::System::{DataExchange::*, Memory::*};
-use windows_sys::Win32::UI::Controls::Dialogs::*;
+
+const SWITCH_WINDOW: usize = 530;
+const RESTART_EXPLORER: usize = 531;
+const CHOOSE_COLUMNS: usize = 532;
 
 pub(super) unsafe fn populate_filters(p: *mut App) {
     SendMessageW((*p).filter_control, CB_RESETCONTENT, 0, 0);
@@ -98,12 +101,9 @@ pub(super) unsafe fn refresh_components(p: *mut App) {
                 .map(|s| PerfTarget::Gpu(s.id.clone())),
         );
     }
+    perf_order::reconcile(p, &mut targets);
     if targets != (*p).perf_targets || SendMessageW((*p).perf_list, LB_GETCOUNT, 0, 0) == 0 {
         (*p).perf_targets = targets;
-        if !(*p).perf_targets.contains(&(*p).perf_target) {
-            let selected = (*p).perf_target.clone();
-            (*p).perf_targets.push(selected);
-        }
         SendMessageW((*p).perf_list, WM_SETREDRAW, 0, 0);
         SendMessageW((*p).perf_list, LB_RESETCONTENT, 0, 0);
         for target in &(*p).perf_targets {
@@ -895,7 +895,9 @@ unsafe fn extra_menu_at(p: *mut App, anchor: popup::Anchor) {
     DestroyMenu(menu);
     finish_modal(p);
     dispatch_extra(p, id, process);
-    restore_focus(p, focus);
+    if id != SWITCH_WINDOW {
+        restore_focus(p, focus);
+    }
 }
 /// The page's extra actions menu (the ⋯ button and the list context menu).
 /// The caller owns (destroys) the returned menu; null on failure.
@@ -952,6 +954,24 @@ pub(super) unsafe fn build_extra_menu(
             tr("서비스로 이동", "Go to services"),
             identifiable,
         );
+        let selected = selected_process(p).filter(|_| has_process);
+        add(
+            SWITCH_WINDOW,
+            tr("앱 창으로 전환", "Switch to app window"),
+            selected
+                .as_ref()
+                .is_some_and(|s| s.created != 0 && crate::actions::has_app_window(s.pid)),
+        );
+        if selected
+            .as_ref()
+            .is_some_and(|s| crate::actions::is_shell_process(s.pid, s.created))
+        {
+            add(
+                RESTART_EXPLORER,
+                tr("Windows 탐색기 다시 시작", "Restart Windows Explorer"),
+                true,
+            );
+        }
         // Priority is a submenu with the current class checked.
         let priorities = CreatePopupMenu();
         if !priorities.is_null() {
@@ -1004,6 +1024,11 @@ pub(super) unsafe fn build_extra_menu(
             (*p).tree_mode || (*p).group_mode,
         );
         add(RUN_TASK, tr("새 작업 실행…", "Run new task…"), true);
+        add(
+            CHOOSE_COLUMNS,
+            tr("열 선택…\tCtrl+Shift+C", "Choose columns…\tCtrl+Shift+C"),
+            true,
+        );
         add(
             RESOURCE_MONITOR,
             tr("리소스 모니터", "Resource Monitor"),
@@ -1082,6 +1107,32 @@ pub(super) unsafe fn build_extra_menu(
 /// when the menu opened).
 unsafe fn dispatch_extra(p: *mut App, id: usize, process: Option<Process>) {
     match id {
+        CHOOSE_COLUMNS if (*p).page == Page::Processes => {
+            let mut bounds: RECT = zeroed();
+            GetWindowRect((*p).more, &mut bounds);
+            process_columns::menu(
+                p,
+                0,
+                POINT {
+                    x: bounds.left,
+                    y: bounds.bottom,
+                },
+            );
+        }
+        SWITCH_WINDOW => {
+            if let Some(s) = process {
+                if let Err(error) = crate::actions::switch_to_window(s.pid, s.created) {
+                    (*p).set_error(ErrorSource::Action, error);
+                }
+            }
+        }
+        RESTART_EXPLORER => {
+            if let Some(s) = process {
+                if confirm_with(p, tr("Windows 탐색기 다시 시작", "Restart Windows Explorer"), tr("작업 표시줄과 바탕 화면이 잠시 사라지고 탐색기 창이 다시 열릴 수 있습니다. 파일 복사 작업을 마친 뒤 다시 시작하세요.", "The taskbar and desktop will briefly disappear, and Explorer windows may reopen. Finish any file transfers before restarting."), None, false) {
+                    begin_action(p, Action::RestartExplorer(s.pid, s.created));
+                }
+            }
+        }
         navigation::FILE_PROPERTIES => {
             if let Some(s) = process {
                 begin_action(p, Action::Properties(s.pid, s.created));
@@ -1150,32 +1201,12 @@ unsafe fn dispatch_extra(p: *mut App, id: usize, process: Option<Process>) {
     redraw(p);
 }
 unsafe fn run_task(p: *mut App) {
-    let mut path = [0u16; 32768];
-    // The system's Open dialog, titled and filtered in the app's language.
-    let filter: Vec<u16> = format!(
-        "{} (*.exe;*.com)\0*.exe;*.com\0\0",
-        tr("프로그램", "Programs")
-    )
-    .encode_utf16()
-    .collect();
-    let title = wide(tr("새 작업 실행", "Run new task"));
-    let mut dialog = OPENFILENAMEW {
-        lStructSize: size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: (*p).hwnd,
-        lpstrFile: path.as_mut_ptr(),
-        nMaxFile: path.len() as u32,
-        lpstrFilter: filter.as_ptr(),
-        lpstrTitle: title.as_ptr(),
-        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER,
-        ..zeroed()
-    };
     (*p).modal = true;
     configure(p);
-    let accepted = GetOpenFileNameW(&mut dialog) != 0;
+    let task = run_task::show(p);
     finish_modal(p);
-    if accepted {
-        let end = path.iter().position(|x| *x == 0).unwrap_or(path.len());
-        begin_action(p, Action::RunTask(String::from_utf16_lossy(&path[..end])));
+    if let Some(task) = task {
+        begin_action(p, Action::RunTask(task));
     }
 }
 pub(super) unsafe fn report_copy(p: *mut App, value: &str) {
