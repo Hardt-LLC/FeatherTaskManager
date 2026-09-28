@@ -1069,11 +1069,18 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
                         Page::Performance,
                         tr("Windows 도구를 열었습니다.", "Opened the Windows tool.").into(),
                     ),
-                    Action::RunTask(task) => (
-                        crate::actions::launch_task(&task, hwnd),
-                        Page::Processes,
-                        tr("새 작업을 실행했습니다.", "Started the new task.").into(),
-                    ),
+                    Action::RunTask(task) => {
+                        let result = crate::actions::launch_task(&task, hwnd);
+                        let notice = if matches!(result, Ok(false)) {
+                            tr(
+                                "관리자 권한 실행을 취소했습니다.",
+                                "Administrator launch cancelled.",
+                            )
+                        } else {
+                            tr("새 작업을 실행했습니다.", "Started the new task.")
+                        };
+                        (result.map(|_| ()), Page::Processes, notice.into())
+                    }
                     Action::RestartExplorer(pid, created) => (
                         crate::actions::restart_explorer(pid, created),
                         Page::Processes,
@@ -4351,17 +4358,21 @@ mod tests {
                 if GetWindow(dialog, GW_OWNER) as usize == owner
                     && !GetDlgItem(dialog, 701).is_null()
                 {
-                    INSPECTED.set(
-                        IsWindowEnabled(GetDlgItem(dialog, IDOK)) == 0
-                            && IsDlgButtonChecked(dialog, 704) == BST_UNCHECKED,
-                    );
+                    INSPECTED.set(IsWindowEnabled(GetDlgItem(dialog, IDOK)) == 0);
                     SetDlgItemTextW(
                         dialog,
                         701,
                         wide(r#""C:\Program Files\Example\app.exe" --inline"#).as_ptr(),
                     );
                     SetDlgItemTextW(dialog, 702, wide(r#""two words" &literal"#).as_ptr());
-                    CheckDlgButton(dialog, 704, BST_CHECKED);
+                    // One click turns the owner-drawn administrator switch on
+                    // (BM_CLICK would re-activate the dialog inside this hook).
+                    SendMessageW(
+                        dialog,
+                        WM_COMMAND,
+                        (BN_CLICKED as usize) << 16 | 704,
+                        GetDlgItem(dialog, 704) as isize,
+                    );
                     PostMessageW(
                         dialog,
                         WM_COMMAND,
@@ -4394,7 +4405,7 @@ mod tests {
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             assert!(
                 INSPECTED.get(),
-                "Run starts disabled and administrator mode starts unchecked"
+                "Run starts disabled until a program is entered"
             );
             assert!(
                 test.jobs.try_recv().is_err(),
@@ -4675,6 +4686,37 @@ mod tests {
             setup_columns(p);
             assert_eq!((*p).sort, process_columns::ProcessColumn::Name as usize);
             assert!(!(*p).descending);
+        }
+    }
+    #[test]
+    fn divider_clicks_keep_widths_and_page_switches_cancel_resizing() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            let list = (*p).list;
+            let at = |x: i32| ((12i32 << 16) | (x & 0xffff)) as isize;
+            let edge = |columns: usize| {
+                (0..columns)
+                    .map(|i| SendMessageW(list, LVM_GETCOLUMNWIDTH, i, 0) as i32)
+                    .sum::<i32>()
+            };
+            let before = (*p).process_columns.columns().to_vec();
+            // A click or double-click on the flexible Name column's divider
+            // (the auto-fit habit) must not collapse it to the minimum.
+            SendMessageW(list, WM_LBUTTONDOWN, 0, at(edge(1)));
+            SendMessageW(list, WM_LBUTTONUP, 0, at(edge(1)));
+            SendMessageW(list, WM_LBUTTONDBLCLK, 0, at(edge(1)));
+            SendMessageW(list, WM_LBUTTONUP, 0, at(edge(1)));
+            assert_eq!((*p).process_columns.columns(), &before[..]);
+            // Changing page mid-drag drops the drag instead of applying the
+            // process column index to the new page's columns.
+            SendMessageW(list, WM_LBUTTONDOWN, 0, at(edge(7)));
+            SendMessageW(list, WM_MOUSEMOVE, 0, at(edge(7) + 40));
+            test.page(Page::Startup);
+            SendMessageW(list, WM_LBUTTONUP, 0, at(edge(4) + 40));
+            test.page(Page::Processes);
+            assert_eq!((*p).process_columns.columns(), &before[..]);
         }
     }
     #[test]

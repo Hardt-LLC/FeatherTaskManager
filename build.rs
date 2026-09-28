@@ -108,6 +108,10 @@ fn main() {
     // Load powrprof.dll (only CallNtPowerInformation) on first use instead,
     // after main has restricted every DLL search to System32 (FTM-2026-05).
     println!("cargo:rustc-link-arg=/DELAYLOAD:powrprof.dll");
+    // Restart Manager is used only by the confirmed Explorer restart. Loading
+    // it on that first use keeps its initializer out of the pre-main window
+    // and off every launch.
+    println!("cargo:rustc-link-arg=/DELAYLOAD:rstrtmgr.dll");
     println!("cargo:rustc-link-arg=delayimp.lib");
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());

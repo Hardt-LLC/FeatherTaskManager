@@ -479,6 +479,10 @@ pub(super) unsafe fn set_columns(hwnd: HWND, columns: Vec<Column>) {
     if (*s).columns != columns {
         (*s).columns = columns;
         set_header_hover(s, None);
+        // A drag started on the previous columns must not be applied to these.
+        (*s).resizing = None;
+        (*s).pressed_header = None;
+        (*s).header_dragged = false;
     }
     relayout(s);
     InvalidateRect(hwnd, null(), 0);
@@ -1451,6 +1455,14 @@ unsafe fn button_down(s: *mut State, pt: POINT, double: bool) {
     }
 }
 
+/// Saves a finished divider drag. A click or double-click without movement
+/// changes nothing: a flexible column has no width of its own until it moves.
+unsafe fn commit_resize(s: *mut State, column: usize) {
+    if let Some(entry) = (&(*s).columns).get(column).filter(|entry| !entry.flex) {
+        (*s).model.resize_column(column, entry.width);
+    }
+}
+
 unsafe fn button_up(s: *mut State, pt: POINT) {
     let resizing = (*s).resizing.take();
     let header = (*s).pressed_header.take();
@@ -1461,8 +1473,7 @@ unsafe fn button_up(s: *mut State, pt: POINT) {
         ReleaseCapture();
     }
     if let Some((column, _, _)) = resizing {
-        let width = (&(*s).columns)[column].width;
-        (*s).model.resize_column(column, width);
+        commit_resize(s, column);
         return;
     }
     if dragging {
@@ -2339,8 +2350,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             (*s).pressed_header = None;
             (*s).header_dragged = false;
             if let Some((column, _, _)) = (*s).resizing.take() {
-                let width = (&(*s).columns)[column].width;
-                (*s).model.resize_column(column, width);
+                commit_resize(s, column);
             }
             0
         }
