@@ -533,7 +533,10 @@ pub(super) unsafe fn refresh(owner: *mut App, _at: Instant) {
     (*s).network = Some(Arc::new(network));
     (*s).files = Some(Arc::new(files));
     if (*s).tab == Tab::Cpu && !(*s).collapsed.contains(&(Tab::Cpu, Kind::Services)) {
-        (*s).services = (*owner).services.clone();
+        (*s).services = (*owner)
+            .resource_services
+            .clone()
+            .unwrap_or_else(|| (*owner).services.clone());
     }
     (*s).process_index.clear();
     (*s).pid_index.clear();

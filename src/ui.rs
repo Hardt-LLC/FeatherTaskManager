@@ -396,6 +396,9 @@ struct App {
     resource_window: HWND,
     resource_snapshot: Option<Arc<Snapshot>>,
     resource_performance: Option<Arc<PerfSnapshot>>,
+    /// A services list only the Resource Monitor asked for while the
+    /// Services page was paused (whose rows index `services`).
+    resource_services: Option<Vec<Service>>,
     resource_network: Option<Arc<ProcessNetworkSample>>,
     resource_data: Option<Arc<crate::resource::Snapshot>>,
     resource_files: Option<Arc<crate::fileetw::Sample>>,
@@ -460,6 +463,8 @@ struct App {
     /// clears it and the switch slides back.
     startup_pending: Option<(String, bool)>,
     services_loading: bool,
+    /// The services job in flight is the Resource Monitor's alone.
+    services_for_monitor: bool,
     startup_loaded: bool,
     services_loaded: bool,
     error: Option<String>,
@@ -529,6 +534,7 @@ impl App {
             resource_window: null_mut(),
             resource_snapshot: None,
             resource_performance: None,
+            resource_services: None,
             resource_network: None,
             resource_data: None,
             resource_files: None,
@@ -579,6 +585,7 @@ impl App {
             startup_refresh_pending: false,
             startup_pending: None,
             services_loading: false,
+            services_for_monitor: false,
             startup_loaded: false,
             services_loaded: false,
             error: None,
@@ -2338,6 +2345,11 @@ unsafe fn configure(p: *mut App) {
     });
 }
 unsafe fn request_list(p: *mut App, page: Page) {
+    if page == Page::Services {
+        // The main window asked: it gets the next list, also one that is
+        // already in flight for the Resource Monitor.
+        (*p).services_for_monitor = false;
+    }
     let job = match page {
         Page::Startup if !(*p).startup_loading => {
             (*p).startup_loading = true;
@@ -3431,15 +3443,26 @@ unsafe fn drain_snapshot(p: *mut App) {
         (*p).resource_files = Some(Arc::new(sample.resource_files));
         resource_monitor::refresh(p, sample.at);
     }
-    if (((*p).page == Page::Services && !(*p).paused && !(*p).minimized)
-        || resource_monitor::needs_services((*p).resource_window))
-        && !(*p).busy
-        && (*p).last_services.elapsed() >= Duration::from_secs(5)
-    {
-        request_list(p, Page::Services);
-    }
+    refresh_services(p);
     if main_updates {
         redraw(p);
+    }
+}
+/// Reload services every 5 s while a live Services page or the Resource
+/// Monitor's Services panel shows them.
+unsafe fn refresh_services(p: *mut App) {
+    let main = (*p).page == Page::Services && !(*p).paused && !(*p).minimized;
+    if !(main || resource_monitor::needs_services((*p).resource_window))
+        || (*p).busy
+        || (*p).last_services.elapsed() < Duration::from_secs(5)
+    {
+        return;
+    }
+    if main {
+        request_list(p, Page::Services);
+    } else if !(*p).services_loading {
+        request_list(p, Page::Services);
+        (*p).services_for_monitor = (*p).services_loading;
     }
 }
 unsafe fn drain_jobs(p: *mut App) {
@@ -3496,8 +3519,23 @@ unsafe fn drain_jobs(p: *mut App) {
                     rebuild(p, identity);
                 }
             }
+            JobResult::Services(result)
+                if std::mem::take(&mut (*p).services_for_monitor)
+                    && (*p).page == Page::Services
+                    && ((*p).paused || (*p).minimized) =>
+            {
+                // A paused Services page keeps its frame; only the Resource
+                // Monitor takes this list.
+                (*p).services_loading = false;
+                if let Ok(services) = result {
+                    (*p).resource_services = Some(services);
+                }
+            }
             JobResult::Services(result) => {
                 (*p).services_loading = false;
+                if result.is_ok() {
+                    (*p).resource_services = None;
+                }
                 match result {
                     Ok(s) => {
                         if let Some(detail) = &mut (*p).service_details {
@@ -4843,6 +4881,46 @@ mod tests {
         assert_eq!(total.network, Some(1000.));
         assert_eq!(GroupTotal::of(&snapshot.processes[2..]).gpu, None);
     }
+    #[test]
+    fn a_services_list_for_the_resource_monitor_leaves_a_paused_page_alone() {
+        let test = TestWindow::new();
+        test.page(Page::Services);
+        assert!(matches!(test.jobs.try_recv(), Ok(Job::Services)));
+        test.result(JobResult::Services(Ok(vec![service(
+            "Alpha",
+            SERVICE_RUNNING,
+            120,
+            Some(2),
+        )])));
+        assert_eq!(test.count(), 1);
+        let two = || {
+            vec![
+                service("Alpha", SERVICE_STOPPED, 0, Some(2)),
+                service("Beta", SERVICE_RUNNING, 7, Some(3)),
+            ]
+        };
+        unsafe {
+            (*test.p).paused = true;
+            // The Resource Monitor's periodic request while the page is paused.
+            (*test.p).services_loading = true;
+            (*test.p).services_for_monitor = true;
+            test.result(JobResult::Services(Ok(two())));
+            assert_eq!(test.count(), 1, "the paused page keeps its frame");
+            assert_eq!(test.text(0, 3), "실행 중");
+            assert_eq!((*test.p).services.len(), 1);
+            assert_eq!((*test.p).resource_services.as_ref().map(Vec::len), Some(2));
+            assert!(!(*test.p).services_loading);
+            // F5 is the main window's own request, even while one for the
+            // Resource Monitor is still in flight: that list is shown.
+            (*test.p).services_loading = true;
+            (*test.p).services_for_monitor = true;
+            command(test.p, REFRESH, 0);
+            test.result(JobResult::Services(Ok(two())));
+            assert_eq!(test.count(), 2);
+            assert!((*test.p).resource_services.is_none());
+        }
+    }
+
     fn service(name: &str, state: u32, pid: u32, start_type: Option<u32>) -> Service {
         Service {
             name: name.into(),
