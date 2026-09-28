@@ -348,7 +348,7 @@ fn point_from(l: LPARAM) -> (i32, i32) {
 }
 
 /// The monitor work area and auto-hide taskbar edges for a maximized window.
-unsafe fn maximized_bounds(window: RECT) -> (Option<RECT>, [bool; 4]) {
+pub(super) unsafe fn maximized_bounds(window: RECT) -> (Option<RECT>, [bool; 4]) {
     let monitor = MonitorFromRect(&window, MONITOR_DEFAULTTONEAREST);
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
@@ -381,7 +381,7 @@ unsafe fn maximized_bounds(window: RECT) -> (Option<RECT>, [bool; 4]) {
 
 /// Windows 11 DWM draws a visible border of this many px (1) around the
 /// window; 0 where the attribute does not exist (Windows 10).
-unsafe fn visible_border(hwnd: HWND) -> i32 {
+pub(super) unsafe fn visible_border(hwnd: HWND) -> i32 {
     let mut thickness: u32 = 0;
     let ok = DwmGetWindowAttribute(
         hwnd,

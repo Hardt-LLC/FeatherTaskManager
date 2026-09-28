@@ -1403,9 +1403,32 @@ pub(super) unsafe fn remove_tray(p: *mut App) {
 }
 
 unsafe fn restore_from_tray(p: *mut App) {
-    ShowWindow((*p).hwnd, SW_RESTORE);
-    SetForegroundWindow((*p).hwnd);
+    reveal((*p).hwnd);
     remove_tray(p);
+}
+
+/// Shows and activates a window as the user left it: a minimized one is
+/// restored (to maximized, if it was), a maximized one stays maximized.
+pub(super) unsafe fn reveal(hwnd: HWND) {
+    ShowWindow(
+        hwnd,
+        if IsIconic(hwnd) != 0 {
+            SW_RESTORE
+        } else {
+            SW_SHOW
+        },
+    );
+    SetForegroundWindow(hwnd);
+}
+
+/// Brings the main window forward from the tray, the taskbar or behind
+/// another window, without changing its size.
+pub(super) unsafe fn show_main(p: *mut App) {
+    if (*p).tray_visible {
+        restore_from_tray(p);
+    } else {
+        reveal((*p).hwnd);
+    }
 }
 
 pub(super) unsafe fn taskbar_created(p: *mut App) {
@@ -1453,8 +1476,15 @@ pub(super) unsafe fn tray_message(p: *mut App, parameter: LPARAM) {
             if selected == 1 {
                 restore_from_tray(p);
             } else if selected == 2 {
-                remove_tray(p);
-                PostMessageW((*p).hwnd, WM_CLOSE, 0, 0);
+                if (*p).modal {
+                    // A confirmation is open (perhaps in the Resource Monitor)
+                    // and WM_CLOSE would be ignored: show it rather than leave a
+                    // process with neither a window nor a tray icon.
+                    restore_from_tray(p);
+                } else {
+                    remove_tray(p);
+                    PostMessageW((*p).hwnd, WM_CLOSE, 0, 0);
+                }
             }
         }
         _ => {}

@@ -19,7 +19,8 @@ param(
     [int]$Iterations = 1,
     [string]$OutputPath,
     [ValidateSet('processes', 'performance', 'startup', 'services')]
-    [string]$Page = 'processes'
+    [string]$Page = 'processes',
+    [switch]$ResourceMonitor
 )
 
 Set-StrictMode -Version Latest
@@ -56,7 +57,9 @@ for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
     $processIdForReport = $null
 
     try {
-        $launched = Start-Process -FilePath $resolvedExe -ArgumentList @('--page', $Page) -WorkingDirectory (Split-Path -Parent $resolvedExe) -WindowStyle Hidden -PassThru
+        $launchArguments = @('--page', $Page)
+        if ($ResourceMonitor) { $launchArguments += '--resource-monitor' }
+        $launched = Start-Process -FilePath $resolvedExe -ArgumentList $launchArguments -WorkingDirectory (Split-Path -Parent $resolvedExe) -WindowStyle Hidden -PassThru
         # Retain the process object/handle; never locate a cleanup target by name.
         $retainedProcessHandle = $launched.Handle
         $processIdForReport = $launched.Id
@@ -84,6 +87,12 @@ for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
             Start-Sleep -Milliseconds 10
         }
         $startupClock.Stop()
+        # A visible secondary window can be discovered sooner than the hidden
+        # main window. Give optional providers the same 10-second settling
+        # opportunity before recording Resource Monitor's steady-state cost.
+        if ($ResourceMonitor -and $startupClock.Elapsed.TotalSeconds -lt 10) {
+            Start-Sleep -Milliseconds ([int](10000 - $startupClock.Elapsed.TotalMilliseconds))
+        }
 
         $launched.Refresh()
         if ($launched.HasExited) {
@@ -187,10 +196,12 @@ $report = [pscustomobject][ordered]@{
     requestedDurationSeconds = $DurationSeconds
     launchWindowStyle = 'Hidden'
     initialPage = $Page
+    resourceMonitor = [bool]$ResourceMonitor
     notes = @(
         'Measurements apply only to the process launched by this script; helper/child processes are excluded.',
         'Startup includes PowerShell Start-Process overhead. Main-window detection is not first paint or full UI readiness.',
         'Hidden launches may have no MainWindowHandle; the metric is null after a bounded 10-second wait.',
+        'ResourceMonitor opens a visible secondary window and samples only after at least 10 seconds from launch; tracing stays off.',
         'Input-idle detection means a GUI message loop became idle; it does not verify that initial data is loaded.',
         'CPU percent = process CPU time / measured wall time / logical processors * 100.',
         'Working set includes shared resident pages. Private bytes are committed private memory, not necessarily resident.',

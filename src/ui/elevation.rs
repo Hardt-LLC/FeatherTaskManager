@@ -44,8 +44,15 @@ pub(super) fn relaunch_arguments(
     } else {
         let mut page = None;
         let mut language_given = false;
-        for pair in options.chunks(2) {
-            match pair {
+        let mut resource_monitor = false;
+        let mut remaining = options;
+        while !remaining.is_empty() {
+            if remaining[0] == "--resource-monitor" && !resource_monitor {
+                resource_monitor = true;
+                remaining = &remaining[1..];
+                continue;
+            }
+            match remaining.get(..2)? {
                 [flag, value] if flag == "--page" && page.is_none() => {
                     page = Some(PAGES.into_iter().find(|&known| known == value.as_str())?);
                 }
@@ -58,9 +65,13 @@ pub(super) fn relaunch_arguments(
                 }
                 _ => return None,
             }
+            remaining = &remaining[2..];
         }
         if let Some(page) = page {
             forwarded.extend(["--page", page]);
+        }
+        if resource_monitor {
+            forwarded.push("--resource-monitor");
         }
         // The language this instance resolved (the given one, else the
         // saved or Windows one), like "Run as administrator".
@@ -219,6 +230,25 @@ mod tests {
 
     #[test]
     fn only_known_options_are_forwarded_rebuilt_from_fixed_strings() {
+        assert_eq!(
+            decide(
+                &["--resource-monitor", "--page", "performance"],
+                true,
+                false
+            ),
+            Some(vec![
+                "--page",
+                "performance",
+                "--resource-monitor",
+                "--language",
+                "en",
+                MARKER
+            ])
+        );
+        assert_eq!(
+            decide(&["--resource-monitor", "--resource-monitor"], true, false),
+            None
+        );
         for page in PAGES {
             assert_eq!(
                 decide(&["--page", page], true, false),

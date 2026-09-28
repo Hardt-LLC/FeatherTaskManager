@@ -15,7 +15,10 @@ use std::{
     collections::{HashSet, VecDeque},
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
-    sync::mpsc::{self, Receiver, Sender, SyncSender},
+    sync::{
+        mpsc::{self, Receiver, Sender, SyncSender},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
@@ -53,6 +56,7 @@ mod perf_order;
 mod popup;
 mod preferences;
 mod process_columns;
+mod resource_monitor;
 mod run_task;
 mod scroll;
 mod shell;
@@ -177,6 +181,7 @@ struct HistoryPoint {
 }
 enum Command {
     Metadata(crate::process_metadata::Needs),
+    Resource(crate::resource::Request, bool, bool),
     /// Sampling interval and pause state. Every page samples the performance
     /// counters too (see `monitor`), so there is no per-page switch.
     Configure {
@@ -188,6 +193,8 @@ enum Command {
 }
 struct MonitorSample {
     at: Instant,
+    /// An explicit one-shot refresh may update the main window while paused.
+    manual_refresh: bool,
     snapshot: Result<Snapshot, String>,
     performance: Option<Result<PerfSnapshot, String>>,
     /// GPU use per `(pid, created)` of `snapshot`'s processes, joined with
@@ -197,6 +204,8 @@ struct MonitorSample {
     /// Network rates per `(pid, created)` and their availability
     /// (`NetworkMonitor`, elevated only).
     process_network: ProcessNetworkSample,
+    resource_data: Option<Arc<crate::resource::Snapshot>>,
+    resource_files: crate::fileetw::Sample,
 }
 /// A grouped app row's values summed over its processes: CPU %, working
 /// set, I/O rate (NaN when none measured), network bytes/s and GPU % (None
@@ -276,6 +285,7 @@ struct NetworkState {
 }
 enum Action {
     End(u32, u64),
+    EndMany(Vec<(u32, u64)>),
     Priority(u32, u64, crate::actions::Priority),
     Efficiency(u32, u64, bool),
     /// Service key and display name (the toast names the service).
@@ -381,8 +391,16 @@ struct App {
     surface: HBRUSH,
     dpi: i32,
     page: Page,
-    snapshot: Option<Snapshot>,
-    performance: Option<PerfSnapshot>,
+    snapshot: Option<Arc<Snapshot>>,
+    performance: Option<Arc<PerfSnapshot>>,
+    resource_window: HWND,
+    resource_snapshot: Option<Arc<Snapshot>>,
+    resource_performance: Option<Arc<PerfSnapshot>>,
+    resource_network: Option<Arc<ProcessNetworkSample>>,
+    resource_data: Option<Arc<crate::resource::Snapshot>>,
+    resource_files: Option<Arc<crate::fileetw::Sample>>,
+    resource_sample_at: Option<Instant>,
+    resource_request: (crate::resource::Request, bool, bool),
     performance_error: Option<String>,
     /// Per-process network availability of the latest sample (None before
     /// the first one).
@@ -508,6 +526,14 @@ impl App {
             page: Page::Processes,
             snapshot: None,
             performance: None,
+            resource_window: null_mut(),
+            resource_snapshot: None,
+            resource_performance: None,
+            resource_network: None,
+            resource_data: None,
+            resource_files: None,
+            resource_sample_at: None,
+            resource_request: Default::default(),
             performance_error: None,
             network_state: None,
             history: VecDeque::with_capacity(120),
@@ -675,10 +701,10 @@ pub fn run() {
             return;
         }
         let handle = hwnd as usize;
-        if let Err(e) = std::thread::Builder::new()
+        let monitor_thread = std::thread::Builder::new()
             .name("feather-monitor".into())
-            .spawn(move || monitor(handle, commands, snapshots))
-        {
+            .spawn(move || monitor(handle, commands, snapshots));
+        if let Err(e) = &monitor_thread {
             (*p).set_error(
                 ErrorSource::General,
                 tf!(
@@ -729,6 +755,9 @@ pub fn run() {
         SetTimer(hwnd, PREFETCH_TIMER, 1500, None);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        if args.iter().any(|arg| arg == "--resource-monitor") {
+            resource_monitor::open(p);
+        }
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             controls::observe_input(&msg);
@@ -741,6 +770,17 @@ pub fn run() {
             }
         }
         dispose(p);
+        if let Ok(thread) = monitor_thread {
+            // The monitor owns the ETW sessions; let it stop them on Stop rather
+            // than ending the process under it. Bounded, so exit never hangs.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
         UnregisterClassW(class.as_ptr(), GetModuleHandleW(null()));
         gfx::buffered_paint_shutdown();
         gfx::shutdown();
@@ -776,16 +816,24 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
     // thread returns on Stop.
     let mut gpu_tracker = ProcessGpuTracker::default();
     let mut network = NetworkMonitor::new();
+    let mut resource = crate::resource::Client::default();
+    let mut resource_request = crate::resource::Request::default();
+    let mut files = crate::fileetw::FileMonitor::new();
+    // A crash or kill skips the sessions' Drop; clear such leftovers now,
+    // not only when file tracing is next turned on.
+    crate::fileetw::stop_stale_sessions();
     let mut metadata = crate::process_metadata::Client::default();
     let mut metadata_needs = crate::process_metadata::Needs::default();
     let mut interval = 1000;
     let mut paused = false;
     let mut refresh = true;
+    let mut manual_refresh = false;
     // When the last sample was taken: the next one is due one interval
     // later, whatever commands arrive in between.
     let mut last: Option<Instant> = None;
     loop {
         if refresh {
+            let elapsed = last.map_or(Duration::from_millis(interval), |at| at.elapsed());
             last = Some(Instant::now());
             if sampler.is_err() {
                 sampler = Sampler::new();
@@ -797,18 +845,25 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
             if let Ok(snapshot) = &mut snapshot {
                 metadata.decorate(&mut snapshot.processes, metadata_needs);
             }
+            let processes = snapshot.as_ref().map_or(&[][..], |s| &s.processes);
+            let resource_data = resource.sample(&resource_request, processes);
+            let resource_files = files.sample(processes, elapsed);
             if perf.is_none() {
                 match PerfSampler::new() {
                     Ok(s) => perf = Some(s),
                     Err(e) => {
                         let value = MonitorSample {
                             at: Instant::now(),
+                            manual_refresh,
                             snapshot,
                             performance: Some(Err(e)),
                             process_gpu: Default::default(),
                             process_network: Default::default(),
+                            resource_data,
+                            resource_files,
                         };
                         if snapshots.try_send(value).is_ok() {
+                            manual_refresh = false;
                             unsafe {
                                 PostMessageW(hwnd as HWND, SNAPSHOT_READY, 0, 0);
                             }
@@ -835,19 +890,25 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
             if snapshots
                 .try_send(MonitorSample {
                     at: Instant::now(),
+                    manual_refresh,
                     snapshot,
                     performance: perf_result,
                     process_gpu,
                     process_network,
+                    resource_data,
+                    resource_files,
                 })
                 .is_ok()
             {
+                manual_refresh = false;
                 unsafe {
                     PostMessageW(hwnd as HWND, SNAPSHOT_READY, 0, 0);
                 }
             }
         }
-        let result = if paused {
+        // A full delivery slot must not lose F5 while paused. Retry on the
+        // normal interval until that one requested frame has been delivered.
+        let result = if paused && !manual_refresh {
             commands
                 .recv()
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
@@ -856,6 +917,17 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
             commands.recv_timeout(last.map_or(period, |at| period.saturating_sub(at.elapsed())))
         };
         match result {
+            Ok(Command::Resource(request, file_trace, endpoint_trace)) => {
+                resource_request = request;
+                // Stop optional work even when both windows are paused and
+                // no further sampling iteration is scheduled.
+                if request == crate::resource::Request::default() {
+                    let _ = resource.sample(&request, &[]);
+                }
+                files.set_enabled(file_trace);
+                network.set_endpoint_capture(endpoint_trace);
+                refresh = false;
+            }
             Ok(Command::Metadata(needs)) => {
                 metadata_needs = needs;
                 refresh = false;
@@ -886,7 +958,7 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 let recent = last.is_some_and(|at| {
                     at.elapsed() < Duration::from_millis((interval / 2).max(100))
                 });
-                refresh = !paused && !recent;
+                refresh = manual_refresh || (!paused && !recent);
                 if !paused && recent && perf.is_none() {
                     if let Ok(mut sampler) = PerfSampler::new() {
                         let _ = sampler.sample();
@@ -894,7 +966,10 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                     }
                 }
             }
-            Ok(Command::Refresh) => refresh = true,
+            Ok(Command::Refresh) => {
+                manual_refresh = true;
+                refresh = true;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => refresh = true,
         }
     }
@@ -1008,11 +1083,18 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
                         Page::Performance,
                         tr("Windows 도구를 열었습니다.", "Opened the Windows tool.").into(),
                     ),
-                    Action::RunTask(task) => (
-                        crate::actions::launch_task(&task, hwnd),
-                        Page::Processes,
-                        tr("새 작업을 실행했습니다.", "Started the new task.").into(),
-                    ),
+                    Action::RunTask(task) => {
+                        let result = crate::actions::launch_task(&task, hwnd);
+                        let notice = if matches!(result, Ok(false)) {
+                            tr(
+                                "관리자 권한 실행을 취소했습니다.",
+                                "Administrator launch cancelled.",
+                            )
+                        } else {
+                            tr("새 작업을 실행했습니다.", "Started the new task.")
+                        };
+                        (result.map(|_| ()), Page::Processes, notice.into())
+                    }
                     Action::RestartExplorer(pid, created) => (
                         crate::actions::restart_explorer(pid, created),
                         Page::Processes,
@@ -1031,6 +1113,27 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
                         )
                         .into(),
                     ),
+                    Action::EndMany(identities) => {
+                        let mut errors = Vec::new();
+                        let mut ended = 0;
+                        for (pid, created) in identities {
+                            match crate::actions::terminate(pid, created) {
+                                Ok(()) => ended += 1,
+                                Err(error) => errors.push(format!("{pid}: {error}")),
+                            }
+                        }
+                        let notice = tf!(
+                            "{}개 프로세스에 종료 요청을 보냈습니다.",
+                            "Sent termination requests to {} processes.",
+                            ended
+                        );
+                        let result = if errors.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(format!("{notice}\n{}", errors.join("\n")))
+                        };
+                        (result, Page::Processes, notice)
+                    }
                     Action::Reveal(pid, created) => (
                         crate::actions::reveal_executable(pid, created),
                         Page::Processes,
@@ -1105,6 +1208,7 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
     }
 }
 unsafe fn dispose(p: *mut App) {
+    resource_monitor::close(p);
     shell::destroy_palette(p);
     shell::remove_tray(p);
     let app = Box::from_raw(p);
@@ -1123,6 +1227,14 @@ unsafe fn dispose(p: *mut App) {
     }
 }
 unsafe fn keyboard(p: *mut App, msg: &MSG) -> bool {
+    if resource_monitor::keyboard(p, msg) {
+        return true;
+    }
+    if !(*p).resource_window.is_null()
+        && (msg.hwnd == (*p).resource_window || IsChild((*p).resource_window, msg.hwnd) != 0)
+    {
+        return false;
+    }
     if shell::palette_key(p, msg) {
         return true;
     }
@@ -1352,10 +1464,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             0
         }
         WM_CLOSE => {
-            DestroyWindow(hwnd);
+            if !(*p).modal {
+                DestroyWindow(hwnd);
+            }
             0
         }
         WM_DESTROY => {
+            resource_monitor::close(p);
             (*p).anim.stop();
             let _ = (*p).tx.send(Command::Stop);
             let _ = (*p).jobs.send(Job::Stop);
@@ -2166,26 +2281,52 @@ unsafe fn order_tabs(p: *mut App) {
 }
 unsafe fn configure(p: *mut App) {
     use process_columns::ProcessColumn;
-    let needs = if (*p).page == Page::Processes && !((*p).paused || (*p).minimized || (*p).modal) {
-        crate::process_metadata::Needs {
-            user: (*p).process_columns.contains(ProcessColumn::User),
-            command_line: (*p).process_columns.contains(ProcessColumn::CommandLine),
-            status: (*p).process_columns.contains(ProcessColumn::Status),
-        }
-    } else {
-        Default::default()
-    };
+    let mut needs =
+        if (*p).page == Page::Processes && !((*p).paused || (*p).minimized || (*p).modal) {
+            crate::process_metadata::Needs {
+                user: (*p).process_columns.contains(ProcessColumn::User),
+                command_line: (*p).process_columns.contains(ProcessColumn::CommandLine),
+                status: (*p).process_columns.contains(ProcessColumn::Status),
+            }
+        } else {
+            Default::default()
+        };
+    needs.status |= !(*p).modal && resource_monitor::needs_status((*p).resource_window);
     if needs != (*p).metadata_needs {
         (*p).metadata_needs = needs;
         let _ = (*p).tx.send(Command::Metadata(needs));
     }
-    if (*p).paused || (*p).minimized || (*p).modal {
+    let main_paused = (*p).paused || (*p).minimized || (*p).modal;
+    let resource_active = !(*p).modal && resource_monitor::interval((*p).resource_window).is_some();
+    let request = if resource_active {
+        let (files, endpoints) = resource_monitor::tracing((*p).resource_window);
+        (resource_monitor::request(p), files, endpoints)
+    } else {
+        Default::default()
+    };
+    if request != (*p).resource_request {
+        (*p).resource_request = request;
+        let _ = (*p)
+            .tx
+            .send(Command::Resource(request.0, request.1, request.2));
+    }
+    if main_paused {
         (*p).perf_history.gap(Instant::now());
     }
+    let resource_interval = resource_active
+        .then(|| resource_monitor::interval((*p).resource_window))
+        .flatten();
+    let interval = resource_interval.map_or((*p).interval, |rate| {
+        if main_paused {
+            rate
+        } else {
+            rate.min((*p).interval)
+        }
+    });
     // Not the page: history keeps recording while another page is open.
     let _ = (*p).tx.send(Command::Configure {
-        interval: (*p).interval,
-        paused: (*p).paused || (*p).minimized || (*p).modal,
+        interval,
+        paused: main_paused && !resource_active,
     });
 }
 unsafe fn request_list(p: *mut App, page: Page) {
@@ -2586,6 +2727,7 @@ unsafe fn refresh_language(p: *mut App) {
         request_list(p, Page::Services);
     }
     InvalidateRect((*p).hwnd, null(), 1);
+    resource_monitor::settings_changed(p);
 }
 unsafe fn set_tree_mode(p: *mut App, enabled: bool) {
     let identity = selected_identity(p);
@@ -3142,6 +3284,14 @@ fn join_process_samples(
             .measured
             .then(|| network.by_id.get(&id).map(|n| n.total_bytes_per_sec))
             .flatten();
+        process.network_send_bytes_per_sec = network
+            .measured
+            .then(|| network.by_id.get(&id).map(|n| n.send_bytes_per_sec))
+            .flatten();
+        process.network_recv_bytes_per_sec = network
+            .measured
+            .then(|| network.by_id.get(&id).map(|n| n.recv_bytes_per_sec))
+            .flatten();
     }
 }
 unsafe fn drain_snapshot(p: *mut App) {
@@ -3153,15 +3303,30 @@ unsafe fn drain_snapshot(p: *mut App) {
     };
     let identity = selected_identity(p);
     let fresh_performance = matches!(&sample.performance, Some(Ok(_)));
+    let resource_active = resource_monitor::active((*p).resource_window);
+    // The shared worker can run faster for Resource Monitor. Keep the main
+    // window's independent pause/rate; tolerate normal collection-time jitter.
+    let due = (*p).last_sample.is_none_or(|at| {
+        sample.at.saturating_duration_since(at)
+            >= Duration::from_millis((*p).interval.saturating_sub(100))
+    });
+    let main_updates =
+        sample.manual_refresh || (!(*p).paused && !(*p).minimized && (!resource_active || due));
     if let Some(performance) = sample.performance {
         match performance {
             Ok(s) => {
-                (*p).performance = Some(s);
-                (*p).performance_error = None;
+                (*p).resource_performance = Some(Arc::new(s));
+                if main_updates {
+                    (*p).performance = (*p).resource_performance.clone();
+                    (*p).performance_error = None;
+                }
             }
             Err(e) => {
-                (*p).performance = None;
-                (*p).performance_error = Some(e);
+                (*p).resource_performance = None;
+                if main_updates {
+                    (*p).performance = None;
+                    (*p).performance_error = Some(e);
+                }
             }
         }
     }
@@ -3172,87 +3337,102 @@ unsafe fn drain_snapshot(p: *mut App) {
                 &mut snapshot,
                 &sample.process_gpu,
                 &sample.process_network,
-                (*p).performance.as_ref(),
+                (*p).resource_performance.as_deref(),
             );
-            (*p).network_state = Some(NetworkState {
-                measured: sample.process_network.measured,
-                reason: sample.process_network.reason.clone(),
-            });
-            let memory = if snapshot.memory_total == 0 {
-                f64::NAN
-            } else {
-                snapshot.memory_used as f64 / snapshot.memory_total as f64 * 100.0
-            };
-            let (disk, network) = if fresh_performance {
-                (*p).performance
-                    .as_ref()
-                    .map(|s| {
-                        (
-                            if s.disk_rates_ready {
-                                s.disk_read_bytes_per_sec + s.disk_write_bytes_per_sec
-                            } else {
-                                f64::NAN
-                            },
-                            if s.network_rates_ready {
-                                s.network_rx_bytes_per_sec + s.network_tx_bytes_per_sec
-                            } else {
-                                f64::NAN
-                            },
-                        )
-                    })
-                    .unwrap_or((f64::NAN, f64::NAN))
-            } else {
-                (f64::NAN, f64::NAN)
-            };
-            if (*p).last_sample.is_none_or(|at| sample.at > at) {
-                (*p).history.push_back(HistoryPoint {
-                    at: sample.at,
-                    cpu: snapshot.cpu_percent,
-                    memory,
-                    disk,
-                    network,
+            let snapshot = Arc::new(snapshot);
+            (*p).resource_snapshot = Some(Arc::clone(&snapshot));
+            if main_updates {
+                (*p).network_state = Some(NetworkState {
+                    measured: sample.process_network.measured,
+                    reason: sample.process_network.reason.clone(),
                 });
-                while (*p).history.len() > 120
-                    || (*p).history.front().is_some_and(|h| {
-                        sample.at.saturating_duration_since(h.at) > Duration::from_secs(60)
-                    })
-                {
-                    (*p).history.pop_front();
+                let memory = if snapshot.memory_total == 0 {
+                    f64::NAN
+                } else {
+                    snapshot.memory_used as f64 / snapshot.memory_total as f64 * 100.0
+                };
+                let (disk, network) = if fresh_performance {
+                    (*p).performance
+                        .as_ref()
+                        .map(|s| {
+                            (
+                                if s.disk_rates_ready {
+                                    s.disk_read_bytes_per_sec + s.disk_write_bytes_per_sec
+                                } else {
+                                    f64::NAN
+                                },
+                                if s.network_rates_ready {
+                                    s.network_rx_bytes_per_sec + s.network_tx_bytes_per_sec
+                                } else {
+                                    f64::NAN
+                                },
+                            )
+                        })
+                        .unwrap_or((f64::NAN, f64::NAN))
+                } else {
+                    (f64::NAN, f64::NAN)
+                };
+                if (*p).last_sample.is_none_or(|at| sample.at > at) {
+                    (*p).history.push_back(HistoryPoint {
+                        at: sample.at,
+                        cpu: snapshot.cpu_percent,
+                        memory,
+                        disk,
+                        network,
+                    });
+                    while (*p).history.len() > 120
+                        || (*p).history.front().is_some_and(|h| {
+                            sample.at.saturating_duration_since(h.at) > Duration::from_secs(60)
+                        })
+                    {
+                        (*p).history.pop_front();
+                    }
+                    (*p).last_sample = Some(sample.at);
                 }
-                (*p).last_sample = Some(sample.at);
-            }
-            (*p).telemetry.record(&snapshot, sample.at);
-            if fresh_performance {
-                if let Some(perf) = &(*p).performance {
-                    (*p).perf_history.record(perf, &snapshot, sample.at);
-                    interactions::refresh_components(p);
+                (*p).telemetry.record(&snapshot, sample.at);
+                if fresh_performance {
+                    if let Some(perf) = &(*p).performance {
+                        (*p).perf_history.record(perf, &snapshot, sample.at);
+                        interactions::refresh_components(p);
+                    }
+                } else {
+                    (*p).perf_history.gap(sample.at);
                 }
-            } else {
-                (*p).perf_history.gap(sample.at);
-            }
-            let count = snapshot.processes.len();
-            let recount = (*p).snapshot.as_ref().map(|s| s.processes.len()) != Some(count);
-            (*p).snapshot = Some(snapshot);
-            if recount {
-                // The Processes nav item (an owner-draw child that `redraw`
-                // does not reach) shows the process count.
-                InvalidateRect((*p).nav[0], null(), 0);
-            }
-            if (*p).page == Page::Processes {
-                rebuild(p, identity);
+                let count = snapshot.processes.len();
+                let recount = (*p).snapshot.as_ref().map(|s| s.processes.len()) != Some(count);
+                (*p).snapshot = Some(snapshot);
+                if recount {
+                    // The Processes nav item (an owner-draw child that `redraw`
+                    // does not reach) shows the process count.
+                    InvalidateRect((*p).nav[0], null(), 0);
+                }
+                if (*p).page == Page::Processes {
+                    rebuild(p, identity);
+                }
             }
         }
-        Err(e) => (*p).set_error(ErrorSource::Monitor, e),
+        Err(e) => {
+            (*p).resource_snapshot = None;
+            (*p).set_error(ErrorSource::Monitor, e);
+        }
     }
-    if (*p).page == Page::Services
-        && !(*p).paused
-        && !(*p).minimized
+    if !(*p).resource_window.is_null() {
+        (*p).resource_sample_at = Some(sample.at);
+        (*p).resource_data = sample.resource_data;
+        (*p).resource_network = Some(Arc::new(sample.process_network));
+        (*p).resource_files = Some(Arc::new(sample.resource_files));
+        resource_monitor::refresh(p, sample.at);
+    }
+    if (((*p).page == Page::Services && !(*p).paused && !(*p).minimized)
+        || resource_monitor::needs_services((*p).resource_window))
         && !(*p).busy
         && (*p).last_services.elapsed() >= Duration::from_secs(5)
     {
         request_list(p, Page::Services);
     }
-    redraw(p);
+    if main_updates {
+        redraw(p);
+    }
 }
 unsafe fn drain_jobs(p: *mut App) {
     if (*p).modal {
@@ -3364,6 +3544,7 @@ unsafe fn drain_jobs(p: *mut App) {
     update_buttons(p);
     InvalidateRect((*p).list, null(), 0);
     redraw(p);
+    resource_monitor::refresh(p, Instant::now());
 }
 fn option_cmp(a: Option<f64>, b: Option<f64>) -> Ordering {
     match (a, b) {
@@ -4019,10 +4200,13 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
                 snapshots
                     .send(MonitorSample {
                         at: Instant::now(),
+                        manual_refresh: false,
                         snapshot,
                         performance: Some(performance),
                         process_gpu,
                         process_network,
+                        resource_data: None,
+                        resource_files: Default::default(),
                     })
                     .map_err(|e| e.to_string())?;
                 drain_snapshot(p);
@@ -4087,6 +4271,7 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
             // The Nuclear Zombie panel before / during / after a run, from
             // read-only data (nothing is trimmed or purged).
             nuclear::save_previews(p, dir)?;
+            resource_monitor::render_previews(p, dir)?;
             frame::save_previews(p, dir)?;
             switch_page(p, Page::Processes);
             set_tree_mode(p, true);
@@ -4152,6 +4337,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     #[test]
+    fn resource_monitor_shares_frames_freezes_and_clears_reused_pid_selection() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_snapshot_lifecycle(test.p);
+        }
+    }
+    #[test]
     fn counts_and_memory_use_thousands_separators() {
         assert_eq!(grouped(7u32), "7");
         assert_eq!(grouped(470u32), "470");
@@ -4179,17 +4372,21 @@ mod tests {
                 if GetWindow(dialog, GW_OWNER) as usize == owner
                     && !GetDlgItem(dialog, 701).is_null()
                 {
-                    INSPECTED.set(
-                        IsWindowEnabled(GetDlgItem(dialog, IDOK)) == 0
-                            && IsDlgButtonChecked(dialog, 704) == BST_UNCHECKED,
-                    );
+                    INSPECTED.set(IsWindowEnabled(GetDlgItem(dialog, IDOK)) == 0);
                     SetDlgItemTextW(
                         dialog,
                         701,
                         wide(r#""C:\Program Files\Example\app.exe" --inline"#).as_ptr(),
                     );
                     SetDlgItemTextW(dialog, 702, wide(r#""two words" &literal"#).as_ptr());
-                    CheckDlgButton(dialog, 704, BST_CHECKED);
+                    // One click turns the owner-drawn administrator switch on
+                    // (BM_CLICK would re-activate the dialog inside this hook).
+                    SendMessageW(
+                        dialog,
+                        WM_COMMAND,
+                        (BN_CLICKED as usize) << 16 | 704,
+                        GetDlgItem(dialog, 704) as isize,
+                    );
                     PostMessageW(
                         dialog,
                         WM_COMMAND,
@@ -4222,7 +4419,7 @@ mod tests {
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             assert!(
                 INSPECTED.get(),
-                "Run starts disabled and administrator mode starts unchecked"
+                "Run starts disabled until a program is entered"
             );
             assert!(
                 test.jobs.try_recv().is_err(),
@@ -4289,10 +4486,13 @@ mod tests {
             self.snapshots
                 .send(MonitorSample {
                     at: Instant::now(),
+                    manual_refresh: false,
                     snapshot: Err(error.into()),
                     performance: None,
                     process_gpu: Default::default(),
                     process_network: Default::default(),
+                    resource_data: None,
+                    resource_files: Default::default(),
                 })
                 .unwrap();
             unsafe {
@@ -4300,9 +4500,13 @@ mod tests {
             }
         }
         fn sample(&self, processes: Vec<Process>, at: Instant) {
+            self.sample_refresh(processes, at, false);
+        }
+        fn sample_refresh(&self, processes: Vec<Process>, at: Instant, manual_refresh: bool) {
             self.snapshots
                 .send(MonitorSample {
                     at,
+                    manual_refresh,
                     snapshot: Ok(Snapshot {
                         processes,
                         cpu_percent: 12.5,
@@ -4313,6 +4517,8 @@ mod tests {
                     performance: None,
                     process_gpu: Default::default(),
                     process_network: Default::default(),
+                    resource_data: None,
+                    resource_files: Default::default(),
                 })
                 .unwrap();
             unsafe {
@@ -4494,6 +4700,37 @@ mod tests {
             setup_columns(p);
             assert_eq!((*p).sort, process_columns::ProcessColumn::Name as usize);
             assert!(!(*p).descending);
+        }
+    }
+    #[test]
+    fn divider_clicks_keep_widths_and_page_switches_cancel_resizing() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            let p = test.p;
+            let list = (*p).list;
+            let at = |x: i32| ((12i32 << 16) | (x & 0xffff)) as isize;
+            let edge = |columns: usize| {
+                (0..columns)
+                    .map(|i| SendMessageW(list, LVM_GETCOLUMNWIDTH, i, 0) as i32)
+                    .sum::<i32>()
+            };
+            let before = (*p).process_columns.columns().to_vec();
+            // A click or double-click on the flexible Name column's divider
+            // (the auto-fit habit) must not collapse it to the minimum.
+            SendMessageW(list, WM_LBUTTONDOWN, 0, at(edge(1)));
+            SendMessageW(list, WM_LBUTTONUP, 0, at(edge(1)));
+            SendMessageW(list, WM_LBUTTONDBLCLK, 0, at(edge(1)));
+            SendMessageW(list, WM_LBUTTONUP, 0, at(edge(1)));
+            assert_eq!((*p).process_columns.columns(), &before[..]);
+            // Changing page mid-drag drops the drag instead of applying the
+            // process column index to the new page's columns.
+            SendMessageW(list, WM_LBUTTONDOWN, 0, at(edge(7)));
+            SendMessageW(list, WM_MOUSEMOVE, 0, at(edge(7) + 40));
+            test.page(Page::Startup);
+            SendMessageW(list, WM_LBUTTONUP, 0, at(edge(4) + 40));
+            test.page(Page::Processes);
+            assert_eq!((*p).process_columns.columns(), &before[..]);
         }
     }
     #[test]
@@ -5293,7 +5530,9 @@ mod tests {
     #[test]
     fn pause_minimize_and_interval_are_forwarded_to_monitor() {
         let test = TestWindow::new();
+        test.snapshot(rows());
         unsafe {
+            let first = (*test.p).snapshot.clone().unwrap();
             command(test.p, PAUSE, 0);
             assert!(matches!(
                 test.commands.recv().unwrap(),
@@ -5303,6 +5542,22 @@ mod tests {
                     ..
                 }
             ));
+            // A queued automatic frame (including one from a just-closed
+            // Resource Monitor) cannot change the paused main window.
+            test.snapshot(vec![process(909, 99, "Queued.exe", 2, 1.)]);
+            assert!(Arc::ptr_eq(&first, (*test.p).snapshot.as_ref().unwrap()));
+            command(test.p, REFRESH, 0);
+            assert!(matches!(test.commands.recv().unwrap(), Command::Refresh));
+            test.sample_refresh(
+                vec![process(909, 99, "Manual.exe", 2, 1.)],
+                Instant::now(),
+                true,
+            );
+            assert_eq!(test.text(0, 0), "Manual.exe");
+            assert!(
+                (*test.p).paused,
+                "a one-shot refresh does not resume sampling"
+            );
             SendMessageW((*test.p).rate, CB_SETCURSEL, 5, 0);
             command(test.p, RATE, CBN_SELCHANGE);
             assert!(matches!(
@@ -5317,6 +5572,12 @@ mod tests {
             assert!(matches!(
                 test.commands.recv().unwrap(),
                 Command::Configure { paused: true, .. }
+            ));
+            let minimized = (*test.p).snapshot.clone().unwrap();
+            test.snapshot(rows());
+            assert!(Arc::ptr_eq(
+                &minimized,
+                (*test.p).snapshot.as_ref().unwrap()
             ));
             SendMessageW((*test.p).hwnd, WM_SIZE, SIZE_RESTORED as usize, 0);
             assert!(matches!(
@@ -5858,6 +6119,7 @@ mod tests {
             test.snapshots
                 .send(MonitorSample {
                     at: Instant::now(),
+                    manual_refresh: false,
                     snapshot: Ok(Snapshot {
                         processes: rows(),
                         cpu_percent: 12.,
@@ -5868,6 +6130,8 @@ mod tests {
                     performance: Some(Ok(perf.clone())),
                     process_gpu: Default::default(),
                     process_network: Default::default(),
+                    resource_data: None,
+                    resource_files: Default::default(),
                 })
                 .unwrap();
             drain_snapshot(test.p);
@@ -5887,7 +6151,7 @@ mod tests {
                 .values[0]
                 .is_nan());
             perf.disks.clear();
-            (*test.p).performance = Some(perf);
+            (*test.p).performance = Some(Arc::new(perf));
             interactions::refresh_components(test.p);
             assert_eq!((*test.p).perf_target, target);
             assert!((*test.p).perf_targets.contains(&target));
@@ -5928,6 +6192,7 @@ mod tests {
             test.snapshots
                 .send(MonitorSample {
                     at,
+                    manual_refresh: false,
                     snapshot: Ok(Snapshot {
                         processes: rows(),
                         cpu_percent: 12.,
@@ -5938,6 +6203,8 @@ mod tests {
                     performance: Some(Ok(perf.clone())),
                     process_gpu: Default::default(),
                     process_network: Default::default(),
+                    resource_data: None,
+                    resource_files: Default::default(),
                 })
                 .unwrap();
             unsafe {
@@ -6070,6 +6337,17 @@ mod tests {
         for i in 0..2 {
             next(&format!("after the pause {i}"));
         }
+        configure(true);
+        tx.send(Command::Refresh).unwrap();
+        let queued = next("manual refresh while paused");
+        let manual = if queued.manual_refresh {
+            queued
+        } else {
+            // An automatic frame can already occupy the bounded slot.
+            next("manual refresh after a queued frame")
+        };
+        assert!(manual.manual_refresh);
+        assert!(rx.recv_timeout(Duration::from_millis(350)).is_err());
         tx.send(Command::Stop).unwrap();
         thread.join().unwrap();
     }

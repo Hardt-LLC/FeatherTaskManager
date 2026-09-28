@@ -42,6 +42,7 @@ Release executables and installers are signed by **HARDT** through Azure Artifac
 
 - Open **Processes** to choose **App groups**, **List view** or **Tree view**. Select a process to end it or its tree after confirmation.
 - Open **Performance**, **Startup apps** or **Services** for monitoring and management.
+- **Performance → Resource Monitor** opens the built-in native monitor: five resource pages, shared process filters, memory details, modules and passive connection tables. Additional file/connection tracing is off by default. See [collection costs and measurement limits](RESOURCE_MONITOR.md).
 - Use a process's **⋯ / right-click menu → File properties** or **Go to services**. In Services, **Go to process** selects its current host. Search `pid:1234` for an exact PID match; clear search to return to the full list.
 - Open **Settings** to change language, theme, refresh rate, start page and window behavior.
 - Use **⋯ → Show / hide live telemetry** for selected-process CPU, memory and all-I/O history.

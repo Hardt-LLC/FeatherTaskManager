@@ -2206,6 +2206,7 @@ mod tests {
             // running): the page's table takes the focus instead of nobody.
             let _ = test._snapshots.send(MonitorSample {
                 at: Instant::now(),
+                manual_refresh: false,
                 snapshot: Ok(crate::sampler::Snapshot {
                     processes: vec![Process {
                         pid: 4321,
@@ -2230,6 +2231,8 @@ mod tests {
                 performance: None,
                 process_gpu: Default::default(),
                 process_network: Default::default(),
+                resource_data: None,
+                resource_files: Default::default(),
             });
             SendMessageW((*p).hwnd, SNAPSHOT_READY, 0, 0);
             preview_selection(p);

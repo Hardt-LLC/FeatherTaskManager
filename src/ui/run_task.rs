@@ -17,6 +17,8 @@ struct State {
     fonts: fonts::Fonts,
     dpi: i32,
     surface: HBRUSH,
+    /// The administrator switch (owner-drawn; always on when Feather is elevated).
+    admin: bool,
     result: Option<TaskLaunch>,
 }
 
@@ -202,16 +204,20 @@ unsafe fn initialize(hwnd: HWND, state: &State) {
         [24.0, 118.0, 512.0, 30.0],
     );
     SendMessageW(arguments, EM_SETLIMITTEXT, 32760, 0);
-    control(
+    let admin = control(
         "BUTTON",
         tr(
             "관리자 권한으로 이 작업 실행",
             "Run this task as administrator",
         ),
         ADMIN,
-        WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+        WS_TABSTOP | BS_OWNERDRAW as u32,
         [24.0, 166.0, 512.0, 26.0],
     );
+    if crate::netetw::is_elevated() {
+        // Every launch from an elevated Feather inherits its token.
+        EnableWindow(admin, 0);
+    }
     let hint = if crate::netetw::is_elevated() {
         tr(
             "Feather가 관리자 권한으로 실행 중이므로 새 작업도 권한을 상속합니다.",
@@ -244,6 +250,39 @@ unsafe fn initialize(hwnd: HWND, state: &State) {
     SetFocus(program);
 }
 
+/// The administrator option as the app's own switch followed by its label:
+/// a themed native checkbox ignores the dark theme's text color.
+unsafe fn draw_admin_switch(pt: &widgets::Painter, item: &DRAWITEMSTRUCT, state: &State) {
+    let r = item.rcItem;
+    let enabled = item.itemState & ODS_DISABLED == 0;
+    let focused = item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0;
+    pt.fill(r, colors().surface);
+    let height = pt.pxi(20.0);
+    let top = (r.top + r.bottom - height) / 2;
+    let track = RECT {
+        left: r.left + pt.pxi(2.0),
+        top,
+        right: r.left + pt.pxi(42.0),
+        bottom: top + height,
+    };
+    let on = if state.admin { 1.0 } else { 0.0 };
+    widgets::switch(pt, track, on, enabled, focused, colors().surface);
+    let mut value = [0u16; 80];
+    let length =
+        GetWindowTextW(item.hwndItem, value.as_mut_ptr(), value.len() as i32).max(0) as usize;
+    let label = RECT {
+        left: track.right + pt.pxi(10.0),
+        ..r
+    };
+    pt.label(
+        state.fonts.get(fonts::Role::Ui),
+        if enabled { colors().fg } else { colors().muted },
+        &String::from_utf16_lossy(&value[..length]),
+        label,
+        DT_LEFT,
+    );
+}
+
 unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> isize {
     if message == WM_INITDIALOG {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, l);
@@ -263,7 +302,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     let task = TaskLaunch {
                         command: read(hwnd, PROGRAM),
                         arguments: read(hwnd, ARGUMENTS),
-                        elevated: IsDlgButtonChecked(hwnd, ADMIN) == BST_CHECKED,
+                        elevated: state.admin,
                     };
                     match crate::actions::task_command(&task) {
                         Ok(_) => {
@@ -280,6 +319,10 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     EndDialog(hwnd, IDCANCEL as isize);
                 }
                 BROWSE => browse(hwnd),
+                ADMIN if w >> 16 == BN_CLICKED as usize => {
+                    state.admin = !state.admin;
+                    InvalidateRect(l as HWND, null(), 0);
+                }
                 PROGRAM if w >> 16 == EN_CHANGE as usize => {
                     EnableWindow(
                         GetDlgItem(hwnd, IDOK),
@@ -311,6 +354,10 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         WM_DRAWITEM => {
             let item = &*(l as *const DRAWITEMSTRUCT);
             let pt = widgets::Painter::new(item.hDC, state.dpi, &state.fonts);
+            if item.CtlID == ADMIN as u32 {
+                draw_admin_switch(&pt, item, state);
+                return 1;
+            }
             let mut value = [0u16; 80];
             let length = GetWindowTextW(item.hwndItem, value.as_mut_ptr(), value.len() as i32)
                 .max(0) as usize;
@@ -367,6 +414,7 @@ pub(super) unsafe fn show(app: *mut App) -> Option<TaskLaunch> {
         fonts: fonts::Fonts::new((*app).dpi, language()),
         dpi: (*app).dpi,
         surface: CreateSolidBrush(colors().surface),
+        admin: crate::netetw::is_elevated(),
         result: None,
     };
     let result = DialogBoxIndirectParamW(

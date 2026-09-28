@@ -5,7 +5,10 @@ use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr::null};
 use crate::{i18n::tr, process_tree::TerminationPlan};
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_CANCELLED, FILETIME, HANDLE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    },
     System::{
         Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE},
         SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
@@ -82,10 +85,17 @@ pub fn running_process_created(pid: u32) -> Result<u64, String> {
         )
     };
     if raw.is_null() {
-        return Err(last_error(tr(
-            "프로세스를 열 수 없습니다",
-            "Cannot open the process",
-        )));
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+            // Without elevation most service hosts refuse even limited query
+            // access. Navigation acts on nothing, so the kernel's process list
+            // is enough to pin the generation; actions still open and check.
+            return crate::sampler::live_process_created(pid)?.ok_or_else(exited);
+        }
+        return Err(format!(
+            "{}: {error}",
+            tr("프로세스를 열 수 없습니다", "Cannot open the process")
+        ));
     }
     let handle = ProcessHandle(raw);
     match unsafe { WaitForSingleObject(handle.0, 0) } {
@@ -819,7 +829,8 @@ fn resolve_task_executable(file: &str) -> Result<std::path::PathBuf, String> {
 }
 
 /// Programs and arguments remain separate; only an explicit admin choice uses runas.
-pub fn launch_task(task: &TaskLaunch, owner: usize) -> Result<(), String> {
+/// `Ok(false)` means the user declined the UAC prompt, which is not an error.
+pub fn launch_task(task: &TaskLaunch, owner: usize) -> Result<bool, String> {
     let (file, arguments) = task_command(task)?;
     let executable = resolve_task_executable(&file)?;
     let initialized = unsafe {
@@ -835,7 +846,7 @@ pub fn launch_task(task: &TaskLaunch, owner: usize) -> Result<(), String> {
         )
         .into());
     }
-    let file = wide(executable.as_os_str());
+    let file = wide(shell_path(&executable).as_os_str());
     let parameters = wide(OsStr::new(&arguments));
     let verb = wide(OsStr::new(if task.elevated { "runas" } else { "open" }));
     let mut info = SHELLEXECUTEINFOW {
@@ -848,16 +859,31 @@ pub fn launch_task(task: &TaskLaunch, owner: usize) -> Result<(), String> {
         nShow: SW_SHOWNORMAL,
         ..Default::default()
     };
-    let result = if unsafe { ShellExecuteExW(&mut info) } == 0 {
+    let result = if unsafe { ShellExecuteExW(&mut info) } != 0 {
+        Ok(true)
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_CANCELLED as i32) {
+        Ok(false)
+    } else {
         Err(last_error(tr(
             "새 작업을 실행할 수 없습니다",
             "Cannot start the new task",
         )))
-    } else {
-        Ok(())
     };
     unsafe { CoUninitialize() };
     result
+}
+
+/// A validated local path without the `\\?\` prefix that canonicalization
+/// adds, so the new process sees an ordinary path as its program name.
+fn shell_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::{Component, Prefix};
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_)) => path
+            .to_str()
+            .and_then(|text| text.strip_prefix(r"\\?\"))
+            .map_or_else(|| path.to_path_buf(), std::path::PathBuf::from),
+        _ => path.to_path_buf(),
+    }
 }
 
 fn windows_explorer() -> Result<std::path::PathBuf, String> {
@@ -1295,6 +1321,25 @@ mod tests {
         assert!(
             task_executable(resource.with_file_name("services.msc").to_str().unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn launched_programs_get_ordinary_paths() {
+        use std::path::Path;
+        assert_eq!(
+            shell_path(Path::new(r"\\?\C:\Windows\notepad.exe")),
+            Path::new(r"C:\Windows\notepad.exe")
+        );
+        assert_eq!(
+            shell_path(Path::new(r"C:\Windows\notepad.exe")),
+            Path::new(r"C:\Windows\notepad.exe")
+        );
+        let current = std::env::current_exe().unwrap();
+        let validated = task_executable(current.to_str().unwrap()).unwrap();
+        assert!(!shell_path(&validated)
+            .to_str()
+            .unwrap()
+            .starts_with(r"\\?\"));
     }
 
     #[test]
