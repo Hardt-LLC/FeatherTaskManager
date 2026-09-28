@@ -7,8 +7,10 @@
 //! Slow device queries run off the UI/monitor thread, with one outstanding job;
 //! disabling requests retires that worker rather than spawning replacements.
 
+use crate::i18n::tr;
 use crate::memclean::{self, MemoryState};
 use crate::sampler::Process;
+use crate::trf;
 use std::collections::HashMap;
 use std::mem::{offset_of, size_of};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -334,7 +336,11 @@ fn verified_process((pid, created): (u32, u64)) -> Result<Owned, String> {
         )
     };
     if handle.is_null() {
-        return Err("Process details are unavailable or access was denied.".into());
+        return Err(tr(
+            "프로세스 정보를 사용할 수 없거나 액세스가 거부되었습니다.",
+            "Process details are unavailable or access was denied.",
+        )
+        .into());
     }
     let handle = Owned(handle);
     let mut start = FILETIME::default();
@@ -345,7 +351,11 @@ fn verified_process((pid, created): (u32, u64)) -> Result<Owned, String> {
         || (u64::from(start.dwHighDateTime) << 32 | u64::from(start.dwLowDateTime)) != created
         || unsafe { WaitForSingleObject(handle.0, 0) } != WAIT_TIMEOUT
     {
-        return Err("The selected process has exited or changed.".into());
+        return Err(tr(
+            "선택한 프로세스가 종료되었거나 바뀌었습니다.",
+            "The selected process has exited or changed.",
+        )
+        .into());
     }
     Ok(handle)
 }
@@ -362,7 +372,8 @@ fn modules(identity: (u32, u64)) -> Result<Vec<Module>, String> {
         }
     }
     if snapshot == INVALID_HANDLE_VALUE {
-        return Err(format!(
+        return Err(trf!(
+            "모듈 목록을 사용할 수 없습니다: {}",
             "Module list unavailable: {}",
             std::io::Error::last_os_error()
         ));
@@ -376,7 +387,11 @@ fn modules(identity: (u32, u64)) -> Result<Vec<Module>, String> {
     let mut result = Vec::new();
     while present {
         if result.len() >= MAX_MODULES {
-            return Err("Module list exceeds the 4096-entry limit.".into());
+            return Err(tr(
+                "모듈 목록이 4096개 제한을 넘습니다.",
+                "Module list exceeds the 4096-entry limit.",
+            )
+            .into());
         }
         result.push(Module {
             name: wide_text(&row.szModule),
@@ -388,13 +403,18 @@ fn modules(identity: (u32, u64)) -> Result<Vec<Module>, String> {
     }
     let error = unsafe { GetLastError() };
     if error != ERROR_NO_MORE_FILES {
-        return Err(format!(
+        return Err(trf!(
+            "모듈 목록을 사용할 수 없습니다: {}",
             "Module list unavailable: {}",
             std::io::Error::from_raw_os_error(error as i32)
         ));
     }
     if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_TIMEOUT {
-        return Err("The selected process has exited.".into());
+        return Err(tr(
+            "선택한 프로세스가 종료되었습니다.",
+            "The selected process has exited.",
+        )
+        .into());
     }
     result.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     Ok(result)
@@ -407,7 +427,8 @@ fn wide_text(value: &[u16]) -> String {
 fn volumes(result: &mut Vec<Volume>, errors: &mut Vec<String>) {
     let drives = unsafe { GetLogicalDrives() };
     if drives == 0 {
-        errors.push(format!(
+        errors.push(trf!(
+            "볼륨 목록을 사용할 수 없습니다: {}",
             "Volume list unavailable: {}",
             std::io::Error::last_os_error()
         ));
@@ -426,8 +447,10 @@ fn volumes(result: &mut Vec<Volume>, errors: &mut Vec<String>) {
         let mut total = 0;
         let mut free = 0;
         if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), null_mut(), &mut total, &mut free) } == 0 {
-            errors.push(format!(
-                "{name} capacity unavailable: {}",
+            errors.push(trf!(
+                "{} 용량을 확인할 수 없습니다: {}",
+                "{} capacity unavailable: {}",
+                name,
                 std::io::Error::last_os_error()
             ));
         } else {
@@ -474,7 +497,11 @@ fn endpoint_table(tcp: bool, family: u32) -> Result<NativeTable, String> {
         };
         if status == 0 {
             if bytes as usize > storage.len() * size_of::<u64>() {
-                return Err("Endpoint table reported an invalid length.".into());
+                return Err(tr(
+                    "연결 테이블의 길이가 잘못되었습니다.",
+                    "Endpoint table reported an invalid length.",
+                )
+                .into());
             }
             return Ok(NativeTable {
                 storage,
@@ -482,39 +509,62 @@ fn endpoint_table(tcp: bool, family: u32) -> Result<NativeTable, String> {
             });
         }
         if status != ERROR_INSUFFICIENT_BUFFER {
-            return Err(format!(
+            return Err(trf!(
+                "연결 테이블을 사용할 수 없습니다: {}",
                 "Endpoint table unavailable: {}",
                 std::io::Error::from_raw_os_error(status as i32)
             ));
         }
         let required = bytes as usize;
         if !(4..=MAX_TABLE_BYTES).contains(&required) {
-            return Err("Endpoint table exceeds the 8 MiB limit.".into());
+            return Err(tr(
+                "연결 테이블이 8 MiB 제한을 넘습니다.",
+                "Endpoint table exceeds the 8 MiB limit.",
+            )
+            .into());
         }
         storage.resize(required.div_ceil(size_of::<u64>()), 0);
     }
-    Err("Endpoint table changed too quickly to collect.".into())
+    Err(tr(
+        "연결 테이블이 너무 빨리 바뀌어 수집하지 못했습니다.",
+        "Endpoint table changed too quickly to collect.",
+    )
+    .into())
+}
+
+fn truncated() -> String {
+    tr("연결 테이블이 잘렸습니다.", "Endpoint table is truncated.").into()
 }
 
 fn table_rows<T: Copy>(table: &NativeTable, offset: usize) -> Result<Vec<T>, String> {
     if table.bytes > table.storage.len() * size_of::<u64>() {
-        return Err("Endpoint table is truncated.".into());
+        return Err(truncated());
     }
     let bytes =
         unsafe { std::slice::from_raw_parts(table.storage.as_ptr().cast::<u8>(), table.bytes) };
     let count = bytes
         .get(..4)
         .map(|b| u32::from_ne_bytes(b.try_into().unwrap()) as usize)
-        .ok_or("Endpoint table is truncated.")?;
+        .ok_or_else(truncated)?;
     if count > MAX_ENDPOINTS {
-        return Err("Endpoint table exceeds the 16384-entry limit.".into());
+        return Err(tr(
+            "연결 테이블이 16384개 제한을 넘습니다.",
+            "Endpoint table exceeds the 16384-entry limit.",
+        )
+        .into());
     }
     let end = count
         .checked_mul(size_of::<T>())
         .and_then(|n| offset.checked_add(n))
-        .ok_or("Endpoint table is malformed.")?;
+        .ok_or_else(|| {
+            tr(
+                "연결 테이블 형식이 잘못되었습니다.",
+                "Endpoint table is malformed.",
+            )
+            .to_owned()
+        })?;
     if end > bytes.len() {
-        return Err("Endpoint table is truncated.".into());
+        return Err(truncated());
     }
     Ok((0..count)
         .map(|i| unsafe {
@@ -620,7 +670,13 @@ fn endpoints(result: &mut Vec<Endpoint>, errors: &mut Vec<String>) {
             Ok(mut rows) => {
                 if rows.len() > MAX_ENDPOINTS.saturating_sub(result.len()) {
                     rows.truncate(MAX_ENDPOINTS.saturating_sub(result.len()));
-                    errors.push("Endpoint list limited to 16384 entries.".into());
+                    errors.push(
+                        tr(
+                            "연결 목록은 16384개까지만 표시합니다.",
+                            "Endpoint list limited to 16384 entries.",
+                        )
+                        .into(),
+                    );
                 }
                 result.extend(rows);
             }

@@ -2,7 +2,7 @@
 //! The shared monitor can run faster than this window. Discarding those
 //! samples would discard ETW byte batches, especially with one-second flushing.
 
-use crate::{fileetw, netetw};
+use crate::{fileetw, i18n::tr, netetw};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Instant;
@@ -46,7 +46,10 @@ impl Pending {
             // The monitor's bounded delivery channel can drop a sample while
             // the UI is busy. Its bytes have already been drained from ETW;
             // treating the remaining intervals as complete would under-report.
-            let reason = "Some resource samples were skipped; waiting for a complete interval";
+            let reason = tr(
+                "일부 리소스 샘플을 건너뛰어 완전한 구간을 기다리는 중입니다",
+                "Some resource samples were skipped; waiting for a complete interval",
+            );
             self.network.invalid = true;
             self.network.reason = Some(reason.into());
             self.network.by_id.clear();
@@ -76,6 +79,35 @@ impl Pending {
         self.network = Network::default();
         self.files = Files::default();
     }
+}
+
+fn network_unavailable() -> String {
+    tr(
+        "네트워크 샘플을 사용할 수 없습니다",
+        "Network sample unavailable",
+    )
+    .into()
+}
+fn endpoints_unavailable() -> String {
+    tr(
+        "원격 주소별 전송량을 사용할 수 없습니다",
+        "Endpoint traffic unavailable",
+    )
+    .into()
+}
+fn files_unavailable() -> String {
+    tr(
+        "파일 I/O 요청을 사용할 수 없습니다",
+        "File I/O requests unavailable",
+    )
+    .into()
+}
+fn files_limited() -> String {
+    tr(
+        "파일 I/O 추적 한도에 도달했습니다",
+        "File I/O tracking limit reached",
+    )
+    .into()
 }
 
 fn duration(value: f64) -> bool {
@@ -131,7 +163,7 @@ impl Network {
             self.reason = sample
                 .reason
                 .clone()
-                .or_else(|| Some("Network sample unavailable".into()));
+                .or_else(|| Some(network_unavailable()));
             return;
         }
         if self.invalid {
@@ -139,7 +171,13 @@ impl Network {
         }
         if sample.by_id.len() > MAX_PROCESSES {
             self.invalid = true;
-            self.reason = Some("Process network tracking limit reached".into());
+            self.reason = Some(
+                tr(
+                    "프로세스 네트워크 추적 한도에 도달했습니다",
+                    "Process network tracking limit reached",
+                )
+                .into(),
+            );
             self.by_id.clear();
             return;
         }
@@ -174,7 +212,7 @@ impl Network {
             self.invalid = true;
         }
         if self.invalid {
-            self.reason = Some("Network sample unavailable".into());
+            self.reason = Some(network_unavailable());
         }
     }
 
@@ -239,7 +277,7 @@ impl Endpoints {
             self.reason = sample
                 .reason
                 .clone()
-                .or_else(|| Some("Endpoint traffic unavailable".into()));
+                .or_else(|| Some(endpoints_unavailable()));
             return;
         }
         if self.invalid {
@@ -258,7 +296,13 @@ impl Endpoints {
             if !self.rows.contains_key(&key) && self.rows.len() >= MAX_DETAILS {
                 self.invalid = true;
                 self.limited = true;
-                self.reason = Some("Endpoint tracking limit reached".into());
+                self.reason = Some(
+                    tr(
+                        "원격 주소 추적 한도에 도달했습니다",
+                        "Endpoint tracking limit reached",
+                    )
+                    .into(),
+                );
                 self.rows.clear();
                 return;
             }
@@ -268,7 +312,7 @@ impl Endpoints {
                 sample.interval_seconds,
             ) {
                 self.invalid = true;
-                self.reason = Some("Endpoint traffic unavailable".into());
+                self.reason = Some(endpoints_unavailable());
                 return;
             }
         }
@@ -354,10 +398,7 @@ impl Files {
             || sample.limited
         {
             self.invalid = true;
-            self.reason = sample
-                .reason
-                .clone()
-                .or_else(|| Some("File I/O requests unavailable".into()));
+            self.reason = sample.reason.clone().or_else(|| Some(files_unavailable()));
             return;
         }
         if self.invalid {
@@ -379,7 +420,7 @@ impl Files {
                     sample.interval_seconds,
                 ) {
                     self.invalid = true;
-                    self.reason = Some("File I/O requests unavailable".into());
+                    self.reason = Some(files_unavailable());
                     return;
                 }
                 continue;
@@ -387,7 +428,7 @@ impl Files {
             if self.row_count >= MAX_DETAILS {
                 self.invalid = true;
                 self.limited = true;
-                self.reason = Some("File I/O tracking limit reached".into());
+                self.reason = Some(files_limited());
                 self.rows.clear();
                 return;
             }
@@ -398,7 +439,7 @@ impl Files {
                 sample.interval_seconds,
             ) {
                 self.invalid = true;
-                self.reason = Some("File I/O requests unavailable".into());
+                self.reason = Some(files_unavailable());
                 return;
             }
             self.rows
@@ -511,6 +552,38 @@ mod tests {
         assert_eq!(files.rows[0].read_bytes_per_sec, 1000.0);
         pending.push(at + Duration::from_millis(750), &network, &files);
         assert!(!pending.take().0.measured);
+    }
+
+    #[test]
+    fn reasons_follow_the_ui_language() {
+        use crate::i18n::{with_language, Language};
+        let skipped = |language| {
+            with_language(language, || {
+                let at = Instant::now();
+                let mut pending = Pending::default();
+                let (network, files) = sample(0.5, 100.0);
+                pending.push(at, &network, &files);
+                pending.push(at + Duration::from_secs(3), &network, &files);
+                let (network, files) = pending.take();
+                (network.reason.unwrap(), files.reason.unwrap())
+            })
+        };
+        let (network, files) = skipped(Language::Korean);
+        assert!(network.starts_with("일부 리소스 샘플"), "{network}");
+        assert_eq!(network, files);
+        assert!(skipped(Language::English)
+            .0
+            .starts_with("Some resource samples"));
+        let mut unmeasured = sample(0.5, 100.0).0;
+        unmeasured.measured = false;
+        let mut pending = Pending::default();
+        with_language(Language::Korean, || {
+            pending.push(Instant::now(), &unmeasured, &sample(0.5, 100.0).1)
+        });
+        assert_eq!(
+            pending.take().0.reason.as_deref(),
+            Some("네트워크 샘플을 사용할 수 없습니다")
+        );
     }
 
     #[test]

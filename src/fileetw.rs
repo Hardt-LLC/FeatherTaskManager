@@ -6,7 +6,7 @@
 //! Only requests whose issuing thread matches the event header are attributed.
 //! File names come from the same trace; no files are opened or written here.
 
-use crate::sampler::Process;
+use crate::{i18n::tr, sampler::Process};
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 use std::ptr::null;
@@ -590,7 +590,7 @@ impl Drop for Session {
 impl Session {
     fn start() -> Result<Self, String> {
         if !crate::netetw::is_elevated() {
-            return Err("Requires administrator".into());
+            return Err(requires_admin());
         }
         let own_created =
             created(unsafe { GetCurrentProcess() }).ok_or("Cannot read process identity")?;
@@ -604,7 +604,13 @@ impl Session {
         let mut logger = CONTROLTRACE_HANDLE { Value: 0 };
         let status = unsafe { StartTraceW(&mut logger, name.as_ptr(), properties.ptr()) };
         if status != ERROR_SUCCESS {
-            return Err(error("Cannot start file I/O trace", status));
+            return Err(error(
+                tr(
+                    "파일 I/O 추적을 시작할 수 없습니다",
+                    "Cannot start file I/O trace",
+                ),
+                status,
+            ));
         }
         let params = ENABLE_TRACE_PARAMETERS {
             Version: ENABLE_TRACE_PARAMETERS_VERSION_2,
@@ -624,7 +630,13 @@ impl Session {
         };
         if status != ERROR_SUCCESS {
             stop(&name);
-            return Err(error("Cannot enable file I/O trace", status));
+            return Err(error(
+                tr(
+                    "파일 I/O 추적을 켤 수 없습니다",
+                    "Cannot enable file I/O trace",
+                ),
+                status,
+            ));
         }
         let shared = Arc::new(Shared::new());
         let context = Box::into_raw(Box::new(Consumer::new(Arc::clone(&shared))));
@@ -643,7 +655,13 @@ impl Session {
                 drop(Box::from_raw(context));
             }
             stop(&name);
-            return Err(error("Cannot open file I/O trace", code));
+            return Err(error(
+                tr(
+                    "파일 I/O 추적을 열 수 없습니다",
+                    "Cannot open file I/O trace",
+                ),
+                code,
+            ));
         }
         let pointer = ConsumerPtr(context);
         let copy = Arc::clone(&shared);
@@ -692,9 +710,13 @@ impl Session {
         )
     }
 }
+fn requires_admin() -> String {
+    tr("관리자 권한이 필요합니다", "Requires administrator").into()
+}
+
 fn error(context: &str, code: u32) -> String {
     if code == ERROR_ACCESS_DENIED {
-        "Requires administrator".into()
+        requires_admin()
     } else {
         format!("{context} (Windows {code})")
     }
@@ -758,11 +780,12 @@ impl FileMonitor {
         if session.shared.ended.load(Ordering::Acquire) || loss == Err(ERROR_WMI_INSTANCE_NOT_FOUND)
         {
             let status = session.shared.status.load(Ordering::Acquire);
+            let stopped = tr("파일 I/O 추적이 중지되었습니다", "File I/O trace stopped");
             let reason = if status == ERROR_SUCCESS {
                 // Ended normally (or stopped by another tool): not an error code.
-                "File I/O trace stopped".to_owned()
+                stopped.to_owned()
             } else {
-                error("File I/O trace stopped", status)
+                error(stopped, status)
             };
             self.session = None;
             self.reason = Some(reason.clone());
@@ -811,7 +834,13 @@ impl FileMonitor {
                 self.lost = Some(lost);
             }
             Err(code) => {
-                sample.reason = Some(error("Cannot check file I/O event loss", code));
+                sample.reason = Some(error(
+                    tr(
+                        "파일 I/O 이벤트 손실을 확인할 수 없습니다",
+                        "Cannot check file I/O event loss",
+                    ),
+                    code,
+                ));
                 self.invalidate(shared);
                 return sample;
             }
@@ -830,15 +859,33 @@ impl FileMonitor {
                     self.recovery = None;
                 }
             }
-            sample.reason = Some("File I/O events dropped".into());
+            sample.reason = Some(
+                tr(
+                    "파일 I/O 이벤트가 누락되어 이 구간은 표시하지 않습니다",
+                    "File I/O events dropped",
+                )
+                .into(),
+            );
             return sample;
         }
         if priming || elapsed.is_zero() {
-            sample.reason = Some("Preparing file I/O requests".into());
+            sample.reason = Some(
+                tr(
+                    "파일 I/O 요청을 준비하는 중입니다",
+                    "Preparing file I/O requests",
+                )
+                .into(),
+            );
             return sample;
         }
         if raw.limited {
-            sample.reason = Some("File I/O tracking limit reached".into());
+            sample.reason = Some(
+                tr(
+                    "파일 I/O 추적 한도에 도달했습니다",
+                    "File I/O tracking limit reached",
+                )
+                .into(),
+            );
             return sample;
         }
         let seconds = elapsed.as_secs_f64();
@@ -866,7 +913,13 @@ impl FileMonitor {
             .collect();
         sample.measured = true;
         if raw.partial {
-            sample.reason = Some("Some file I/O requests could not be attributed".into());
+            sample.reason = Some(
+                tr(
+                    "일부 파일 I/O 요청은 프로세스를 확인할 수 없어 제외했습니다",
+                    "Some file I/O requests could not be attributed",
+                )
+                .into(),
+            );
         }
         sample
     }

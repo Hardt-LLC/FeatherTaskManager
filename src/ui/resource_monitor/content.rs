@@ -153,6 +153,40 @@ fn identity_columns(s: &State, pid: u32, created: Option<u64>) -> (Option<(u32, 
         ],
     )
 }
+/// A collector's reason in the UI language. `netetw` reports stable English
+/// codes (the main window matches them too); the other collectors and the
+/// aggregation already speak the UI language and pass through.
+fn reason(text: &str) -> String {
+    match text {
+        "Preparing endpoint traffic" => tr(
+            "원격 주소별 전송량을 준비하는 중입니다",
+            "Preparing endpoint traffic",
+        )
+        .into(),
+        "Endpoint limit reached" => tr(
+            "원격 주소 추적 한도에 도달했습니다",
+            "Endpoint limit reached",
+        )
+        .into(),
+        "Endpoint event format unavailable" => tr(
+            "이 Windows의 연결 이벤트 형식을 해석할 수 없습니다",
+            "Endpoint event format unavailable",
+        )
+        .into(),
+        _ if text == "Requires administrator"
+            || text == "Network events dropped"
+            || text.starts_with("Network trace stopped")
+            || text.starts_with("Cannot check network event loss")
+            || text.starts_with("Cannot enable the network provider")
+            || text.starts_with("Cannot open the network trace")
+            || text.starts_with("Cannot start the network")
+            || text.starts_with("Cannot read this process") =>
+        {
+            paint::network_note(text).0.into()
+        }
+        _ => text.into(),
+    }
+}
 fn error_text(s: &State, fallback: &str) -> String {
     s.data
         .as_ref()
@@ -272,7 +306,7 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                     if st.network.as_ref().is_none_or(|n| !n.measured) {
                         st.network
                             .as_ref()
-                            .and_then(|n| n.reason.clone())
+                            .and_then(|n| n.reason.as_deref().map(reason))
                             .unwrap_or_else(|| {
                                 tr(
                                     "프로세스별 측정에는 관리자 권한이 필요합니다",
@@ -409,8 +443,8 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                 Vec::new()
             } else if let Some(network) = &st.network {
                 let endpoints = &network.endpoints;
-                summary = endpoints.reason.clone().unwrap_or_default();
-                empty = endpoints.reason.clone().unwrap_or_else(|| {
+                summary = endpoints.reason.as_deref().map(reason).unwrap_or_default();
+                empty = endpoints.reason.as_deref().map(reason).unwrap_or_else(|| {
                     tr(
                         "이 구간에 확인된 전송이 없습니다.",
                         "No attributable transfers in this interval.",
@@ -955,5 +989,37 @@ impl table::Model for Model {
             },
             pt.c.row_border,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::{with_language, Language};
+
+    #[test]
+    fn collector_reasons_follow_the_ui_language() {
+        with_language(Language::Korean, || {
+            assert_eq!(
+                reason("Preparing endpoint traffic"),
+                "원격 주소별 전송량을 준비하는 중입니다"
+            );
+            assert_eq!(
+                reason("Network trace stopped (error 5)"),
+                paint::network_note("Network trace stopped").0
+            );
+            assert_eq!(
+                reason("Requires administrator"),
+                paint::network_note("Requires administrator").0
+            );
+            // Other collectors already speak the UI language.
+            assert_eq!(
+                reason("파일 I/O 요청을 준비하는 중입니다"),
+                "파일 I/O 요청을 준비하는 중입니다"
+            );
+        });
+        with_language(Language::English, || {
+            assert_eq!(reason("Endpoint limit reached"), "Endpoint limit reached");
+        });
     }
 }
