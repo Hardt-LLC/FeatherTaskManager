@@ -230,6 +230,19 @@ impl Sampler {
         })
     }
 
+    /// The creation time of `pid` in a fresh kernel process list, or `None`
+    /// when it is not running. Needs no access to the process itself.
+    pub fn created(&mut self, pid: u32) -> Result<Option<u64>, String> {
+        let valid_bytes = self.query_processes()?;
+        // Same invariants as in `sample`: initialized, in bounds, not retained.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), valid_bytes) };
+        Ok(parse_processes(bytes, 0)?
+            .into_iter()
+            .find(|sample| sample.process.pid == pid)
+            .map(|sample| sample.process.created))
+    }
+
     fn resize_buffer(&mut self, bytes: usize) -> Result<(), String> {
         if bytes > MAX_BUFFER_BYTES {
             return Err("Process snapshot exceeds the 64 MiB safety limit".to_owned());
@@ -340,6 +353,11 @@ fn resource_rates(
             .checked_sub(before.hard_faults)
             .map(|faults| f64::from(faults) / seconds),
     )
+}
+
+/// One-off lookup for explicit navigation on a worker thread.
+pub fn live_process_created(pid: u32) -> Result<Option<u64>, String> {
+    Sampler::new()?.created(pid)
 }
 
 fn parse_processes(bytes: &[u8], previous_count: usize) -> Result<Vec<ProcessSample>, String> {
@@ -477,6 +495,21 @@ mod tests {
         assert_eq!(suspended_threads(&record, 2), Some(false));
         assert_eq!(suspended_threads(&record[..HEADER_BYTES + 80], 2), None);
         assert_eq!(suspended_threads(&record, 0), None);
+    }
+
+    #[test]
+    fn live_lookup_pins_generations_without_opening_the_process() {
+        let own = std::process::id();
+        assert_eq!(
+            live_process_created(own).unwrap(),
+            Some(crate::actions::running_process_created(own).unwrap())
+        );
+        // PIDs are multiples of four, so this one never names a process.
+        assert_eq!(live_process_created(own | 3).unwrap(), None);
+        // Without elevation System refuses even limited access; navigation
+        // still resolves it through the kernel's process list.
+        let system = crate::actions::running_process_created(4).unwrap();
+        assert_eq!(live_process_created(4).unwrap(), Some(system));
     }
 
     fn counter(created: u64, cpu: u64, io: u64) -> Counters {

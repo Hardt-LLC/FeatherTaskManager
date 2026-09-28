@@ -105,7 +105,3 @@ reuse the current work branch, avoid interrupting active edits/benchmarks, repor
 only useful changes or actionable failures, and preserve the user's reviewed
 design. Scheduling is separate from these scripts; running a capture does not
 install an operating-system task or add background work to Feather.
-
-The current chat has an active daily follow-up, **Feather 성능·기능 지속 개선**,
-which follows `IMPROVEMENTS.md` on `codex/task-manager-improvements`. Its schedule
-is managed by the Codex app and is not installed by cloning this repository.

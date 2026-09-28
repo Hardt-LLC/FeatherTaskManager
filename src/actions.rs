@@ -5,7 +5,7 @@ use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr::null};
 use crate::{i18n::tr, process_tree::TerminationPlan};
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::{
         Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE},
         SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
@@ -82,10 +82,17 @@ pub fn running_process_created(pid: u32) -> Result<u64, String> {
         )
     };
     if raw.is_null() {
-        return Err(last_error(tr(
-            "프로세스를 열 수 없습니다",
-            "Cannot open the process",
-        )));
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+            // Without elevation most service hosts refuse even limited query
+            // access. Navigation acts on nothing, so the kernel's process list
+            // is enough to pin the generation; actions still open and check.
+            return crate::sampler::live_process_created(pid)?.ok_or_else(exited);
+        }
+        return Err(format!(
+            "{}: {error}",
+            tr("프로세스를 열 수 없습니다", "Cannot open the process")
+        ));
     }
     let handle = ProcessHandle(raw);
     match unsafe { WaitForSingleObject(handle.0, 0) } {
