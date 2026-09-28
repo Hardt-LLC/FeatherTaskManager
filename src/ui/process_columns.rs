@@ -4,6 +4,49 @@ use windows_sys::Win32::System::Registry::*;
 
 const PATH: &str = r"Software\FeatherTask\Preferences";
 const VALUE: &str = "ProcessColumnsV1";
+/// Menu command of a shown column's action: `ACTIONS + index * 8 + action`.
+const ACTIONS: usize = 200;
+/// One Wider / Narrower step (DIP).
+const WIDTH_STEP: f32 = 16.0;
+
+/// What the column menu does to one shown column: the keyboard's way to
+/// drag a header or its edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    MoveLeft,
+    MoveRight,
+    Wider,
+    Narrower,
+    ResetWidth,
+    Hide,
+}
+impl Action {
+    const ALL: [Self; 6] = [
+        Self::MoveLeft,
+        Self::MoveRight,
+        Self::Wider,
+        Self::Narrower,
+        Self::ResetWidth,
+        Self::Hide,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            Self::MoveLeft => tr("왼쪽으로 이동", "Move left"),
+            Self::MoveRight => tr("오른쪽으로 이동", "Move right"),
+            Self::Wider => tr("너비 늘리기", "Wider"),
+            Self::Narrower => tr("너비 줄이기", "Narrower"),
+            Self::ResetWidth => tr("열 너비 초기화", "Reset column width"),
+            Self::Hide => tr("이 열 숨기기", "Hide this column"),
+        }
+    }
+    fn command(self, index: usize) -> usize {
+        ACTIONS + index * 8 + self as usize
+    }
+    fn from_command(command: usize) -> Option<(usize, Self)> {
+        let offset = command.checked_sub(ACTIONS)?;
+        Some((offset / 8, *Self::ALL.get(offset % 8)?))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -153,6 +196,43 @@ impl Config {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
             entry.width = width.round().clamp(48.0, 800.0) as u32;
         }
+    }
+    /// Whether `action` changes the shown column `index` (`width`: its drawn
+    /// width in DIP, since a flexible column stores none).
+    fn allows(&self, index: usize, action: Action, width: f32) -> bool {
+        let Some(id) = self.at(index) else {
+            return false;
+        };
+        match action {
+            Action::MoveLeft => index > 1,
+            Action::MoveRight => index > 0 && index + 1 < self.shown().count(),
+            Action::Wider => width < 800.0,
+            Action::Narrower => width > 48.0,
+            Action::ResetWidth => true,
+            Action::Hide => id != Name,
+        }
+    }
+    /// Apply `action` to the shown column `index`; false when it does nothing.
+    fn apply(&mut self, index: usize, action: Action, width: f32) -> bool {
+        if !self.allows(index, action, width) {
+            return false;
+        }
+        let Some(id) = self.at(index) else {
+            return false;
+        };
+        match action {
+            Action::MoveLeft => self.reorder(index, index - 1),
+            Action::MoveRight => self.reorder(index, index + 1),
+            Action::Wider => self.resize(id, width + WIDTH_STEP),
+            Action::Narrower => self.resize(id, width - WIDTH_STEP),
+            Action::ResetWidth => {
+                if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+                    entry.width = id.width();
+                }
+            }
+            Action::Hide => self.toggle(id),
+        }
+        true
     }
     fn reorder(&mut self, from: usize, to: usize) {
         let (Some(source), Some(target)) = (self.at(from), self.at(to)) else {
@@ -352,7 +432,31 @@ pub(super) unsafe fn reorder(p: *mut App, from: usize, to: usize) {
     (*p).process_columns.reorder(from, to);
     changed(p);
 }
-pub(super) unsafe fn menu(p: *mut App, index: usize, at: POINT) {
+/// The drawn width (DIP) of the shown column `index` of the process table.
+unsafe fn drawn_width(p: *mut App, index: usize) -> f32 {
+    let px = SendMessageW((*p).list, LVM_GETCOLUMNWIDTH, index, 0) as f32;
+    px * 96.0 / (*p).dpi.max(1) as f32
+}
+/// Append the shown column `index`'s actions to `menu`.
+unsafe fn add_actions(p: *mut App, menu: HMENU, index: usize) {
+    let width = drawn_width(p, index);
+    for action in Action::ALL {
+        if action == Action::Hide && (*p).process_columns.at(index) == Some(Name) {
+            continue;
+        }
+        let enabled = (*p).process_columns.allows(index, action, width);
+        AppendMenuW(
+            menu,
+            MF_STRING | if enabled { 0 } else { MF_GRAYED },
+            action.command(index),
+            wide(action.label()).as_ptr(),
+        );
+    }
+}
+/// The column menu: the column toggles, then the actions of `target` (the
+/// header that was pointed at) or, opened from the keyboard (Ctrl+Shift+C,
+/// ⋯ → Choose columns), an Edit column submenu with every shown column.
+pub(super) unsafe fn menu(p: *mut App, target: Option<usize>, at: POINT) {
     if (*p).modal {
         return;
     }
@@ -389,28 +493,33 @@ pub(super) unsafe fn menu(p: *mut App, index: usize, at: POINT) {
         AppendMenuW(menu, MF_POPUP, child as usize, wide(label).as_ptr());
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    if let Some(id) = (*p).process_columns.at(index) {
-        add(
-            menu,
-            101,
-            tr("왼쪽으로 이동", "Move left"),
-            if index > 1 { 0 } else { MF_GRAYED },
-        );
-        add(
-            menu,
-            102,
-            tr("오른쪽으로 이동", "Move right"),
-            if index > 0 && index + 1 < (*p).process_columns.shown().count() {
-                0
-            } else {
-                MF_GRAYED
-            },
-        );
-        add(menu, 103, tr("열 너비 초기화", "Reset column width"), 0);
-        if id != Name {
-            add(menu, 104, tr("이 열 숨기기", "Hide this column"), 0);
+    match target {
+        Some(index) => {
+            if (*p).process_columns.at(index).is_some() {
+                add_actions(p, menu, index);
+                AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            }
         }
-        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        None => {
+            let edit = CreatePopupMenu();
+            if !edit.is_null() {
+                let shown: Vec<_> = (*p).process_columns.shown().collect();
+                for (index, id) in shown.into_iter().enumerate() {
+                    let actions = CreatePopupMenu();
+                    if !actions.is_null() {
+                        add_actions(p, actions, index);
+                        AppendMenuW(edit, MF_POPUP, actions as usize, wide(id.label()).as_ptr());
+                    }
+                }
+                AppendMenuW(
+                    menu,
+                    MF_POPUP,
+                    edit as usize,
+                    wide(tr("열 편집", "Edit column")).as_ptr(),
+                );
+                AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            }
+        }
     }
     add(
         menu,
@@ -422,27 +531,22 @@ pub(super) unsafe fn menu(p: *mut App, index: usize, at: POINT) {
     (*p).modal = true;
     configure(p);
     let command = popup::track_menu(p, menu, popup::Anchor::Point(at));
+    // Destroys the submenus with it.
     DestroyMenu(menu);
     interactions::finish_modal(p);
     restore_focus(p, previous);
     match command {
         1..=18 => (*p).process_columns.toggle(ALL[command - 1]),
-        101 => (*p).process_columns.reorder(index, index.saturating_sub(1)),
-        102 => (*p).process_columns.reorder(index, index + 1),
-        103 => {
-            if let Some(id) = (*p).process_columns.at(index) {
-                if let Some(e) = (*p).process_columns.entries.iter_mut().find(|e| e.id == id) {
-                    e.width = id.width();
-                }
-            }
-        }
-        104 => {
-            if let Some(id) = (*p).process_columns.at(index) {
-                (*p).process_columns.toggle(id);
-            }
-        }
         105 => (*p).process_columns = Config::default(),
-        _ => return,
+        _ => {
+            let Some((index, action)) = Action::from_command(command) else {
+                return;
+            };
+            let width = drawn_width(p, index);
+            if !(*p).process_columns.apply(index, action, width) {
+                return;
+            }
+        }
     }
     changed(p);
 }
@@ -469,5 +573,39 @@ mod tests {
         invalid[2] = u32::MAX;
         assert!(Config::decode(&invalid).is_none());
         assert!(Config::decode(&[1, 0]).is_none());
+    }
+    #[test]
+    fn keyboard_actions_reorder_resize_and_hide_the_targeted_column() {
+        let mut config = Config::default();
+        assert_eq!(
+            Action::from_command(Action::Narrower.command(3)),
+            Some((3, Action::Narrower))
+        );
+        assert_eq!(Action::from_command(ACTIONS + 6), None);
+        assert_eq!(Action::from_command(105), None);
+        // Memory (index 3) moves both ways; Name stays first.
+        assert!(config.apply(3, Action::MoveLeft, 112.0));
+        assert_eq!(config.at(2), Some(Memory));
+        assert!(config.apply(2, Action::MoveRight, 112.0));
+        assert_eq!(config.at(3), Some(Memory));
+        assert!(!config.apply(1, Action::MoveLeft, 80.0));
+        assert!(!config.apply(0, Action::MoveRight, 300.0));
+        let last = config.shown().count() - 1;
+        assert!(!config.apply(last, Action::MoveRight, 80.0));
+        // Width steps start from the drawn width, also for the flexible Name.
+        assert!(config.apply(3, Action::Wider, 112.0));
+        assert_eq!(config.columns()[3].width, 128.0);
+        assert!(config.apply(0, Action::Narrower, 300.0));
+        assert_eq!(config.columns()[0].width, 284.0);
+        assert!(!config.columns()[0].flex);
+        assert!(!config.apply(3, Action::Wider, 800.0));
+        assert!(!config.apply(3, Action::Narrower, 48.0));
+        assert!(config.apply(0, Action::ResetWidth, 284.0));
+        assert!(config.columns()[0].flex);
+        // Hide removes only the targeted column; Name cannot be hidden.
+        assert!(!config.apply(0, Action::Hide, 300.0));
+        assert!(config.apply(3, Action::Hide, 128.0));
+        assert!(!config.contains(Memory));
+        assert!(!config.apply(ALL.len(), Action::Wider, 100.0));
     }
 }

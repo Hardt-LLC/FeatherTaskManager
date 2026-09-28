@@ -41,7 +41,7 @@ Download the latest version from [Releases](https://github.com/Hardt-LLC/Feather
 Release executables and installers are signed by **HARDT** through Azure Artifact Signing.
 
 - Open **Processes** to choose **App groups**, **List view** or **Tree view**. Select a process to end it or its tree after confirmation.
-- Right-click a process column header (or **⋯ → Choose columns…**, `Ctrl+Shift+C`) to show up to 18 columns such as user, command line, status, CPU time, handles and GPU memory. Drag headers to reorder them and drag their edges to resize; **Reset column layout** restores the default.
+- Right-click a process column header (or **⋯ → Choose columns…**, `Ctrl+Shift+C`) to show up to 18 columns such as user, command line, status, CPU time, handles and GPU memory. Drag headers to reorder them and drag their edges to resize, or use **Edit column** in the same menu to move, widen, narrow or hide a column from the keyboard; **Reset column layout** restores the default.
 - **Run new task** takes a program and separate arguments, optionally **as administrator** through UAC. The ⋯ and right-click menus can also **Switch to app window** and, for Windows Explorer, **Restart Windows Explorer** after confirmation.
 - Open **Performance**, **Startup apps** or **Services** for monitoring and management. On **Performance**, drag devices (or press `Alt+↑`/`Alt+↓`) to put them in your order; it is saved, and **Reset component order** restores the default.
 - **Performance → Resource Monitor** opens the built-in native monitor: five resource pages, shared process filters, memory details, modules and passive connection tables. Additional file/connection tracing is off by default. See [collection costs and measurement limits](RESOURCE_MONITOR.md).
