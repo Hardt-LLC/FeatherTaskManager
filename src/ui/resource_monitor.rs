@@ -612,11 +612,15 @@ unsafe fn invalidate(s: *mut State) {
     );
     EnableWindow((*s).clear, i32::from(!(*s).checked.is_empty()));
 }
+/// Rebuild after a view change. `new_data`: it may change what the monitor
+/// collects (tab, panel, checks, tracing, rate), so the monitor is told and
+/// the next sample is taken as soon as it arrives. A search or a sort only
+/// filters and reorders the current frame and never resamples.
 unsafe fn changed(s: *mut State, new_data: bool) {
     if new_data {
         (*s).last_refresh = None;
+        configure((*s).owner);
     }
-    configure((*s).owner);
     content::rebuild(s, (*s).accepted_at.unwrap_or_else(Instant::now));
     view::layout(s);
     invalidate(s);
@@ -930,7 +934,8 @@ unsafe fn notify(s: *mut State, l: LPARAM) -> LRESULT {
         LVN_COLUMNCLICK => {
             let n = &*(l as *const NMLISTVIEW);
             let col = n.iSubItem.max(0) as usize;
-            if (&(*s).panels)[index].kind.check() && col == 0 {
+            let check_all = (&(*s).panels)[index].kind.check() && col == 0;
+            if check_all {
                 let ids: Vec<_> = (&(*s).panels)[index]
                     .rows
                     .iter()
@@ -953,7 +958,9 @@ unsafe fn notify(s: *mut State, l: LPARAM) -> LRESULT {
                     panel.descending = panel.columns.get(col).is_some_and(|c| c.right);
                 }
             }
-            changed(s, false);
+            // Checks can change what is collected (one checked process's
+            // modules); a sort only reorders what the window already has.
+            changed(s, check_all);
         }
         NM_CLICK => {
             let n = &*(l as *const NMITEMACTIVATE);
@@ -1408,6 +1415,26 @@ pub(super) unsafe fn render_previews(owner: *mut App, dir: &std::path::Path) -> 
     (*owner).prefs.theme = theme_before;
     (*owner).prefs.apply_theme();
     result
+}
+
+/// Open the window with tracing on, shown (so it counts as active) without
+/// appearing on screen: transparent, non-activating, not in the taskbar.
+#[cfg(test)]
+pub(super) unsafe fn show_traced(owner: *mut App) {
+    create(owner, false);
+    let s = owner_state(owner);
+    assert!(!s.is_null());
+    let hwnd = (*s).hwnd;
+    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & !WS_EX_APPWINDOW;
+    SetWindowLongPtrW(
+        hwnd,
+        GWL_EXSTYLE,
+        (style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize,
+    );
+    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    (*s).detailed = true;
+    changed(s, true);
 }
 
 #[cfg(test)]

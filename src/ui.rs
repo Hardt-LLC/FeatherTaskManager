@@ -841,11 +841,16 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
     let mut paused = false;
     let mut refresh = true;
     let mut manual_refresh = false;
+    // What a sample collects changed since the last one (a panel opened, a
+    // column or trace turned on): the next Configure samples at once.
+    let mut new_work = false;
+    let mut traces = (false, false);
     // When the last sample was taken: the next one is due one interval
     // later, whatever commands arrive in between.
     let mut last: Option<Instant> = None;
     loop {
         if refresh {
+            new_work = false;
             let elapsed = last.map_or(Duration::from_millis(interval), |at| at.elapsed());
             last = Some(Instant::now());
             if sampler.is_err() {
@@ -931,7 +936,9 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
         };
         match result {
             Ok(Command::Resource(request, file_trace, endpoint_trace)) => {
+                new_work |= request != resource_request || (file_trace, endpoint_trace) != traces;
                 resource_request = request;
+                traces = (file_trace, endpoint_trace);
                 // Stop optional work even when both windows are paused and
                 // no further sampling iteration is scheduled.
                 if request == crate::resource::Request::default() {
@@ -942,6 +949,7 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 refresh = false;
             }
             Ok(Command::Metadata(needs)) => {
+                new_work |= needs != metadata_needs;
                 metadata_needs = needs;
                 refresh = false;
             }
@@ -950,6 +958,9 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 interval: i,
                 paused: p,
             }) => {
+                // Resizes, keystrokes and page switches re-send the same
+                // configuration: only a change samples ahead of schedule.
+                let changed = i != interval || p != paused || std::mem::take(&mut new_work);
                 interval = i;
                 if p && !paused {
                     // Bytes counted while paused are not shown: the first
@@ -973,7 +984,7 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 let recent = last.is_some_and(|at| {
                     at.elapsed() < Duration::from_millis((interval / 2).max(100))
                 });
-                refresh = manual_refresh || (!paused && !recent);
+                refresh = manual_refresh || (changed && !paused && !recent);
                 if !paused && recent && perf.is_none() {
                     if let Ok(mut sampler) = resume_perf(&mut thermal) {
                         let _ = sampler.sample();
@@ -2312,10 +2323,16 @@ unsafe fn configure(p: *mut App) {
         let _ = (*p).tx.send(Command::Metadata(needs));
     }
     let main_paused = (*p).paused || (*p).minimized || (*p).modal;
-    let resource_active = !(*p).modal && resource_monitor::interval((*p).resource_window).is_some();
+    let resource_shown = resource_monitor::interval((*p).resource_window).is_some();
+    let resource_active = !(*p).modal && resource_shown;
     let request = if resource_active {
         let (files, endpoints) = resource_monitor::tracing((*p).resource_window);
         (resource_monitor::request(p), files, endpoints)
+    } else if resource_shown {
+        // A menu or dialog pauses sampling but keeps the request: stopping
+        // the file and endpoint traces for it would restart (and re-prime)
+        // their ETW sessions after every menu.
+        (*p).resource_request
     } else {
         Default::default()
     };
@@ -4391,6 +4408,41 @@ mod tests {
         }
     }
     #[test]
+    fn menus_and_dialogs_pause_sampling_but_keep_resource_monitor_tracing() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::show_traced(test.p);
+            let traced = (*test.p).resource_request;
+            assert!(traced.1 && traced.2, "file and endpoint tracing are on");
+            while test.commands.try_recv().is_ok() {}
+            // A menu or confirm dialog: modal while it runs.
+            (*test.p).modal = true;
+            configure(test.p);
+            (*test.p).modal = false;
+            configure(test.p);
+            let sent: Vec<_> = test.commands.try_iter().collect();
+            assert!(
+                !sent.iter().any(|c| matches!(c, Command::Resource(..))),
+                "the traces are neither stopped nor restarted"
+            );
+            assert!(sent
+                .iter()
+                .any(|c| matches!(c, Command::Configure { paused: true, .. })));
+            assert!(matches!(
+                sent.last(),
+                Some(Command::Configure { paused: false, .. })
+            ));
+            assert_eq!((*test.p).resource_request, traced);
+            // Closing the window still stops them.
+            resource_monitor::close(test.p);
+            assert!(test.commands.try_iter().any(|c| matches!(
+                c,
+                Command::Resource(request, false, false) if request == Default::default()
+            )));
+        }
+    }
+    #[test]
     fn resource_monitor_rows_keep_their_identity_across_refreshes() {
         let test = TestWindow::new();
         test.snapshot(rows());
@@ -6447,8 +6499,7 @@ mod tests {
         let third = next("third sample");
         // Where the per-CPU counters work (not every machine exposes them),
         // a page switch (Configure without a pause) must not restart the
-        // sampler: past the "recent sample" window (125 ms here) the switch
-        // samples at once, and that sample still has rates.
+        // sampler: its next sample still has rates.
         let counters_work = warm(&third);
         std::thread::sleep(Duration::from_millis(150));
         configure(false);
@@ -6456,6 +6507,24 @@ mod tests {
         if counters_work {
             assert!(warm(&after_switch), "the page switch kept the sampler");
         }
+        // Page switches, resizes and keystrokes re-send the same
+        // configuration: past the "recent sample" window (125 ms here) each
+        // one used to sample at once. The schedule stands instead: about 6
+        // samples in 1.5 s, not one per Configure (10).
+        let mut samples = 0;
+        for _ in 0..10 {
+            configure(false);
+            let until = Instant::now() + Duration::from_millis(150);
+            while let Ok(sample) = rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                assert!(sample.snapshot.is_ok());
+                samples += 1;
+            }
+        }
+        assert!(
+            (4..=7).contains(&samples),
+            "{samples} samples for 10 unchanged configurations"
+        );
         // A pause drops it (the UI records the gap); sampling resumes with
         // performance data every interval.
         configure(true);
