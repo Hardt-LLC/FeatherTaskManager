@@ -4678,24 +4678,25 @@ mod tests {
             SendMessageW(list, WM_MOUSEMOVE, 0, at(edge + 600));
             SendMessageW(list, WM_LBUTTONUP, 0, at(edge + 600));
             assert!((*p).process_columns.columns()[4].width > 400.0);
+            // The overflow bar is the themed one: Windows' native bar (which
+            // ignores the dark theme) never appears.
+            let (offset, maximum, bar) = table::horizontal_state(list);
+            assert_eq!(offset, 0);
+            assert!(maximum > 0, "extra width must remain reachable");
+            assert!(bar > 0);
+            assert_eq!(GetWindowLongW(list, GWL_STYLE) as u32 & WS_HSCROLL, 0);
             let mut scroll = SCROLLINFO {
                 cbSize: size_of::<SCROLLINFO>() as u32,
                 fMask: SIF_ALL,
                 ..zeroed()
             };
-            assert_ne!(GetScrollInfo(list, SB_HORZ, &mut scroll), 0);
-            assert!(
-                scroll.nMax as u32 >= scroll.nPage,
-                "extra width must remain reachable"
-            );
+            assert_eq!(GetScrollInfo(list, SB_HORZ, &mut scroll), 0);
             SendMessageW(list, WM_HSCROLL, SB_RIGHT as usize, 0);
-            GetScrollInfo(list, SB_HORZ, &mut scroll);
-            assert!(scroll.nPos > 0);
+            assert_eq!(table::horizontal_state(list).0, maximum);
             // Resizing and scrolling never change the semantic sort column.
             assert_eq!((*p).sort, process_columns::ProcessColumn::Cpu as usize);
             test.page(Page::Services);
-            GetScrollInfo(list, SB_HORZ, &mut scroll);
-            assert_eq!(scroll.nPos, 0);
+            assert_eq!(table::horizontal_state(list), (0, 0, 0));
             (*p).process_columns
                 .toggle(process_columns::ProcessColumn::Memory);
             test.page(Page::Processes);

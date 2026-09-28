@@ -1,5 +1,7 @@
-//! Opt-in horizontal scrolling with the same colors as the vertical overlay.
-//! Pointer movement drives updates; there is no animation or polling timer.
+//! Horizontal overflow scrolling for tables that keep explicit column widths,
+//! in the same colors as the vertical overlay (Windows' native bar ignores the
+//! dark theme). Pointer movement drives updates; there is no animation or
+//! polling timer.
 use super::*;
 
 #[derive(Default)]
@@ -9,7 +11,7 @@ pub(super) struct Bar {
 }
 
 pub(super) unsafe fn height(s: *mut State) -> i32 {
-    if (*s).model.themed_horizontal() && (*s).horizontal_max > 0 {
+    if (*s).horizontal_max > 0 {
         gfx::pxi((*s).model.dpi(), 14.0)
     } else {
         0
@@ -66,9 +68,6 @@ pub(super) unsafe fn paint(s: *mut State, pt: &Painter) {
 }
 
 pub(super) unsafe fn message(s: *mut State, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
-    if !(*s).model.themed_horizontal() {
-        return None;
-    }
     let hwnd = (*s).hwnd;
     let (lane, thumb) = geometry(s);
     let visible = height(s) > 0;

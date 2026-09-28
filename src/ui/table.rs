@@ -152,10 +152,6 @@ pub(super) trait Model {
     unsafe fn horizontal_columns(&self) -> bool {
         self.editable_columns()
     }
-    /// Use the theme-aware client scrollbar instead of Windows' native bar.
-    unsafe fn themed_horizontal(&self) -> bool {
-        false
-    }
     unsafe fn resize_column(&self, _column: usize, _width: f32) {}
     unsafe fn reorder_column(&self, _from: usize, _to: usize) {}
     unsafe fn column_menu(&self, _column: usize, _point: POINT) {}
@@ -346,7 +342,6 @@ struct State {
     horizontal_offset: i32,
     horizontal_max: i32,
     horizontal_page: i32,
-    horizontal_syncing: bool,
     horizontal_bar: horizontal::Bar,
     redraw: bool,
     typed: String,
@@ -452,7 +447,6 @@ impl State {
             horizontal_offset: 0,
             horizontal_max: 0,
             horizontal_page: 0,
-            horizontal_syncing: false,
             horizontal_bar: horizontal::Bar::default(),
             redraw: true,
             typed: String::new(),
@@ -658,6 +652,22 @@ pub(super) unsafe fn scroll_offset(hwnd: HWND) -> f32 {
     }
 }
 
+/// Horizontal overflow (tests): offset, maximum offset and the height of
+/// the themed bar (0 while the columns fit), in device px.
+#[cfg(test)]
+pub(super) unsafe fn horizontal_state(hwnd: HWND) -> (i32, i32, i32) {
+    let s = state(hwnd);
+    if s.is_null() {
+        (0, 0, 0)
+    } else {
+        (
+            (*s).horizontal_offset,
+            (*s).horizontal_max,
+            horizontal::height(s),
+        )
+    }
+}
+
 /// The scrollable extent (content, view) in device px.
 pub(super) unsafe fn extent(hwnd: HWND) -> Extent {
     let s = state(hwnd);
@@ -758,9 +768,6 @@ unsafe fn column_spans(s: *mut State) -> Vec<(i32, i32)> {
 }
 
 unsafe fn sync_horizontal(s: *mut State) {
-    if (*s).horizontal_syncing {
-        return;
-    }
     let area = client(s);
     let maximum = if (*s).model.horizontal_columns() {
         (column_spans(s)
@@ -777,21 +784,6 @@ unsafe fn sync_horizontal(s: *mut State) {
     (*s).horizontal_max = maximum;
     (*s).horizontal_page = area.right;
     (*s).horizontal_offset = (*s).horizontal_offset.clamp(0, maximum);
-    if (*s).model.themed_horizontal() {
-        return;
-    }
-    (*s).horizontal_syncing = true;
-    let info = SCROLLINFO {
-        cbSize: size_of::<SCROLLINFO>() as u32,
-        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
-        nMin: 0,
-        nMax: (maximum + area.right - 1).max(0),
-        nPage: area.right.max(0) as u32,
-        nPos: (*s).horizontal_offset,
-        ..zeroed()
-    };
-    SetScrollInfo((*s).hwnd, SB_HORZ, &info, 1);
-    (*s).horizontal_syncing = false;
 }
 
 unsafe fn horizontal_to(s: *mut State, position: i32) {
@@ -800,15 +792,6 @@ unsafe fn horizontal_to(s: *mut State, position: i32) {
         return;
     }
     (*s).horizontal_offset = next;
-    let info = SCROLLINFO {
-        cbSize: size_of::<SCROLLINFO>() as u32,
-        fMask: SIF_POS,
-        nPos: next,
-        ..zeroed()
-    };
-    if !(*s).model.themed_horizontal() {
-        SetScrollInfo((*s).hwnd, SB_HORZ, &info, 1);
-    }
     (*s).painted_offset = None;
     InvalidateRect((*s).hwnd, null(), 0);
 }
@@ -2354,13 +2337,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             }
             0
         }
+        // The themed bar replaces Windows' native one (which ignores the
+        // dark theme); scroll requests from other sources still work.
         WM_HSCROLL => {
-            let mut info = SCROLLINFO {
-                cbSize: size_of::<SCROLLINFO>() as u32,
-                fMask: SIF_TRACKPOS,
-                ..zeroed()
-            };
-            GetScrollInfo(hwnd, SB_HORZ, &mut info);
             let now = (*s).horizontal_offset;
             let page = client(s).right.max(1);
             let next = match (w & 0xffff) as i32 {
@@ -2370,7 +2349,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 SB_PAGERIGHT => now + page,
                 SB_LEFT => 0,
                 SB_RIGHT => (*s).horizontal_max,
-                SB_THUMBPOSITION | SB_THUMBTRACK => info.nTrackPos,
                 _ => now,
             };
             horizontal_to(s, next);

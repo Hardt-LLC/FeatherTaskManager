@@ -760,9 +760,6 @@ impl table::Model for Model {
     unsafe fn horizontal_columns(&self) -> bool {
         true
     }
-    unsafe fn themed_horizontal(&self) -> bool {
-        true
-    }
     unsafe fn dpi(&self) -> i32 {
         (*self.0).dpi
     }
