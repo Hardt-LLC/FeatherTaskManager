@@ -26,7 +26,8 @@ same identity and critical-process protections as Task Manager, after confirmati
   their visible expanded panels. These use bounded, in-memory Windows ETW data.
   Connection attribution reuses Feather's existing network session. Administrator
   rights may be required; turning tracing on never changes privileges or installs
-  a driver. Turning it off stops its additional work.
+  a driver. Turning it off stops its additional work. Menus and confirmation
+  dialogs pause sampling but keep an enabled trace running instead of restarting it.
 - No DNS lookups, traffic probes, packet payload capture, file reads, trace files,
   external telemetry, or new runtime dependency are introduced.
 
