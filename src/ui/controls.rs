@@ -1325,7 +1325,8 @@ mod tests {
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-    /// A hidden main window (like `ui::tests::TestWindow`) for control tests.
+    /// A hidden main window (like `ui::tests::TestWindow`) for control tests,
+    /// its client the reference's 1200 × 820 DIP at the window's DPI.
     struct Harness {
         p: *mut App,
         class: Vec<u16>,
@@ -1350,7 +1351,7 @@ mod tests {
                     NEXT.fetch_add(1, AtomicOrdering::Relaxed)
                 ));
                 assert!(!create_window(p, &class, 1200, 820).is_null());
-                fit_client((*p).hwnd, 1200, 820);
+                fit_client_dip(p, 1200.0, 820.0);
                 // Deterministic cues: the last input was the mouse.
                 pointer_pressed((*p).hwnd);
                 Self {
@@ -1953,12 +1954,14 @@ mod tests {
                 cancel: "Cancel",
                 danger: true,
             };
+            let mut client: RECT = zeroed();
+            GetClientRect((*p).hwnd, &mut client);
+            let before = client.right;
             SetTimer((*p).hwnd, 0x5151, 1, Some(move_owner));
             assert!(!popup::confirm_dialog(p, &spec));
             // The dialog and scrim are fading out: still there, already moved.
-            let mut client: RECT = zeroed();
             GetClientRect((*p).hwnd, &mut client);
-            assert_eq!(client.right, 1100, "the window was resized");
+            assert_eq!(client.right, before - 100, "the window was resized");
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen((*p).hwnd, &mut origin);
             let mut window: RECT = zeroed();
@@ -1967,19 +1970,21 @@ mod tests {
                 .into_iter()
                 .filter_map(|h| popup::geometry(h).map(|(r, _)| r))
                 .collect();
+            // 440 px wide (the client leaves it room).
+            let width = gfx::pxi((*p).dpi, 440.0);
             let dialog = boxes
                 .iter()
-                .find(|r| r.right - r.left == 440)
+                .find(|r| r.right - r.left == width)
                 .expect("dialog");
             assert!(
-                (dialog.left - origin.x - (client.right - 440) / 2).abs() <= 1,
+                (dialog.left - origin.x - (client.right - width) / 2).abs() <= 1,
                 "re-centred horizontally"
             );
             let middle = (dialog.top + dialog.bottom) / 2 - origin.y;
             assert!((middle - client.bottom / 2).abs() <= 1, "and vertically");
             let scrim = boxes
                 .iter()
-                .find(|r| r.right - r.left > 440)
+                .find(|r| r.right - r.left > width)
                 .expect("scrim");
             assert!(
                 scrim.left <= origin.x && scrim.right >= origin.x + client.right,
@@ -2051,13 +2056,17 @@ mod tests {
                     .collect();
                 let shown: Vec<String> = lines.iter().flat_map(|(t, _)| words(t)).collect();
                 assert_eq!(shown, expected, "every word is shown, in order");
-                // No ink right of the text box (the padding stays clear).
+                // No ink right of the text box (the padding stays clear):
+                // the text starts inside the 1 px border and 24 px padding,
+                // the scan stops above the 61 px footer.
                 popup::settle(dialog);
                 let content = popup::surface_content(dialog).unwrap();
                 let c = colors();
-                let text_right = content.left + 1 + 24 + width;
-                for y in content.top + 2..content.bottom - 64 {
-                    for x in text_right + 2..content.right - 10 {
+                let dpi = (*p).dpi;
+                let text_right =
+                    content.left + gfx::hairline(dpi) as i32 + gfx::pxi(dpi, 24.0) + width;
+                for y in content.top + 2..content.bottom - gfx::pxi(dpi, 64.0) {
+                    for x in text_right + 2..content.right - gfx::pxi(dpi, 10.0) {
                         let pixel = popup::pixel(dialog, x, y).unwrap();
                         // (x stops short of the rounded top-right corner)
                         assert_eq!(rgb(pixel), c.surface, "ink at {x},{y} past the text box");
@@ -2078,8 +2087,10 @@ mod tests {
             let button = (*p).more;
             assert!(IsWindowEnabled(button) != 0);
             let r = child_rect(p, button);
+            let mut client: RECT = zeroed();
+            GetClientRect((*p).hwnd, &mut client);
             let capture = || {
-                let mut frame = gfx::Dib::new(1200, 820).unwrap();
+                let mut frame = gfx::Dib::new(client.right, client.bottom).unwrap();
                 frame.pixels().fill(0xffff_ffff);
                 capture::paint_client_and_children((*p).hwnd, frame.dc()).unwrap();
                 frame
@@ -2087,17 +2098,24 @@ mod tests {
             let c = colors();
             let parent = paint::parent_background(p, button);
             let x = (r.left + r.right) / 2;
+            // translateY(1px) in whole device px; the border is a hairline.
+            let down = gfx::pxi((*p).dpi, 1.0).max(1);
+            let hair = gfx::hairline((*p).dpi) as i32;
             let mut released = capture();
             assert_eq!(rgb(released.pixel(x, r.top)), c.border);
             assert_eq!(rgb(released.pixel(x, r.bottom - 1)), c.border);
             assert_eq!(rgb(released.pixel(x, r.bottom)), parent);
             SendMessageW(button, BM_SETSTATE, 1, 0);
             let mut pressed = capture();
-            assert_eq!(rgb(pressed.pixel(x, r.top)), parent, "the face moved down");
-            assert_eq!(rgb(pressed.pixel(x, r.top + 1)), c.border);
+            assert_eq!(
+                rgb(pressed.pixel(x, r.top + down - 1)),
+                parent,
+                "the face moved down"
+            );
+            assert_eq!(rgb(pressed.pixel(x, r.top + down)), c.border);
             assert_eq!(rgb(pressed.pixel(x, r.bottom - 1)), c.surface);
             assert_eq!(
-                rgb(pressed.pixel(x, r.bottom)),
+                rgb(pressed.pixel(x, r.bottom - hair + down)),
                 c.border,
                 "its bottom edge is painted on the window below the button"
             );
@@ -2275,13 +2293,14 @@ mod tests {
             popup::settle(dialog);
             let (bounds, opacity) = popup::geometry(dialog).unwrap();
             assert_eq!(opacity, 1.0);
-            assert_eq!(bounds.right - bounds.left, 440);
+            let width = gfx::pxi((*p).dpi, 440.0);
+            assert_eq!(bounds.right - bounds.left, width);
             let mut client: RECT = zeroed();
             GetClientRect((*p).hwnd, &mut client);
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen((*p).hwnd, &mut origin);
             assert!(
-                (bounds.left - origin.x - (client.right - 440) / 2).abs() <= 1,
+                (bounds.left - origin.x - (client.right - width) / 2).abs() <= 1,
                 "centred horizontally"
             );
             let (cover, _) = popup::geometry(scrim).unwrap();
@@ -2296,19 +2315,22 @@ mod tests {
             // Dialog: opaque surface body, rounded transparent corner, bg
             // footer, the danger button, the soft shadow below.
             let content = popup::surface_content(dialog).unwrap();
-            let body = popup::pixel(dialog, content.left + 6, content.top + 12).unwrap();
+            let d = |v: f32| gfx::pxi((*p).dpi, v);
+            let body = popup::pixel(dialog, content.left + d(6.0), content.top + d(12.0)).unwrap();
             assert_eq!(body >> 24, 255);
             assert_eq!(rgb(body), c.surface);
             let corner = popup::pixel(dialog, content.left, content.top).unwrap();
             assert!(corner >> 24 < 255, "rounded corner");
-            let foot = popup::pixel(dialog, content.left + 6, content.bottom - 6).unwrap();
+            let foot =
+                popup::pixel(dialog, content.left + d(6.0), content.bottom - d(6.0)).unwrap();
             assert_eq!(rgb(foot), c.bg);
-            let action = popup::pixel(dialog, content.right - 30, content.bottom - 40).unwrap();
+            let action =
+                popup::pixel(dialog, content.right - d(30.0), content.bottom - d(40.0)).unwrap();
             assert_eq!(rgb(action), c.danger);
             let shadow = popup::pixel(
                 dialog,
                 (content.left + content.right) / 2,
-                content.bottom + 20,
+                content.bottom + d(20.0),
             )
             .unwrap();
             assert!(
@@ -2333,10 +2355,23 @@ mod tests {
             assert!(!toast.is_null());
             assert_eq!(popup::current_toast((*p).hwnd), toast);
             let (r, _) = popup::geometry(toast).unwrap();
-            let mut corner = POINT { x: 1200, y: 820 };
+            let mut client: RECT = zeroed();
+            GetClientRect((*p).hwnd, &mut client);
+            let mut corner = POINT {
+                x: client.right,
+                y: client.bottom,
+            };
             ClientToScreen((*p).hwnd, &mut corner);
-            assert_eq!((corner.x - r.right, corner.y - r.bottom), (16, 44));
-            assert_eq!(r.bottom - r.top, 39, "padding 10 + 13 px line + 10");
+            let d = |v: f32| gfx::pxi((*p).dpi, v);
+            assert_eq!(
+                (corner.x - r.right, corner.y - r.bottom),
+                (d(16.0), d(44.0))
+            );
+            assert_eq!(
+                r.bottom - r.top,
+                d(10.0 + 13.0 * 1.45 + 10.0),
+                "padding 10 + 13 px line + 10"
+            );
             let now = Instant::now();
             popup::advance(toast, now + Duration::from_millis(400));
             assert_eq!(popup::geometry(toast).unwrap().1, 1.0, "faded in");
@@ -2380,27 +2415,34 @@ mod tests {
         let test = Harness::new();
         unsafe {
             let p = test.p;
+            let dpi = (*p).dpi;
             let list = popup::open_list(
                 p,
                 menu(),
-                MenuStyle::menu(96),
+                MenuStyle::menu(dpi),
                 Anchor::Point(POINT { x: 300, y: 300 }),
                 None,
             );
             let (r, opacity) = popup::geometry(list).unwrap();
             assert!(opacity < 1.0 || anim::reduced_motion(), "fades in");
-            assert_eq!(r.right - r.left, 200, "min-width 200");
+            let d = |v: f32| gfx::pxi(dpi, v);
+            assert_eq!(r.right - r.left, d(200.0), "min-width 200");
             // 1 + 4 + 4 rows × 32 + separator 9 + 4 + 1.
-            assert_eq!(r.bottom - r.top, 1 + 4 + 4 * 32 + 9 + 4 + 1);
+            let hair = gfx::hairline(dpi) as i32;
+            assert_eq!(
+                r.bottom - r.top,
+                hair + d(4.0) + 4 * d(32.0) + d(9.0) + d(4.0) + hair
+            );
             popup::settle(list);
             let content = popup::surface_content(list).unwrap();
             let c = colors();
-            let inside = popup::pixel(list, content.left + 2, content.top + 40).unwrap();
+            let inside = popup::pixel(list, content.left + 2, content.top + d(40.0)).unwrap();
             assert_eq!((inside >> 24, rgb(inside)), (255, c.surface));
-            let border = popup::pixel(list, content.left, content.top + 40).unwrap();
+            let border = popup::pixel(list, content.left, content.top + d(40.0)).unwrap();
             assert_eq!(rgb(border), c.border);
             assert!(popup::pixel(list, content.left, content.top).unwrap() >> 24 < 200);
-            let below = popup::pixel(list, content.left + 100, content.bottom + 24).unwrap();
+            let below =
+                popup::pixel(list, content.left + d(100.0), content.bottom + d(24.0)).unwrap();
             assert!(below >> 24 > 0, "shadow below");
             assert_eq!(popup::pixel(list, 0, 0).unwrap() >> 24, 0);
             // The hot item cross-fades to fg_sel.
@@ -2409,8 +2451,8 @@ mod tests {
             let row = popup::row_rect(list, 0).unwrap();
             let hot = popup::pixel(
                 list,
-                content.left + (row.left - r.left) + 4,
-                content.top + (row.top - r.top) + 16,
+                content.left + (row.left - r.left) + d(4.0),
+                content.top + (row.top - r.top) + d(16.0),
             )
             .unwrap();
             assert_eq!(rgb(hot), c.fg_sel);
@@ -2467,20 +2509,31 @@ mod tests {
             assert!(!ring_outside(p, GetDlgItem((*p).hwnd, PREF_TOP as i32)));
             // Nav items and segments have no pressed translation.
             assert!(!translates(NAV) && !translates(THEME_DARK) && translates(PRIMARY));
-            // The ring sits 2..4 px outside the control, in the main window.
-            let mut frame = gfx::Dib::new(1200, 820).unwrap();
+            // The ring sits 2..4 px outside the control, in the main window
+            // (a 2 px gap, then 2 px rounded to whole device px): every
+            // pixel it covers fully is fg, the gap stays clear.
+            let mut client: RECT = zeroed();
+            GetClientRect((*p).hwnd, &mut client);
+            let mut frame = gfx::Dib::new(client.right, client.bottom).unwrap();
             layout(p);
             let r = child_rect(p, (*p).more);
             preview_focus(p, Some((*p).more));
             paint::paint_to(p, frame.dc());
             let y = (r.top + r.bottom) / 2;
-            assert_eq!(rgb(frame.pixel(r.right + 2, y)), colors().fg);
-            assert_eq!(rgb(frame.pixel(r.right + 3, y)), colors().fg);
-            assert_ne!(rgb(frame.pixel(r.right, y)), colors().fg, "2 px gap");
+            let gap = gfx::px((*p).dpi, 2.0);
+            let ring = gfx::px((*p).dpi, 2.0).round().max(1.0);
+            let (inner, outer) = (gap.ceil() as i32, (gap + ring).floor() as i32);
+            assert!(outer - inner >= 1);
+            for dx in inner..outer {
+                assert_eq!(rgb(frame.pixel(r.right + dx, y)), colors().fg, "ring +{dx}");
+            }
+            for dx in 0..gap.floor() as i32 {
+                assert_ne!(rgb(frame.pixel(r.right + dx, y)), colors().fg, "2 px gap");
+            }
             preview_focus(p, None);
             paint::paint_to(p, frame.dc());
             assert_ne!(
-                rgb(frame.pixel(r.right + 2, y)),
+                rgb(frame.pixel(r.right + inner, y)),
                 colors().fg,
                 "no focus, no ring"
             );

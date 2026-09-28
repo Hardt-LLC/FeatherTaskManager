@@ -1712,10 +1712,13 @@ mod tests {
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-    /// A hidden main window (never shown) with its App.
+    /// A hidden main window (never shown) with its App, created like `run`
+    /// creates it: a 1200 × 820 DIP client plus the resize borders.
     struct Harness {
         p: *mut App,
         class: Vec<u16>,
+        /// The window size it was created with (device px).
+        created: (i32, i32),
         _channels: (
             SyncSender<MonitorSample>,
             Receiver<Command>,
@@ -1738,11 +1741,15 @@ mod tests {
                     std::process::id(),
                     NEXT.fetch_add(1, AtomicOrdering::Relaxed)
                 ));
-                assert!(!create_window(p, &class, 1200, 820).is_null());
+                let dpi = GetDpiForSystem().max(96);
+                let d = |v: f32| gfx::pxi(dpi as i32, v);
+                let created = outer_size(dpi, d(1200.0), d(820.0), 0);
+                assert!(!create_window(p, &class, created.0, created.1).is_null());
                 assert_eq!(IsWindowVisible((*p).hwnd), 0);
                 Self {
                     p,
                     class,
+                    created,
                     _channels: (snapshots, commands, jobs, complete),
                 }
             }
@@ -1791,32 +1798,44 @@ mod tests {
         let h = Harness::new();
         unsafe {
             let hwnd = (*h.p).hwnd;
-            let (fx, fy) = resize_border(GetDpiForWindow(hwnd));
+            let dpi = GetDpiForWindow(hwnd);
+            let d = |v: f32| gfx::pxi(dpi as i32, v);
+            let (fx, fy) = resize_border(dpi);
             let mut window: RECT = zeroed();
             let mut client: RECT = zeroed();
             GetWindowRect(hwnd, &mut window);
             GetClientRect(hwnd, &mut client);
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(hwnd, &mut origin);
-            // The client starts at the window's top edge (below DWM's 1 px
-            // border row on Windows 11): no caption, no top frame.
+            // The client starts at the window's top edge (below DWM's
+            // border rows on Windows 11: 1 px at 100 %, 2 at 150 %): no
+            // caption, no top frame.
             let top = (*h.p).frame.top_frame;
-            assert!((0..=1).contains(&top));
+            let border = if (*h.p).frame.win11 {
+                visible_border(hwnd)
+            } else {
+                0
+            };
+            assert_eq!(top, border);
+            assert!(
+                (0..=dpi.div_ceil(96) as i32).contains(&top),
+                "{top} at {dpi}"
+            );
             assert_eq!(origin.y, window.top + top);
             assert_eq!(origin.x, window.left + fx);
             assert_eq!(window.right - window.left - client.right, 2 * fx);
             assert_eq!(window.bottom - window.top - client.bottom, fy + top);
-            // Created 1200 × 820: attach kept that window's client height
-            // although DWM's border row became known late.
-            assert_eq!(client.bottom, 820 - fy);
+            // Created for a 1200 × 820 client: attach kept that window's
+            // client height although DWM's border row became known late.
+            assert_eq!(client.bottom, h.created.1 - fy);
             // fit_client lands exactly (previews compare 1:1 with the reference).
-            fit_client(hwnd, 1200, 820);
+            fit_client(hwnd, d(1200.0), d(820.0));
             GetClientRect(hwnd, &mut client);
-            assert_eq!(t(client), (0, 0, 1200, 820));
+            assert_eq!(t(client), (0, 0, d(1200.0), d(820.0)));
             GetWindowRect(hwnd, &mut window);
             assert_eq!(
                 (window.right - window.left, window.bottom - window.top),
-                outer_size(GetDpiForWindow(hwnd), 1200, 820, top)
+                outer_size(dpi, d(1200.0), d(820.0), top)
             );
             // WM_NCHITTEST through the real window procedure.
             layout(h.p);
@@ -1837,26 +1856,37 @@ mod tests {
             assert_eq!((*h.p).frame.hot, Some(Button::Minimize));
             SendMessageW(hwnd, WM_MOUSELEAVE, 0, 0);
             assert_eq!((*h.p).frame.hot, None);
-            assert_eq!(h.hit(100, 22), HTCAPTION);
-            assert_eq!(h.hit(600, 2), HTTOP);
-            assert_eq!(h.hit(600, -top), HTTOP);
-            assert_eq!(h.hit(600, 300), HTCLIENT);
-            assert_eq!(h.hit(-2, 300), HTLEFT);
-            assert_eq!(h.hit(600, 822), HTBOTTOM);
+            assert_eq!(h.hit(d(100.0), d(22.0)), HTCAPTION);
+            assert_eq!(h.hit(d(600.0), 2), HTTOP);
+            assert_eq!(h.hit(d(600.0), -top), HTTOP);
+            assert_eq!(h.hit(d(600.0), d(300.0)), HTCLIENT);
+            assert_eq!(h.hit(-2, d(300.0)), HTLEFT);
+            assert_eq!(h.hit(d(600.0), client.bottom + 2), HTBOTTOM);
             // The minimum track size is the supported minimum client + borders.
             let mut info: MINMAXINFO = zeroed();
             SendMessageW(hwnd, WM_GETMINMAXINFO, 0, &mut info as *mut _ as isize);
             assert_eq!(
                 (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
-                (980 + 2 * fx, 660 + fy + top)
+                (d(980.0) + 2 * fx, d(660.0) + fy + top)
             );
-            // Scaling to 150 % keeps the client proportional (no caption added).
+            // Scaling to another DPI (150 %, or 100 % from 150 %) keeps the
+            // client proportional (no caption added).
+            let to = if dpi == 144 { 96 } else { 144 };
             let mut size = SIZE { cx: 0, cy: 0 };
             assert_eq!(
-                SendMessageW(hwnd, WM_GETDPISCALEDSIZE, 144, &mut size as *mut _ as isize),
+                SendMessageW(
+                    hwnd,
+                    WM_GETDPISCALEDSIZE,
+                    to as usize,
+                    &mut size as *mut _ as isize
+                ),
                 1
             );
-            assert_eq!((size.cx, size.cy), outer_size(144, 1800, 1230, top));
+            let scaled = |v: f32| gfx::pxi(to as i32, v);
+            assert_eq!(
+                (size.cx, size.cy),
+                outer_size(to, scaled(1200.0), scaled(820.0), top)
+            );
         }
     }
 
@@ -1986,7 +2016,7 @@ mod tests {
             let p = h.p;
             let hwnd = (*p).hwnd;
             (*p).anim.anim = anim::Animator::new().with_reduced_motion(false);
-            fit_client(hwnd, 1200, 820);
+            let (narrow, height) = fit_client_dip(p, 1200.0, 820.0);
             layout(p);
             let key = Button::Minimize.key();
             // Hovered minimize, then the mouse leaves: a 150 ms fade-out runs.
@@ -1996,9 +2026,9 @@ mod tests {
             assert!((*p).anim.anim.is_key_animating(key));
             let before = current_layout(p).caption_buttons()[0];
             // Wider (e.g. snapped): the fade continues where the button is now.
-            fit_client(hwnd, 1400, 820);
+            let (wide, _) = fit_client_dip(p, 1400.0, 820.0);
             let after = current_layout(p).caption_buttons()[0];
-            assert_eq!(after.left - before.left, 200);
+            assert_eq!(after.left - before.left, wide - narrow);
             assert!((*p).anim.anim.is_key_animating(key));
             assert_eq!((*p).anim.anim.target(key), Some(0.0));
             // Maximize (a window-state change): every fade settles now.
@@ -2006,7 +2036,7 @@ mod tests {
                 hwnd,
                 WM_SIZE,
                 SIZE_MAXIMIZED as usize,
-                client_pack(1400, 820),
+                client_pack(wide, height),
             );
             assert!((*p).frame.maximized);
             assert_eq!((*p).frame.hot, None);
@@ -2018,7 +2048,7 @@ mod tests {
                 hwnd,
                 WM_SIZE,
                 SIZE_RESTORED as usize,
-                client_pack(1400, 820),
+                client_pack(wide, height),
             );
             assert!(!(*p).frame.maximized);
             // Restore while a fade runs: settled as well.
@@ -2029,45 +2059,39 @@ mod tests {
                 hwnd,
                 WM_SIZE,
                 SIZE_MAXIMIZED as usize,
-                client_pack(1400, 820),
+                client_pack(wide, height),
             );
             assert!(!(*p).anim.anim.is_key_animating(Button::Close.key()));
             SendMessageW(
                 hwnd,
                 WM_SIZE,
                 SIZE_RESTORED as usize,
-                client_pack(1400, 820),
+                client_pack(wide, height),
             );
-            // DPI change: fading keys jump to their end, the hot one stays lit.
+            // DPI change (to 150 %, or 100 % from 150 %): fading keys jump to
+            // their end, the hot one stays lit.
+            let dpi_changed = |dpi: i32| {
+                let r = RECT {
+                    left: 0,
+                    top: 0,
+                    right: gfx::pxi(dpi, 1200.0),
+                    bottom: gfx::pxi(dpi, 820.0),
+                };
+                SendMessageW(
+                    hwnd,
+                    WM_DPICHANGED,
+                    (dpi | (dpi << 16)) as usize,
+                    &r as *const _ as isize,
+                );
+            };
+            let dpi = (*p).dpi;
             SendMessageW(hwnd, WM_NCMOUSEMOVE, HTMAXBUTTON as usize, 0);
             assert!((*p).anim.anim.is_key_animating(Button::Maximize.key()));
-            let r = RECT {
-                left: 0,
-                top: 0,
-                right: 1800,
-                bottom: 1230,
-            };
-            SendMessageW(
-                hwnd,
-                WM_DPICHANGED,
-                144 | (144 << 16),
-                &r as *const _ as isize,
-            );
+            dpi_changed(if dpi == 144 { 96 } else { 144 });
             assert_eq!((*p).frame.hot, Some(Button::Maximize));
             assert!(!(*p).anim.anim.is_key_animating(Button::Maximize.key()));
             assert_eq!((*p).anim.value(Button::Maximize.key()), 1.0);
-            let r = RECT {
-                left: 0,
-                top: 0,
-                right: 1200,
-                bottom: 820,
-            };
-            SendMessageW(
-                hwnd,
-                WM_DPICHANGED,
-                96 | (96 << 16),
-                &r as *const _ as isize,
-            );
+            dpi_changed(dpi);
             (*p).anim.stop();
         }
     }
