@@ -34,6 +34,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
 mod access;
+mod horizontal;
 
 const CLASS: &str = "FeatherTable";
 /// Frame timer id of the table's animation host (its delay timer is
@@ -145,6 +146,14 @@ pub(super) trait Model {
         HeaderCell::default()
     }
     unsafe fn editable_columns(&self) -> bool {
+        false
+    }
+    /// Preserve column widths and scroll horizontally without requiring editing.
+    unsafe fn horizontal_columns(&self) -> bool {
+        self.editable_columns()
+    }
+    /// Use the theme-aware client scrollbar instead of Windows' native bar.
+    unsafe fn themed_horizontal(&self) -> bool {
         false
     }
     unsafe fn resize_column(&self, _column: usize, _width: f32) {}
@@ -338,6 +347,7 @@ struct State {
     horizontal_max: i32,
     horizontal_page: i32,
     horizontal_syncing: bool,
+    horizontal_bar: horizontal::Bar,
     redraw: bool,
     typed: String,
     typed_at: Option<Instant>,
@@ -443,6 +453,7 @@ impl State {
             horizontal_max: 0,
             horizontal_page: 0,
             horizontal_syncing: false,
+            horizontal_bar: horizontal::Bar::default(),
             redraw: true,
             typed: String::new(),
             typed_at: None,
@@ -710,12 +721,18 @@ unsafe fn client(s: *mut State) -> RECT {
     r
 }
 
+unsafe fn content_client(s: *mut State) -> RECT {
+    let mut r = client(s);
+    r.bottom = (r.bottom - horizontal::height(s)).max(r.top);
+    r
+}
+
 /// Process layouts keep explicit widths; overflow uses a horizontal bar.
 /// Other pages retain their original compact, proportionally fitted columns.
 unsafe fn column_spans(s: *mut State) -> Vec<(i32, i32)> {
     let area = client(s);
     let dpi = (*s).model.dpi();
-    let width = if (*s).model.editable_columns() {
+    let width = if (*s).model.horizontal_columns() {
         area.right.max(
             (*s).columns
                 .iter()
@@ -741,7 +758,7 @@ unsafe fn sync_horizontal(s: *mut State) {
         return;
     }
     let area = client(s);
-    let maximum = if (*s).model.editable_columns() {
+    let maximum = if (*s).model.horizontal_columns() {
         (column_spans(s)
             .last()
             .map_or(0, |span| span.1 + (*s).horizontal_offset)
@@ -756,6 +773,9 @@ unsafe fn sync_horizontal(s: *mut State) {
     (*s).horizontal_max = maximum;
     (*s).horizontal_page = area.right;
     (*s).horizontal_offset = (*s).horizontal_offset.clamp(0, maximum);
+    if (*s).model.themed_horizontal() {
+        return;
+    }
     (*s).horizontal_syncing = true;
     let info = SCROLLINFO {
         cbSize: size_of::<SCROLLINFO>() as u32,
@@ -782,7 +802,9 @@ unsafe fn horizontal_to(s: *mut State, position: i32) {
         nPos: next,
         ..zeroed()
     };
-    SetScrollInfo((*s).hwnd, SB_HORZ, &info, 1);
+    if !(*s).model.themed_horizontal() {
+        SetScrollInfo((*s).hwnd, SB_HORZ, &info, 1);
+    }
     (*s).painted_offset = None;
     InvalidateRect((*s).hwnd, null(), 0);
 }
@@ -810,12 +832,12 @@ unsafe fn relayout(s: *mut State) {
         y += (*s).model.row_height(row).max(1);
         tops.push(y);
     }
-    let area = client(s);
+    let area = content_client(s);
     let header = (*s).model.header_height().clamp(0, area.bottom.max(0));
     let content = if count > 0 { y + pad } else { 0 };
     let extent = Extent::new(content as f32, (area.bottom - header).max(0) as f32);
     (*s).scroll.set_extent(&mut (*s).anim, extent);
-    let lane = lane(s, area);
+    let lane = lane(s, client(s));
     (*s).anim.register(Key::Bar, (*s).hwnd, Some(lane));
     (*s).anim.register(Key::Grow, (*s).hwnd, Some(lane));
     // The glide repaints incrementally (`sync_scroll`), not the whole
@@ -826,7 +848,7 @@ unsafe fn relayout(s: *mut State) {
 
 /// The rows' area below the sticky header (client px).
 unsafe fn rows_area(s: *mut State) -> RECT {
-    let area = client(s);
+    let area = content_client(s);
     RECT {
         top: (*s).model.header_height().clamp(0, area.bottom.max(0)),
         ..area
@@ -953,6 +975,10 @@ unsafe fn sync_scroll(s: *mut State) {
 }
 
 unsafe fn lane(s: *mut State, area: RECT) -> RECT {
+    let area = RECT {
+        bottom: (area.bottom - horizontal::height(s)).max(area.top),
+        ..area
+    };
     let header = (*s).model.header_height().clamp(0, area.bottom.max(0));
     scroll::lane(
         RECT {
@@ -997,7 +1023,7 @@ unsafe fn row_parts(s: *mut State, row: usize) -> Option<Parts> {
 }
 
 unsafe fn hit(s: *mut State, pt: POINT) -> Hit {
-    let area = client(s);
+    let area = content_client(s);
     if !contains(&area, pt) {
         return Hit::Nothing;
     }
@@ -1796,6 +1822,7 @@ unsafe fn paint_to(s: *mut State, dc: HDC) -> (i32, RECT) {
         }
     }
     (*s).scroll.paint(&pt, &(*s).anim, lane(s, area));
+    horizontal::paint(s, &pt);
     // Per-row keys stay bounded: hover keys settle back to 0 and go; chevron
     // and switch keys live while their rows are on screen.
     (*s).anim.retain(|key, value, animating| {
@@ -2126,6 +2153,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
     let s = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
     if s.is_null() {
         return DefWindowProcW(hwnd, msg, w, l);
+    }
+    if let Some(result) = horizontal::message(s, msg, w, l) {
+        return result;
     }
     match msg {
         WM_NCDESTROY => {
@@ -2919,7 +2949,7 @@ impl Model for AppRows {
                 6 => (*p)
                     .performance
                     .as_ref()
-                    .and_then(super::system_gpu_percent)
+                    .and_then(|perf| super::system_gpu_percent(perf))
                     .map(|v| format!("{v:.1}%")),
                 _ => None,
             })

@@ -26,8 +26,9 @@
 //! - The event callback is allocation-free per event (a hash-map update into a
 //!   consumer-thread-local batch); the batch is flushed to the shared totals
 //!   once per ETW buffer, so the shared mutex is taken per buffer, not per event.
-//! - Only measured bytes are exposed. No connection, address, or port fields are
-//!   read, so no IP address, MAC address, or remote endpoint ever leaves ETW.
+//! - Address and port decoding is off by default. The built-in resource monitor
+//!   may opt into bounded endpoint aggregates on this same trace. No DNS lookup,
+//!   packet content, or additional network session is involved.
 //!
 //! Event ids and payload layout were verified on this machine against the
 //! provider manifest (`wevtutil gp Microsoft-Windows-Kernel-Network /ge /gm`):
@@ -37,11 +38,12 @@ use crate::sampler::Process;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
@@ -84,10 +86,8 @@ const CLOCK_SYSTEM_TIME: u32 = 2;
 const INVALID_PROCESSTRACE_HANDLE: u64 = u64::MAX;
 /// EVENT_CONTROL_CODE_ENABLE_PROVIDER.
 const ENABLE_PROVIDER: u32 = 1;
-/// Intervals reported unmeasured after ETW reports lost events: the interval in
-/// which the loss was seen, and the next one, whose buffers may also have been
-/// written before the loss was counted (flush lag is up to one second).
-const LOSS_HOLD_SAMPLES: u8 = 2;
+/// Bounds both the consumer buffer and a sampler interval, including UDP churn.
+const MAX_ENDPOINTS: usize = 2048;
 
 /// Distinguishes several monitors in one process (e.g. `--self-test`).
 static SESSION_SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -133,6 +133,69 @@ pub struct ProcessNet {
     pub total_bytes_per_sec: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Transport {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Debug)]
+pub struct EndpointTraffic {
+    pub pid: u32,
+    pub created: u64,
+    pub protocol: Transport,
+    pub local_addr: IpAddr,
+    pub local_port: u16,
+    pub remote_addr: IpAddr,
+    pub remote_port: u16,
+    pub send_bytes_per_sec: f64,
+    pub recv_bytes_per_sec: f64,
+}
+
+/// Observed traffic, not a connection inventory. An empty measured interval
+/// means no attributable transfers were observed; it does not mean no sockets.
+#[derive(Clone, Debug, Default)]
+pub struct EndpointSample {
+    pub enabled: bool,
+    pub measured: bool,
+    pub reason: Option<String>,
+    pub interval_seconds: f64,
+    pub rows: Vec<EndpointTraffic>,
+    /// The fixed endpoint limit was reached. Rates are omitted for this interval.
+    pub limited: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct EndpointKey {
+    pid: u32,
+    protocol: Transport,
+    local_addr: IpAddr,
+    local_port: u16,
+    remote_addr: IpAddr,
+    remote_port: u16,
+}
+
+#[derive(Default)]
+struct EndpointBatch {
+    epoch: u64,
+    ready: bool,
+    rows: HashMap<EndpointKey, PidBytes>,
+    limited: bool,
+    unsupported: bool,
+}
+
+impl EndpointBatch {
+    fn add(&mut self, key: EndpointKey, bytes: PidBytes) {
+        if let Some(value) = self.rows.get_mut(&key) {
+            value.merge(bytes);
+        } else if self.rows.len() < MAX_ENDPOINTS {
+            self.rows.insert(key, bytes);
+        } else {
+            self.limited = true;
+        }
+    }
+}
+
 /// The per-process network result of one monitor iteration.
 #[derive(Clone, Debug, Default)]
 pub struct ProcessNetworkSample {
@@ -156,6 +219,7 @@ pub struct ProcessNetworkSample {
     pub total_send_bytes_per_sec: f64,
     /// Sum of all attributable receive bytes per second this interval.
     pub total_recv_bytes_per_sec: f64,
+    pub endpoints: EndpointSample,
 }
 
 impl ProcessNetworkSample {
@@ -180,6 +244,13 @@ impl ProcessNetworkSample {
 struct Shared {
     /// Bytes accumulated per PID since the last [`Shared::drain`].
     totals: Mutex<HashMap<u32, PidBytes>>,
+    /// Odd epochs enable endpoint decoding; every toggle invalidates old data.
+    endpoint_epoch: AtomicU64,
+    endpoint_since: AtomicU64,
+    endpoints: Mutex<EndpointBatch>,
+    /// Loss recovery is acknowledged only after all buffered counts are clear.
+    reset: AtomicU64,
+    reset_ack: AtomicU64,
     /// Set on shutdown; the buffer callback returns false to end `ProcessTrace`.
     stop: AtomicBool,
     /// Total send/recv events processed, for diagnostics.
@@ -194,6 +265,11 @@ impl Shared {
     fn new() -> Self {
         Self {
             totals: Mutex::new(HashMap::new()),
+            endpoint_epoch: AtomicU64::new(0),
+            endpoint_since: AtomicU64::new(0),
+            endpoints: Mutex::new(EndpointBatch::default()),
+            reset: AtomicU64::new(0),
+            reset_ack: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             events: AtomicU64::new(0),
             ended: AtomicBool::new(false),
@@ -207,6 +283,23 @@ impl Shared {
             Err(_) => HashMap::new(),
         }
     }
+
+    fn drain_endpoints(&self) -> EndpointBatch {
+        let Ok(mut totals) = self.endpoints.lock() else {
+            return EndpointBatch {
+                epoch: self.endpoint_epoch.load(Ordering::Acquire),
+                ready: true,
+                unsupported: true,
+                ..EndpointBatch::default()
+            };
+        };
+        let replacement = EndpointBatch {
+            epoch: totals.epoch,
+            ready: totals.ready,
+            ..EndpointBatch::default()
+        };
+        std::mem::replace(&mut *totals, replacement)
+    }
 }
 
 /// Owned by the consumer thread; reached from both ETW callbacks by raw pointer.
@@ -214,6 +307,73 @@ impl Shared {
 struct Consumer {
     batch: HashMap<u32, PidBytes>,
     shared: Arc<Shared>,
+    endpoints: EndpointBatch,
+    endpoint_since: u64,
+    reset_epoch: u64,
+}
+
+impl Consumer {
+    fn reset_if_requested(&mut self) -> bool {
+        // Read once per buffer; the event callback has no recovery overhead.
+        let epoch = self.shared.reset.load(Ordering::Acquire);
+        if epoch == self.reset_epoch {
+            return false;
+        }
+        self.batch.clear();
+        self.endpoints = EndpointBatch {
+            epoch: self.endpoints.epoch,
+            ..EndpointBatch::default()
+        };
+        if let (Ok(mut totals), Ok(mut endpoints)) =
+            (self.shared.totals.lock(), self.shared.endpoints.lock())
+        {
+            totals.clear();
+            // Preserve a pending enable/disable epoch set by the sampler.
+            *endpoints = EndpointBatch {
+                epoch: endpoints.epoch,
+                ready: false,
+                ..EndpointBatch::default()
+            };
+            self.reset_epoch = epoch;
+            self.shared.reset_ack.store(epoch, Ordering::Release);
+        }
+        true
+    }
+
+    fn flush_endpoints(&mut self) {
+        // One atomic read per ETW buffer. Disabled events only test a local bit.
+        let epoch = self.shared.endpoint_epoch.load(Ordering::Acquire);
+        if epoch != self.endpoints.epoch {
+            self.endpoints = EndpointBatch {
+                epoch,
+                ..EndpointBatch::default()
+            };
+            self.endpoint_since = self.shared.endpoint_since.load(Ordering::Acquire);
+            if let Ok(mut totals) = self.shared.endpoints.lock() {
+                if totals.epoch == epoch {
+                    totals.ready = true;
+                }
+            }
+            return;
+        }
+        if epoch & 1 == 0 {
+            return;
+        }
+        if let Ok(mut totals) = self.shared.endpoints.lock() {
+            if totals.epoch == epoch {
+                for (key, bytes) in self.endpoints.rows.drain() {
+                    totals.add(key, bytes);
+                }
+                totals.limited |= std::mem::take(&mut self.endpoints.limited);
+                totals.unsupported |= std::mem::take(&mut self.endpoints.unsupported);
+                totals.ready = true;
+                return;
+            }
+        }
+        self.endpoints.rows.clear();
+        self.endpoints.limited = false;
+        self.endpoints.unsupported = false;
+    }
 }
 
 /// The consumer's heap address (from `Box::into_raw`), moved into the consumer
@@ -320,10 +480,16 @@ pub struct NetworkMonitor {
     previous: HashMap<u32, u64>,
     /// ETW's cumulative lost count at the last successful query.
     lost_baseline: Option<u64>,
-    /// Remaining intervals to report unmeasured after lost events.
-    loss_hold: u8,
+    recovery: Option<Recovery>,
     /// Events processed by a session that has since ended.
     ended_events: u64,
+    endpoint_epoch: u64,
+    endpoint_primed: bool,
+}
+
+struct Recovery {
+    epoch: u64,
+    acknowledged_at: Option<Instant>,
 }
 
 impl NetworkMonitor {
@@ -346,8 +512,10 @@ impl NetworkMonitor {
             last_swap: None,
             previous: HashMap::new(),
             lost_baseline: None,
-            loss_hold: 0,
+            recovery: None,
             ended_events: 0,
+            endpoint_epoch: 0,
+            endpoint_primed: false,
         }
     }
 
@@ -358,21 +526,127 @@ impl NetworkMonitor {
         })
     }
 
+    /// The resource monitor explicitly opts in while its advanced network view
+    /// is active. Turning it off discards addresses and releases their storage.
+    /// This does not restart or add a trace, and never prompts for elevation.
+    pub fn set_endpoint_capture(&mut self, enabled: bool) {
+        if (self.endpoint_epoch & 1 != 0) == enabled {
+            return;
+        }
+        self.endpoint_epoch = self.endpoint_epoch.wrapping_add(1);
+        self.endpoint_primed = false;
+        if let Some(session) = &self.session {
+            let mut now = FILETIME::default();
+            unsafe {
+                windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime(&mut now)
+            };
+            let since = u64::from(now.dwLowDateTime) | u64::from(now.dwHighDateTime) << 32;
+            session
+                .shared
+                .endpoint_since
+                .store(since, Ordering::Release);
+            if let Ok(mut totals) = session.shared.endpoints.lock() {
+                *totals = EndpointBatch {
+                    epoch: self.endpoint_epoch,
+                    ..EndpointBatch::default()
+                };
+            }
+            session
+                .shared
+                .endpoint_epoch
+                .store(self.endpoint_epoch, Ordering::Release);
+        }
+    }
+
     /// Swaps out the accumulated byte counts and converts them to rates using
     /// the real elapsed time since the previous call.
     pub fn sample(&mut self, processes: &[Process]) -> ProcessNetworkSample {
         let Some(session) = self.session.as_mut() else {
-            return ProcessNetworkSample::unavailable(
+            let mut sample = ProcessNetworkSample::unavailable(
                 self.reason.clone().unwrap_or_else(requires_admin),
             );
+            sample.endpoints = self.endpoint_sample(EndpointBatch::default(), &sample);
+            return sample;
         };
         // Query first, then drain, then check the thread: a trace that ended
         // before the drain is never reported as a measured interval.
         let lost = session.lost();
         let now = Instant::now();
         let raw = session.shared.drain();
+        let endpoint_raw = if self.endpoint_epoch & 1 != 0 {
+            session.shared.drain_endpoints()
+        } else {
+            EndpointBatch::default()
+        };
         let ended = session.ended();
-        self.account(processes, now, raw, lost, ended)
+        let mut sample = self.account(processes, now, raw, lost, ended);
+        sample.endpoints = self.endpoint_sample(endpoint_raw, &sample);
+        sample
+    }
+
+    fn endpoint_sample(
+        &mut self,
+        raw: EndpointBatch,
+        network: &ProcessNetworkSample,
+    ) -> EndpointSample {
+        if self.endpoint_epoch & 1 == 0 {
+            return EndpointSample::default();
+        }
+        let mut sample = EndpointSample {
+            enabled: true,
+            interval_seconds: network.interval_seconds,
+            limited: raw.limited,
+            ..EndpointSample::default()
+        };
+        if !network.measured {
+            self.endpoint_primed = false;
+            sample.reason.clone_from(&network.reason);
+            return sample;
+        }
+        if raw.epoch != self.endpoint_epoch || !raw.ready {
+            self.endpoint_primed = false;
+            sample.reason = Some("Preparing endpoint traffic".into());
+            return sample;
+        }
+        if !std::mem::replace(&mut self.endpoint_primed, true) {
+            sample.reason = Some("Preparing endpoint traffic".into());
+            return sample;
+        }
+        if raw.limited || raw.unsupported {
+            sample.reason = Some(
+                if raw.limited {
+                    "Endpoint limit reached"
+                } else {
+                    "Endpoint event format unavailable"
+                }
+                .into(),
+            );
+            return sample;
+        }
+        for (key, bytes) in raw.rows {
+            let Some(&created) = self.previous.get(&key.pid) else {
+                continue;
+            };
+            // The parent sample admits only continuous process identities and
+            // excludes delayed events of a previous PID owner. Apply it again
+            // to each endpoint because buffers may contain a mixture of owners.
+            if !network.by_id.contains_key(&(key.pid, created)) || bytes.earliest < created {
+                continue;
+            }
+            sample.rows.push(EndpointTraffic {
+                pid: key.pid,
+                created,
+                protocol: key.protocol,
+                local_addr: key.local_addr,
+                local_port: key.local_port,
+                remote_addr: key.remote_addr,
+                remote_port: key.remote_port,
+                send_bytes_per_sec: bytes.send as f64 / network.interval_seconds,
+                recv_bytes_per_sec: bytes.recv as f64 / network.interval_seconds,
+            });
+        }
+        sample.measured = true;
+        sample
     }
 
     /// Converts one interval's drained bytes to a sample. Separate from
@@ -392,7 +666,6 @@ impl NetworkMonitor {
             // Someone stopped the session; the consumer is about to return.
             return self.end_session(stopped_reason(ERROR_SUCCESS));
         }
-        let priming = self.last_swap.is_none();
         let previous_swap = self.last_swap.replace(now);
         let previous = std::mem::replace(&mut self.previous, identities(processes));
         // ETW's lost counters are cumulative since the session started.
@@ -400,33 +673,50 @@ impl NetworkMonitor {
             Ok(total) => {
                 let increased = match self.lost_baseline {
                     Some(baseline) => total > baseline,
-                    None => !priming && total > 0,
+                    None => total > 0,
                 };
                 self.lost_baseline = Some(total);
                 if increased {
-                    self.loss_hold = LOSS_HOLD_SAMPLES;
+                    self.invalidate();
                 }
                 None
             }
-            Err(status) => Some(status),
+            Err(status) => {
+                self.invalidate();
+                Some(status)
+            }
         };
-        let Some(previous_swap) = previous_swap else {
-            // First observation: bytes cover an unknown span since start; prime.
-            return ProcessNetworkSample::default();
-        };
-        let seconds = now.saturating_duration_since(previous_swap).as_secs_f64();
-        if seconds <= 0.0 {
-            return ProcessNetworkSample::default();
-        }
+        let seconds = previous_swap.map_or(0.0, |previous_swap| {
+            now.saturating_duration_since(previous_swap).as_secs_f64()
+        });
         if let Some(status) = query_error {
             return ProcessNetworkSample::unmeasured(
                 format!("Cannot check network event loss (error {status})"),
                 seconds,
             );
         }
-        if self.loss_hold > 0 {
-            self.loss_hold -= 1;
+        if let Some(recovery) = &mut self.recovery {
+            if self.session.as_ref().is_some_and(|session| {
+                session.shared.reset_ack.load(Ordering::Acquire) == recovery.epoch
+            }) {
+                if let Some(at) = recovery.acknowledged_at {
+                    if now.saturating_duration_since(at)
+                        >= Duration::from_secs(u64::from(FLUSH_TIMER_SECONDS))
+                    {
+                        // Discard this clean drain. The following interval is
+                        // entirely after acknowledgement and a full flush.
+                        self.recovery = None;
+                    }
+                } else {
+                    // This drain may predate the consumer acknowledgement.
+                    recovery.acknowledged_at = Some(now);
+                }
+            }
             return ProcessNetworkSample::unmeasured("Network events dropped", seconds);
+        }
+        if seconds <= 0.0 {
+            // First observation: bytes cover an unknown span since start; prime.
+            return ProcessNetworkSample::default();
         }
         let mut total_send = 0.0;
         let mut total_recv = 0.0;
@@ -463,6 +753,20 @@ impl NetworkMonitor {
             by_id,
             total_send_bytes_per_sec: total_send,
             total_recv_bytes_per_sec: total_recv,
+            endpoints: EndpointSample::default(),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        if let Some(session) = &self.session {
+            self.recovery = Some(Recovery {
+                epoch: session
+                    .shared
+                    .reset
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1),
+                acknowledged_at: None,
+            });
         }
     }
 
@@ -475,6 +779,7 @@ impl NetworkMonitor {
         self.reason = Some(reason.clone());
         self.last_swap = None;
         self.previous.clear();
+        self.recovery = None;
         ProcessNetworkSample::unavailable(reason)
     }
 }
@@ -761,6 +1066,9 @@ fn start_session(enable_provider: bool) -> Result<Session, String> {
     let context = Box::into_raw(Box::new(Consumer {
         batch: HashMap::new(),
         shared: Arc::clone(&shared),
+        endpoints: EndpointBatch::default(),
+        endpoint_since: 0,
+        reset_epoch: 0,
     }));
 
     let mut logname = name.clone().into_boxed_slice();
@@ -841,7 +1149,7 @@ fn same_guid(a: &GUID, b: &GUID) -> bool {
 /// able to inject byte counts with matching event ids. Reads the process id
 /// and byte size (the first two payload fields for every send/recv event) and
 /// adds them, with the event's system time, to the consumer-thread-local
-/// batch; no address or port is read.
+/// batch. Endpoint parsing is an explicit, bounded opt-in on this same session.
 unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     if record.is_null() {
         return;
@@ -873,6 +1181,24 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         let time = u64::try_from(record.EventHeader.TimeStamp).unwrap_or(0);
         entry.earliest = entry.earliest.min(time);
         consumer.shared.events.fetch_add(1, Ordering::Relaxed);
+        if consumer.endpoints.epoch & 1 != 0 && time >= consumer.endpoint_since {
+            let data = std::slice::from_raw_parts(
+                record.UserData.cast::<u8>(),
+                record.UserDataLength as usize,
+            );
+            if let Some(key) = read_endpoint(id, record.EventHeader.EventDescriptor.Version, data) {
+                consumer.endpoints.add(
+                    key,
+                    PidBytes {
+                        send: if send { u64::from(size) } else { 0 },
+                        recv: if recv { u64::from(size) } else { 0 },
+                        earliest: time,
+                    },
+                );
+            } else {
+                consumer.endpoints.unsupported = true;
+            }
+        }
     }
 }
 
@@ -897,6 +1223,58 @@ unsafe fn read_pid_size(data: *const c_void, len: u16) -> Option<(u32, u32)> {
     Some((read_u32(0), read_u32(4)))
 }
 
+/// The installed provider's version-0 templates were checked with
+/// `(Get-WinEvent -ListProvider Microsoft-Windows-Kernel-Network).Events`.
+/// Microsoft documents the same leading fields at:
+/// https://learn.microsoft.com/windows/win32/etw/tcpip-sendipv4
+/// https://learn.microsoft.com/windows/win32/etw/tcpip-sendipv6
+/// win:IPv4 and win:Port are in network byte order:
+/// https://learn.microsoft.com/windows/win32/wes/eventmanifestschema-inputtype-complextype
+///
+/// No string allocations, pointer-size-dependent trailing fields, or packet
+/// contents are read. IPv6 scope identifiers are absent from these events.
+fn read_endpoint(id: u16, version: u8, data: &[u8]) -> Option<EndpointKey> {
+    if version != 0 {
+        return None;
+    }
+    let (protocol, ipv6, send) = match id {
+        10 => (Transport::Tcp, false, true),
+        11 => (Transport::Tcp, false, false),
+        26 => (Transport::Tcp, true, true),
+        27 => (Transport::Tcp, true, false),
+        42 => (Transport::Udp, false, true),
+        43 => (Transport::Udp, false, false),
+        58 => (Transport::Udp, true, true),
+        59 => (Transport::Udp, true, false),
+        _ => return None,
+    };
+    let length = if ipv6 { 16 } else { 4 };
+    let port_offset = 8 + length * 2;
+    if data.len() < port_offset + 4 {
+        return None;
+    }
+    let pid = u32::from_le_bytes(data[..4].try_into().ok()?);
+    let address = |offset: usize| -> Option<IpAddr> {
+        if ipv6 {
+            Some(Ipv6Addr::from(<[u8; 16]>::try_from(&data[offset..offset + 16]).ok()?).into())
+        } else {
+            Some(Ipv4Addr::from(<[u8; 4]>::try_from(&data[offset..offset + 4]).ok()?).into())
+        }
+    };
+    let destination = address(8)?;
+    let source = address(8 + length)?;
+    let destination_port = u16::from_be_bytes(data[port_offset..port_offset + 2].try_into().ok()?);
+    let source_port = u16::from_be_bytes(data[port_offset + 2..port_offset + 4].try_into().ok()?);
+    Some(EndpointKey {
+        pid,
+        protocol,
+        local_addr: if send { source } else { destination },
+        local_port: if send { source_port } else { destination_port },
+        remote_addr: if send { destination } else { source },
+        remote_port: if send { destination_port } else { source_port },
+    })
+}
+
 /// ETW buffer callback. Runs on the consumer thread after each buffer is
 /// delivered. Flushes the batch to the shared totals under one lock, and stops
 /// `ProcessTrace` promptly once shutdown was requested.
@@ -909,6 +1287,9 @@ unsafe extern "system" fn on_buffer(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {
         return 1;
     }
     let consumer = &mut *context;
+    if consumer.reset_if_requested() {
+        return u32::from(!consumer.shared.stop.load(Ordering::Acquire));
+    }
     if !consumer.batch.is_empty() {
         if let Ok(mut totals) = consumer.shared.totals.lock() {
             for (pid, bytes) in consumer.batch.drain() {
@@ -918,6 +1299,7 @@ unsafe extern "system" fn on_buffer(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {
             consumer.batch.clear();
         }
     }
+    consumer.flush_endpoints();
     // Returning false (0) ends ProcessTrace; keep consuming otherwise.
     u32::from(!consumer.shared.stop.load(Ordering::Acquire))
 }
@@ -1011,7 +1393,155 @@ mod tests {
         Consumer {
             batch: HashMap::new(),
             shared: Arc::new(Shared::new()),
+            endpoints: EndpointBatch::default(),
+            endpoint_since: 0,
+            reset_epoch: 0,
         }
+    }
+
+    fn endpoint_payload(ipv6: bool, receive: bool) -> Vec<u8> {
+        let mut data = [7u32.to_le_bytes(), 400u32.to_le_bytes()].concat();
+        let (local, remote) = if ipv6 {
+            (
+                Ipv6Addr::LOCALHOST.octets().to_vec(),
+                "2001:db8::9".parse::<Ipv6Addr>().unwrap().octets().to_vec(),
+            )
+        } else {
+            (vec![10, 1, 2, 3], vec![203, 0, 113, 8])
+        };
+        let (destination, source, destination_port, source_port) = if receive {
+            (&local, &remote, 43210u16, 443u16)
+        } else {
+            (&remote, &local, 443u16, 43210u16)
+        };
+        data.extend(destination);
+        data.extend(source);
+        data.extend(destination_port.to_be_bytes());
+        data.extend(source_port.to_be_bytes());
+        data
+    }
+
+    fn feed_endpoint(consumer: &mut Consumer, id: u16, time: u64) {
+        let data = endpoint_payload(matches!(id, 26 | 27 | 58 | 59), RECV_IDS.contains(&id));
+        let mut record: EVENT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventHeader.ProviderId = KERNEL_NETWORK_PROVIDER;
+        record.EventHeader.EventDescriptor.Id = id;
+        record.EventHeader.TimeStamp = time as i64;
+        record.UserData = data.as_ptr() as *mut c_void;
+        record.UserDataLength = data.len() as u16;
+        record.UserContext = (consumer as *mut Consumer).cast();
+        unsafe { on_event(&mut record) };
+    }
+
+    #[test]
+    fn endpoint_layouts_normalize_send_receive_and_reject_unknown_or_short_formats() {
+        for (send, receive, protocol, ipv6) in [
+            (10, 11, Transport::Tcp, false),
+            (26, 27, Transport::Tcp, true),
+            (42, 43, Transport::Udp, false),
+            (58, 59, Transport::Udp, true),
+        ] {
+            let data = endpoint_payload(ipv6, false);
+            let key = read_endpoint(send, 0, &data).unwrap();
+            assert_eq!(
+                key,
+                read_endpoint(receive, 0, &endpoint_payload(ipv6, true)).unwrap()
+            );
+            assert_eq!(key.protocol, protocol);
+            assert_eq!((key.pid, key.local_port, key.remote_port), (7, 43210, 443));
+            assert_eq!(
+                key.remote_addr.to_string(),
+                if ipv6 { "2001:db8::9" } else { "203.0.113.8" }
+            );
+            assert_eq!(read_endpoint(send, 1, &data), None);
+            assert_eq!(read_endpoint(send, 0, &data[..data.len() - 1]), None);
+            assert_eq!(read_endpoint(99, 0, &data), None);
+        }
+    }
+
+    #[test]
+    fn endpoint_opt_in_primes_bounds_and_rejects_old_pid_owners_and_toggle_data() {
+        let mut monitor = fake_running();
+        let shared = Arc::clone(&monitor.session.as_ref().unwrap().shared);
+        let mut consumer = Consumer {
+            shared,
+            ..consumer()
+        };
+        feed_endpoint(&mut consumer, 10, 100);
+        flush(&mut consumer);
+        assert!(consumer.shared.drain_endpoints().rows.is_empty());
+        assert_eq!(
+            consumer.endpoints.rows.capacity(),
+            0,
+            "disabled capture allocates no endpoint map"
+        );
+
+        monitor.set_endpoint_capture(true);
+        let since = consumer.shared.endpoint_since.load(Ordering::Acquire);
+        flush(&mut consumer); // Acknowledge the new epoch at a buffer boundary.
+        let created = since - 1000;
+        monitor.previous.insert(7, created);
+        let mut base = ProcessNetworkSample {
+            measured: true,
+            interval_seconds: 2.0,
+            ..ProcessNetworkSample::default()
+        };
+        base.by_id.insert((7, created), ProcessNet::default());
+        let first = monitor.endpoint_sample(consumer.shared.drain_endpoints(), &base);
+        assert!(first.enabled && !first.measured && first.rows.is_empty());
+        feed_endpoint(&mut consumer, 10, since - 1); // Buffered before activation.
+        feed_endpoint(&mut consumer, 10, since + 1);
+        feed_endpoint(&mut consumer, 11, since + 2);
+        flush(&mut consumer);
+        let measured = monitor.endpoint_sample(consumer.shared.drain_endpoints(), &base);
+        assert!(measured.measured);
+        assert_eq!(measured.rows.len(), 1);
+        let row = &measured.rows[0];
+        assert_eq!(
+            (row.created, row.send_bytes_per_sec, row.recv_bytes_per_sec),
+            (created, 200.0, 200.0)
+        );
+
+        feed_endpoint(&mut consumer, 10, since + 3);
+        flush(&mut consumer);
+        let reused = since + 100;
+        monitor.previous.insert(7, reused);
+        base.by_id.clear();
+        base.by_id.insert((7, reused), ProcessNet::default());
+        assert!(monitor
+            .endpoint_sample(consumer.shared.drain_endpoints(), &base)
+            .rows
+            .is_empty());
+
+        let key = read_endpoint(10, 0, &endpoint_payload(false, false)).unwrap();
+        let mut capped = EndpointBatch {
+            epoch: monitor.endpoint_epoch,
+            ready: true,
+            ..EndpointBatch::default()
+        };
+        for port in 0..=MAX_ENDPOINTS {
+            capped.add(
+                EndpointKey {
+                    remote_port: port as u16,
+                    ..key
+                },
+                PidBytes::default(),
+            );
+        }
+        assert_eq!(capped.rows.len(), MAX_ENDPOINTS);
+        let sample = monitor.endpoint_sample(capped, &base);
+        assert!(sample.limited && !sample.measured && sample.rows.is_empty());
+
+        feed_endpoint(&mut consumer, 10, since + 101);
+        monitor.set_endpoint_capture(false);
+        flush(&mut consumer); // The in-flight old epoch must be discarded.
+        assert_eq!(consumer.endpoints.rows.capacity(), 0);
+        assert!(consumer.shared.drain_endpoints().rows.is_empty());
+        assert!(
+            !monitor
+                .endpoint_sample(EndpointBatch::default(), &base)
+                .enabled
+        );
     }
 
     #[test]
@@ -1301,35 +1831,71 @@ mod tests {
     }
 
     #[test]
-    fn lost_events_make_two_intervals_unmeasured() {
+    fn lost_events_wait_for_consumer_ack_and_a_clean_flush_for_both_aggregates() {
         let mut monitor = fake_running();
+        monitor.set_endpoint_capture(true);
+        let shared = Arc::clone(&monitor.session.as_ref().unwrap().shared);
+        let mut consumer = consumer();
+        consumer.shared = Arc::clone(&shared);
+        flush(&mut consumer);
+        let event_time = consumer.endpoint_since + 1;
+        feed_endpoint(&mut consumer, 10, event_time);
+        flush(&mut consumer);
+        feed_endpoint(&mut consumer, 10, event_time);
+        assert!(!consumer.batch.is_empty() && !consumer.endpoints.rows.is_empty());
+        assert!(!shared.totals.lock().unwrap().is_empty());
+        assert!(!shared.endpoints.lock().unwrap().rows.is_empty());
         let t0 = Instant::now();
-        let at = |n: u64| t0 + Duration::from_secs(n);
-        let processes = [proc(100, 1)];
-        let traffic = || bytes(&[(100, 10, 10, 5)]);
-        // Losses before the first sample are outside any reported interval.
-        assert!(
-            !monitor
-                .account(&processes, at(0), traffic(), Ok(3), None)
-                .measured
-        );
-        assert!(
-            monitor
-                .account(&processes, at(1), traffic(), Ok(3), None)
-                .measured
-        );
-        for n in [2, 3] {
-            let sample = monitor.account(&processes, at(n), traffic(), Ok(9), None);
+        let at = |n: u64| t0 + Duration::from_millis(n * 250);
+        let processes = [proc(7, 1)];
+        let traffic = || bytes(&[(7, 10, 10, event_time)]);
+        // Include losses before the first sample: buffered data is still unsafe.
+        // Fast sampling must never substitute for a consumer acknowledgement.
+        for n in 0..9 {
+            let sample = monitor.account(&processes, at(n), traffic(), Ok(3), None);
             assert!(!sample.measured, "interval {n}");
             assert_eq!(sample.reason.as_deref(), Some("Network events dropped"));
             assert!(sample.by_id.is_empty());
-            assert_eq!(sample.interval_seconds, 1.0);
+            assert_eq!(sample.interval_seconds, if n == 0 { 0.0 } else { 0.25 });
+            assert!(
+                !monitor
+                    .endpoint_sample(EndpointBatch::default(), &sample)
+                    .measured
+            );
         }
+        assert_eq!(shared.reset.load(Ordering::Acquire), 1);
+        assert_eq!(shared.reset_ack.load(Ordering::Acquire), 0);
+        flush(&mut consumer);
+        assert_eq!(shared.reset_ack.load(Ordering::Acquire), 1);
+        assert!(consumer.batch.is_empty() && consumer.endpoints.rows.is_empty());
+        assert!(shared.drain().is_empty() && shared.drain_endpoints().rows.is_empty());
+        assert_eq!(consumer.endpoints.epoch, monitor.endpoint_epoch);
+        // First observe the ack, then one full flush period and a clean drain.
+        for n in 9..14 {
+            let sample = monitor.account(&processes, at(n), traffic(), Ok(3), None);
+            assert!(!sample.measured, "recovery interval {n}");
+            assert!(
+                !monitor
+                    .endpoint_sample(EndpointBatch::default(), &sample)
+                    .measured
+            );
+        }
+        flush(&mut consumer);
+        let sample = monitor.account(&processes, at(14), traffic(), Ok(3), None);
+        assert!(sample.measured);
+        // Endpoint capture retains its own initial full-interval priming rule.
         assert!(
-            monitor
-                .account(&processes, at(4), traffic(), Ok(9), None)
+            !monitor
+                .endpoint_sample(shared.drain_endpoints(), &sample)
                 .measured
         );
+        feed_endpoint(&mut consumer, 10, event_time + 1);
+        flush(&mut consumer);
+        let sample = monitor.account(&processes, at(15), shared.drain(), Ok(3), None);
+        let endpoints = monitor.endpoint_sample(shared.drain_endpoints(), &sample);
+        assert!(sample.measured && endpoints.measured);
+        assert_eq!(sample.by_id[&(7, 1)].send_bytes_per_sec, 1600.0);
+        assert_eq!(endpoints.rows[0].send_bytes_per_sec, 1600.0);
     }
 
     #[test]
@@ -1344,9 +1910,29 @@ mod tests {
             failed.reason.as_deref(),
             Some("Cannot check network event loss (error 5)")
         );
+        assert_eq!(
+            monitor
+                .session
+                .as_ref()
+                .unwrap()
+                .shared
+                .reset
+                .load(Ordering::Acquire),
+            1
+        );
         // Losses during the failed interval still show up against baseline 0.
         let after = monitor.account(&[], at(2), HashMap::new(), Ok(1), None);
         assert_eq!(after.reason.as_deref(), Some("Network events dropped"));
+        assert_eq!(
+            monitor
+                .session
+                .as_ref()
+                .unwrap()
+                .shared
+                .reset
+                .load(Ordering::Acquire),
+            2
+        );
     }
 
     #[test]

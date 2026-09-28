@@ -848,11 +848,25 @@ pub(super) unsafe fn chart(
     color: u32,
     style: ChartStyle,
 ) {
+    chart_with((*p).dpi, &(*p).fonts, dc, r, points, ceiling, color, style);
+}
+
+/// Same chart renderer for independent native windows at their own DPI.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn chart_with(
+    dpi: i32,
+    fonts: &fonts::Fonts,
+    dc: HDC,
+    r: RECT,
+    points: &[(Instant, f64)],
+    ceiling: Option<f64>,
+    color: u32,
+    style: ChartStyle,
+) {
     if r.right <= r.left || r.bottom <= r.top {
         return;
     }
     let c = colors();
-    let dpi = (*p).dpi;
     let hair = gfx::hairline(dpi);
     let (background, radius, area, width) = match style {
         ChartStyle::Main => (c.bg, 4.0, argb(color, 0.22), 1.5),
@@ -932,7 +946,7 @@ pub(super) unsafe fn chart(
     if style == ChartStyle::Main && points.iter().filter(|v| v.1.is_finite()).count() < 2 {
         label(
             dc,
-            (*p).fonts.small,
+            fonts.small,
             c.muted,
             tr("데이터 수집 중", "Collecting data"),
             r,

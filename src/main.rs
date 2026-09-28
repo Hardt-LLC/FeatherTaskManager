@@ -5,6 +5,7 @@
 compile_error!("Feather Task Manager currently targets 64-bit Windows (x86_64-pc-windows-msvc).");
 
 mod actions;
+mod fileetw;
 mod gpu;
 mod hardware;
 mod i18n;
@@ -15,6 +16,7 @@ mod process_metadata;
 mod process_tree;
 mod registry;
 mod replacement;
+mod resource;
 mod sampler;
 mod services;
 mod smbios;

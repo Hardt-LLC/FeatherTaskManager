@@ -21,7 +21,15 @@ pub(super) unsafe fn save_client(p: *mut App, path: &Path) -> Result<(), String>
     if p.is_null() || (*p).hwnd.is_null() {
         return Err("Preview requires an initialized application window".into());
     }
-    let hwnd = (*p).hwnd;
+    // Settle the task manager's animated controls before rendering.
+    (*p).anim.finish_all();
+    table::settle((*p).list);
+    table::settle((*p).perf_list);
+    save_window((*p).hwnd, path)
+}
+
+/// Render only a Feather-owned window and its own child controls.
+pub(super) unsafe fn save_window(hwnd: HWND, path: &Path) -> Result<(), String> {
     let mut rect: RECT = zeroed();
     if GetClientRect(hwnd, &mut rect) == 0 {
         return Err(win32_error("GetClientRect"));
@@ -37,9 +45,6 @@ pub(super) unsafe fn save_client(p: *mut App, path: &Path) -> Result<(), String>
     // A preview is a settled state: running tweens (a page switch's nav
     // slide, hover fades) jump to their end — no message loop ticks them
     // here. Stage a mid-animation state with `anim.set` instead.
-    (*p).anim.finish_all();
-    table::settle((*p).list);
-    table::settle((*p).perf_list);
     let surface = Surface::new(width, height)?;
     // Initialize every pixel, including pixels outside any native child's paint
     // region. Root WM_PRINTCLIENT paints the real app background over this.

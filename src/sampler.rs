@@ -37,10 +37,19 @@ pub struct Process {
     /// Percent of the entire machine, not percent of a single logical CPU.
     pub cpu_percent: f64,
     pub working_set: u64,
+    /// Private resident bytes from the same bulk snapshot (not private commit).
+    pub private_working_set: u64,
+    /// Hard faults requiring disk reads per second; absent until a full interval.
+    pub hard_faults_per_sec: Option<f64>,
     /// Private committed bytes; this is not the private resident working set.
     pub private_bytes: u64,
     /// All read, write and other I/O transfer bytes per second (not disk only).
     pub io_bytes_per_sec: f64,
+    /// All read/write transfer bytes, including files, network and devices.
+    /// These must never be labelled as physical disk throughput.
+    /// NaN until a full interval, on PID reuse, or if that counter regresses.
+    pub io_read_bytes_per_sec: f64,
+    pub io_write_bytes_per_sec: f64,
     /// Utilization of the process's busiest GPU engine in percent (0-100),
     /// joined in by the UI monitor from `performance::ProcessGpuTracker`;
     /// `None` when not measured for this interval. The sampler never sets it.
@@ -49,6 +58,8 @@ pub struct Process {
     /// from `netetw::NetworkMonitor` (elevated only); `None` when not
     /// measured. The sampler never sets it.
     pub network_bytes_per_sec: Option<f64>,
+    pub network_send_bytes_per_sec: Option<f64>,
+    pub network_recv_bytes_per_sec: Option<f64>,
     pub threads: u32,
     pub handles: u32,
     pub session_id: u32,
@@ -80,6 +91,9 @@ struct Counters {
     created: u64,
     cpu: u64,
     io: u64,
+    io_read: u64,
+    io_write: u64,
+    hard_faults: u32,
     seen: u64,
 }
 
@@ -187,6 +201,7 @@ impl Sampler {
             let pid = sample.process.pid;
             let before = self.previous.get(&pid).copied();
             let (cpu, io) = rates(before, sample.counters, seconds, cpu_budget);
+            let (read, write, faults) = resource_rates(before, sample.counters, seconds);
             sample.counters.seen = self.generation;
             self.previous.insert(pid, sample.counters);
             if pid == 0 {
@@ -197,6 +212,9 @@ impl Sampler {
             }
             sample.process.cpu_percent = cpu;
             sample.process.io_bytes_per_sec = io;
+            sample.process.io_read_bytes_per_sec = read;
+            sample.process.io_write_bytes_per_sec = write;
+            sample.process.hard_faults_per_sec = faults;
             processes.push(sample.process);
         }
         self.previous
@@ -299,6 +317,31 @@ fn rates(before: Option<Counters>, now: Counters, seconds: f64, cpu_budget: f64)
     (cpu.clamp(0.0, 100.0), io)
 }
 
+fn resource_rates(
+    before: Option<Counters>,
+    now: Counters,
+    seconds: f64,
+) -> (f64, f64, Option<f64>) {
+    let Some(before) = before.filter(|old| old.created == now.created) else {
+        return (f64::NAN, f64::NAN, None);
+    };
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return (f64::NAN, f64::NAN, None);
+    }
+    (
+        now.io_read
+            .checked_sub(before.io_read)
+            .map_or(f64::NAN, |bytes| bytes as f64 / seconds),
+        now.io_write
+            .checked_sub(before.io_write)
+            .map_or(f64::NAN, |bytes| bytes as f64 / seconds),
+        // A reset or 32-bit wrap is unmeasured, not a burst of billions of faults.
+        now.hard_faults
+            .checked_sub(before.hard_faults)
+            .map(|faults| f64::from(faults) / seconds),
+    )
+}
+
 fn parse_processes(bytes: &[u8], previous_count: usize) -> Result<Vec<ProcessSample>, String> {
     let invalid = || "Windows returned a malformed native process record".to_owned();
     if bytes.len() < HEADER_BYTES {
@@ -366,6 +409,7 @@ fn parse_processes(bytes: &[u8], previous_count: usize) -> Result<Vec<ProcessSam
                 created,
                 cpu_percent: 0.0,
                 working_set: u64_at(144),
+                private_working_set: u64_at(8),
                 private_bytes: u64_at(200),
                 io_bytes_per_sec: 0.0,
                 gpu_percent: None,
@@ -383,6 +427,9 @@ fn parse_processes(bytes: &[u8], previous_count: usize) -> Result<Vec<ProcessSam
                 io: u64_at(232)
                     .saturating_add(u64_at(240))
                     .saturating_add(u64_at(248)),
+                io_read: u64_at(232),
+                io_write: u64_at(240),
+                hard_faults: u32_at(16),
                 seen: 0,
             },
         });
@@ -437,7 +484,7 @@ mod tests {
             created,
             cpu,
             io,
-            seen: 0,
+            ..Counters::default()
         }
     }
 
@@ -485,6 +532,41 @@ mod tests {
             rates(Some(counter(1, 0, 0)), counter(1, 10, 10), 0.0, 0.0),
             (0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn resource_rates_keep_io_separate_and_reject_fault_counter_reset_or_pid_reuse() {
+        let before = Counters {
+            created: 7,
+            io_read: 100,
+            io_write: 80,
+            hard_faults: 20,
+            ..Counters::default()
+        };
+        let now = Counters {
+            created: 7,
+            io_read: 300,
+            io_write: 100,
+            hard_faults: 26,
+            ..Counters::default()
+        };
+        assert_eq!(
+            resource_rates(Some(before), now, 2.0),
+            (100.0, 10.0, Some(3.0))
+        );
+        for (read, write, faults) in [
+            resource_rates(None, now, 2.0),
+            resource_rates(Some(before), Counters { created: 8, ..now }, 2.0),
+            resource_rates(Some(now), before, 2.0),
+            resource_rates(Some(before), now, f64::NAN),
+        ] {
+            assert!(read.is_nan() && write.is_nan());
+            assert_eq!(faults, None);
+        }
+        let (read, write, faults) =
+            resource_rates(Some(before), Counters { io_read: 99, ..now }, 2.0);
+        assert!(read.is_nan());
+        assert_eq!((write, faults), (10.0, Some(3.0)));
     }
 
     #[test]
@@ -538,12 +620,16 @@ mod tests {
     #[test]
     fn parses_native_fields_and_utf16_without_dereferencing_native_pointer() {
         let mut bytes = record(123, &"테스트.exe".encode_utf16().collect::<Vec<_>>());
+        bytes[8..16].copy_from_slice(&100_000u64.to_le_bytes());
+        bytes[16..20].copy_from_slice(&42u32.to_le_bytes());
         bytes[144..152].copy_from_slice(&123_456u64.to_le_bytes());
         bytes[200..208].copy_from_slice(&654_321u64.to_le_bytes());
         let result = parse_processes(&bytes, 0).unwrap();
         assert_eq!(result[0].process.pid, 123);
         assert_eq!(result[0].process.name, "테스트.exe");
         assert_eq!(result[0].process.working_set, 123_456);
+        assert_eq!(result[0].process.private_working_set, 100_000);
+        assert_eq!(result[0].counters.hard_faults, 42);
         assert_eq!(result[0].process.private_bytes, 654_321);
     }
 

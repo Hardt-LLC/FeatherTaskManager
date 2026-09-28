@@ -201,6 +201,7 @@ pub(super) unsafe fn apply_theme(p: *mut App) {
     present_all(p, suspended);
     // Layered popups keep the palette they were opened with; repaint them.
     popup::theme_changed();
+    resource_monitor::settings_changed(p);
 }
 unsafe fn combo(p: *mut App, id: usize, label: &str) -> HWND {
     controls::select(p, label, id)
@@ -445,10 +446,7 @@ pub(super) unsafe fn command(p: *mut App, id: usize, notification: u32) -> bool 
             let text = performance_text(p);
             report_copy(p, &text);
         }
-        RESOURCE_MONITOR => begin_action(
-            p,
-            Action::SystemTool(crate::actions::SystemTool::ResourceMonitor),
-        ),
+        RESOURCE_MONITOR => resource_monitor::open(p),
         EXPAND_ALL => {
             (*p).collapsed.clear();
             // The grouped view: open every app that has processes.
