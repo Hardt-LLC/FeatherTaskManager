@@ -5,8 +5,9 @@ use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr::null};
 use crate::{i18n::tr, process_tree::TerminationPlan};
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0},
+    Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::{
+        Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE},
         SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
         Threading::{
             GetCurrentProcessId, GetPriorityClass, GetProcessInformation, GetProcessTimes,
@@ -20,7 +21,13 @@ use windows_sys::Win32::{
             REALTIME_PRIORITY_CLASS,
         },
     },
-    UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+    UI::{
+        Shell::{
+            ShellExecuteExW, ShellExecuteW, SEE_MASK_FLAG_NO_UI, SEE_MASK_INVOKEIDLIST,
+            SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+        },
+        WindowsAndMessaging::SW_SHOWNORMAL,
+    },
 };
 
 struct ProcessHandle(HANDLE);
@@ -52,6 +59,43 @@ fn creation_time(handle: HANDLE) -> Result<u64, String> {
         )));
     }
     Ok(filetime_value(created))
+}
+
+/// Resolve a live process identity for navigation. The liveness check and
+/// creation time use one retained handle, and never wait for the process.
+pub fn running_process_created(pid: u32) -> Result<u64, String> {
+    let exited = || {
+        tr(
+            "프로세스가 실행 중이 아닙니다. 목록을 새로 고치세요.",
+            "The process is not running. Refresh the list.",
+        )
+        .to_owned()
+    };
+    if pid == 0 {
+        return Err(exited());
+    }
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if raw.is_null() {
+        return Err(last_error(tr(
+            "프로세스를 열 수 없습니다",
+            "Cannot open the process",
+        )));
+    }
+    let handle = ProcessHandle(raw);
+    match unsafe { WaitForSingleObject(handle.0, 0) } {
+        WAIT_TIMEOUT => creation_time(handle.0),
+        WAIT_OBJECT_0 => Err(exited()),
+        _ => Err(last_error(tr(
+            "프로세스 실행 상태를 확인할 수 없습니다",
+            "Cannot verify whether the process is running",
+        ))),
+    }
 }
 
 fn open_checked(
@@ -537,6 +581,57 @@ pub fn reveal_executable(pid: u32, expected_created: u64) -> Result<(), String> 
     shell_execute("open", explorer.as_os_str(), Some(OsStr::new(&parameters)))
 }
 
+/// Show the checked executable's native file properties on the action worker.
+/// The verb is fixed and no executable arguments or process waits are used.
+pub fn show_properties(pid: u32, expected_created: u64) -> Result<(), String> {
+    let path = executable_path(pid, expected_created)?;
+    let verb = wide(OsStr::new("properties"));
+    let file = wide(OsStr::new(&path));
+
+    // Shell extensions may require an STA. Balance S_OK and S_FALSE alike;
+    // a failed initialization (including an incompatible apartment) owns none.
+    let initialized = unsafe {
+        CoInitializeEx(
+            null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
+    if initialized < 0 {
+        return Err(format!(
+            "{} (HRESULT 0x{:08X})",
+            tr(
+                "파일 속성을 위한 Windows 셸을 초기화할 수 없습니다",
+                "Cannot initialize the Windows shell for file properties"
+            ),
+            initialized as u32
+        ));
+    }
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+    let _apartment = Apartment;
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        // INVOKEIDLIST enables the properties context-menu verb; NOASYNC is
+        // required because the job worker has no Windows message loop.
+        fMask: SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
+    };
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        return Err(last_error(tr(
+            "실행 파일의 속성을 열 수 없습니다",
+            "Cannot open the executable's properties",
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SystemTool {
     ResourceMonitor,
@@ -687,8 +782,13 @@ mod tests {
         let pid = unsafe { GetCurrentProcessId() };
         let created = creation_time(unsafe { GetCurrentProcess() }).unwrap();
         assert_ne!(created, 0);
+        assert_eq!(running_process_created(pid).unwrap(), created);
+        assert!(running_process_created(0).is_err());
         assert!(executable_path(pid, 0).is_err());
         assert!(executable_path(pid, created + 1).is_err());
+        // Invalid identities fail before COM or a native properties UI opens.
+        assert!(show_properties(pid, 0).is_err());
+        assert!(show_properties(pid, created + 1).is_err());
         let actual = executable_path(pid, created).unwrap();
         assert_eq!(
             std::path::Path::new(&actual),

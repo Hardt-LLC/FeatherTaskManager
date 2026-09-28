@@ -42,10 +42,11 @@ Release executables and installers are signed by **HARDT** through Azure Artifac
 
 - Open **Processes** to choose **App groups**, **List view** or **Tree view**. Select a process to end it or its tree after confirmation.
 - Open **Performance**, **Startup apps** or **Services** for monitoring and management.
+- Use a process's **⋯ / right-click menu → File properties** or **Go to services**. In Services, **Go to process** selects its current host. Search `pid:1234` for an exact PID match; clear search to return to the full list.
 - Open **Settings** to change language, theme, refresh rate, start page and window behavior.
 - Use **⋯ → Show / hide live telemetry** for selected-process CPU, memory and all-I/O history.
 - Select **Processes → Nuclear Zombie** (or `Ctrl+K` → "memory") to clean up memory and list zombie processes. Efficiency mode is in the **⋯** and right-click menus.
-- `—` means unmeasured. Per-process GPU uses Windows Task Manager's rule (the busiest engine); per-process network is measured only when Feather runs as administrator. Startup impact and CPU temperature are not collected.
+- `—` means unmeasured. Per-process GPU uses Windows Task Manager's rule (the busiest engine); per-process network is measured only when Feather runs as administrator. Startup impact and CPU package temperature are not collected. Performance shows firmware-provided ACPI thermal zones where available, labeled by zone rather than as CPU temperature. Sensors refresh every 5 seconds; unavailable sensors retry every 60 seconds without installing a driver.
 - Turn on **Settings → Always run as administrator** to start elevated every time (per-process network, full zombie scans). It applies to the installed Feather only: every start, including each `Ctrl+Shift+Esc` even while an elevated window is open, shows the Windows UAC prompt, and Feather keeps running with standard rights if you decline. A portable copy is never elevated automatically; **Processes → ⋯ → Run as administrator** elevates the running copy once.
 - To replace Windows Task Manager, install with Setup first, then select **Settings → Replace Windows Task Manager** and approve the administrator prompt. This enables `Ctrl+Shift+Esc` and `Ctrl+Alt+Delete → Task Manager`. Turn the same setting off to restore Windows Task Manager before manually deleting the app.
 
@@ -71,6 +72,8 @@ cargo build --release --locked
 ```
 
 Run `target\release\FeatherTaskManager.exe`. For signed installers and release packaging, see [SIGNING.md](SIGNING.md).
+
+For bounded performance measurements and the development improvement cycle, see [PERFORMANCE_LOOP.md](PERFORMANCE_LOOP.md). Feature priorities and completed work are tracked in [IMPROVEMENTS.md](IMPROVEMENTS.md).
 
 ## License
 

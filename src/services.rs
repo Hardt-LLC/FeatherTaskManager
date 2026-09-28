@@ -183,6 +183,35 @@ fn query_status(service: &ServiceHandle) -> Result<SERVICE_STATUS_PROCESS, Strin
     Ok(status)
 }
 
+/// Fresh host PID for navigation, requiring status access only. Zero means no
+/// stable host: SCM does not guarantee a valid PID while starting or stopping.
+pub fn process_id(name: &str) -> Result<u32, String> {
+    let wide = wide_name(name)?;
+    let manager = open_manager(SC_MANAGER_CONNECT)?;
+    let raw = unsafe { OpenServiceW(manager.0, wide.as_ptr(), SERVICE_QUERY_STATUS) };
+    if raw.is_null() {
+        return Err(service_error(
+            tr(
+                "서비스 상태를 확인할 수 없습니다",
+                "Cannot read the service status",
+            ),
+            unsafe { GetLastError() },
+        ));
+    }
+    let service = ServiceHandle(raw);
+    let status = query_status(&service)?;
+    Ok(
+        if matches!(
+            status.dwCurrentState,
+            SERVICE_RUNNING | SERVICE_PAUSE_PENDING | SERVICE_PAUSED | SERVICE_CONTINUE_PENDING
+        ) {
+            status.dwProcessId
+        } else {
+            0
+        },
+    )
+}
+
 pub fn details(name: &str) -> Result<ServiceDetails, String> {
     let wide = wide_name(name)?;
     let manager = open_manager(SC_MANAGER_CONNECT)?;
@@ -606,6 +635,7 @@ mod tests {
             assert!(start(name).is_err());
             assert!(stop(name).is_err());
             assert!(details(name).is_err());
+            assert!(process_id(name).is_err());
             assert!(restart(name).is_err());
         }
         assert!(wide_name(&"a".repeat(257)).is_err());

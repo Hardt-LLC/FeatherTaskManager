@@ -157,11 +157,16 @@ for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
                     $null = $launched.CloseMainWindow()
                     if (-not $launched.WaitForExit(1000)) {
                         $launched.Kill()
-                        $null = $launched.WaitForExit(3000)
+                        if (-not $launched.WaitForExit(3000)) {
+                            throw 'The launched process did not exit within the cleanup deadline.'
+                        }
                     }
                 }
             }
             catch {
+                $anyFailure = $true
+                $results[$results.Count - 1].status = 'error'
+                $results[$results.Count - 1] | Add-Member -NotePropertyName cleanupError -NotePropertyValue $_.Exception.Message
                 Write-Warning "Could not finish cleanup of our launched process ${processIdForReport}: $($_.Exception.Message)"
             }
             finally {

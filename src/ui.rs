@@ -46,6 +46,7 @@ mod gfx;
 mod icons;
 mod interactions;
 mod layout;
+mod navigation;
 mod nuclear;
 mod paint;
 mod popup;
@@ -253,6 +254,7 @@ enum Action {
     RunTask(String),
     EndTree(TerminationPlan),
     Reveal(u32, u64),
+    Properties(u32, u64),
     Toggle(Box<StartupEntry>, bool),
     Start(String, String),
     Stop(String, String),
@@ -260,6 +262,7 @@ enum Action {
     ReplaceTaskManager(bool, Page),
 }
 enum Job {
+    Navigate(navigation::Request),
     ProcessDetails(u32, u64),
     ServiceDetails(String),
     Startup,
@@ -274,6 +277,7 @@ enum Job {
     Stop,
 }
 enum JobResult {
+    Navigate(navigation::Request, Result<navigation::Target, String>),
     ProcessDetails(u32, u64, Result<crate::actions::ProcessSettings, String>),
     ServiceDetails(String, Result<crate::services::ServiceDetails, String>),
     Startup(Result<Vec<StartupEntry>, String>),
@@ -882,6 +886,10 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
         };
         let result = match job {
             Job::Stop => break,
+            Job::Navigate(request) => {
+                let result = navigation::resolve(&request);
+                JobResult::Navigate(request, result)
+            }
             Job::Cleanup(..) => unreachable!(),
             Job::ProcessDetails(pid, created) => JobResult::ProcessDetails(
                 pid,
@@ -970,6 +978,11 @@ fn job_worker(hwnd: usize, jobs: Receiver<Job>, complete: Sender<JobResult>) {
                         crate::actions::reveal_executable(pid, created),
                         Page::Processes,
                         tr("파일 위치를 열었습니다.", "Opened the file location.").into(),
+                    ),
+                    Action::Properties(pid, created) => (
+                        crate::actions::show_properties(pid, created),
+                        Page::Processes,
+                        tr("파일 속성을 열었습니다.", "Opened file properties.").into(),
                     ),
                     Action::Toggle(entry, enabled) => (
                         crate::startup::set_enabled(&entry, enabled),
@@ -3145,6 +3158,7 @@ unsafe fn drain_jobs(p: *mut App) {
     while let Ok(result) = (*p).results.try_recv() {
         let identity = selected_identity(p);
         match result {
+            JobResult::Navigate(request, result) => navigation::finish(p, request, result),
             JobResult::ProcessDetails(pid, created, result) => {
                 if (*p).process_detail_identity == Some((pid, created)) {
                     (*p).process_settings = result.ok();
@@ -3288,9 +3302,7 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
                     .snapshot
                     .as_ref()
                     .and_then(|s| s.processes.get(row))
-                    .is_some_and(|s| {
-                        s.name.to_lowercase().contains(filter) || s.pid.to_string().contains(filter)
-                    }),
+                    .is_some_and(|s| navigation::matches_search(filter, s.pid, &[&s.name])),
                 // Name, publisher (the visible column), command, location.
                 Page::Startup => (&(*p).startup).get(row).is_some_and(|s| {
                     s.name.to_lowercase().contains(filter)
@@ -3302,9 +3314,7 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
                         || s.location.to_lowercase().contains(filter)
                 }),
                 Page::Services => (&(*p).services).get(row).is_some_and(|s| {
-                    s.name.to_lowercase().contains(filter)
-                        || s.display_name.to_lowercase().contains(filter)
-                        || s.pid.to_string().contains(filter)
+                    navigation::matches_search(filter, s.pid, &[&s.name, &s.display_name])
                 }),
                 Page::Performance | Page::Settings => false,
             }
@@ -3370,8 +3380,7 @@ unsafe fn rebuild(p: *mut App, identity: Option<Identity>) {
                 .iter()
                 .enumerate()
                 .filter(|(_, process)| {
-                    process.name.to_lowercase().contains(filter)
-                        || process.pid.to_string().contains(filter)
+                    navigation::matches_search(filter, process.pid, &[&process.name])
                 })
                 .map(|(index, _)| index)
                 .collect::<HashSet<_>>()
@@ -4653,6 +4662,119 @@ mod tests {
         test.select(0);
         unsafe {
             assert_eq!(IsWindowEnabled((*test.p).primary), 0);
+        }
+    }
+    #[test]
+    fn navigation_roundtrip_preserves_exact_identity_and_ignores_stale_source() {
+        for (group_mode, tree_mode) in [(false, false), (true, false), (false, true)] {
+            let test = TestWindow::new();
+            let parent = process(10, 100, "Parent.exe", 30, 0.0);
+            let mut host = process(12, 200, "Host.exe", 20, 0.0);
+            host.parent_pid = 10;
+            let id = ProcessIdentity::from(&host);
+            unsafe {
+                (*test.p).group_mode = group_mode;
+                (*test.p).tree_mode = tree_mode;
+                (*test.p).window_pids = HashSet::from([10]);
+                (*test.p).last_window_scan = Some(Instant::now());
+                (*test.p).collapsed.insert(ProcessIdentity::from(&parent));
+            }
+            test.snapshot(vec![parent, host, process(120, 300, "Other.exe", 10, 0.0)]);
+            test.search("pid:12");
+            test.select(
+                (0..test.count())
+                    .find(|&row| test.text(row, 1) == "12")
+                    .unwrap(),
+            );
+            let request = navigation::Request::Services(id);
+            unsafe {
+                navigation::begin(test.p, request.clone());
+            }
+            assert!(test
+                .jobs
+                .try_iter()
+                .any(|job| matches!(job, Job::Navigate(_))));
+            test.result(JobResult::Navigate(
+                request,
+                Ok(navigation::Target::Services(
+                    vec![
+                        service("HostService", SERVICE_RUNNING, 12, Some(2)),
+                        service("OtherService", SERVICE_RUNNING, 120, Some(2)),
+                    ],
+                    12,
+                )),
+            ));
+            assert_eq!(test.count(), 1);
+            assert_eq!(
+                test.identity(),
+                Some(Identity::Service("HostService".into()))
+            );
+
+            let request = navigation::Request::Process("HostService".into());
+            unsafe {
+                navigation::begin(test.p, request.clone());
+            }
+            test.result(JobResult::Navigate(
+                request,
+                Ok(navigation::Target::Process(id)),
+            ));
+            assert_eq!(test.identity(), Some(Identity::Process(12, 200)));
+            assert!((0..test.count()).all(|row| test.text(row, 1) != "120"));
+            unsafe {
+                assert_eq!(
+                    ((*test.p).group_mode, (*test.p).tree_mode),
+                    (group_mode, tree_mode)
+                );
+                assert!((*test.p).collapsed.contains(&ProcessIdentity {
+                    pid: 10,
+                    created: 100
+                }));
+            }
+
+            // A different page must discard both delayed success and its target.
+            let request = navigation::Request::Services(id);
+            unsafe {
+                navigation::begin(test.p, request.clone());
+            }
+            test.page(Page::Performance);
+            test.result(JobResult::Navigate(
+                request,
+                Ok(navigation::Target::Services(
+                    vec![service("StaleService", SERVICE_RUNNING, 12, Some(2))],
+                    12,
+                )),
+            ));
+            unsafe {
+                assert_eq!((*test.p).page, Page::Performance);
+            }
+
+            // A different selected process must also discard a delayed error.
+            test.page(Page::Processes);
+            test.search("pid:12");
+            test.select(
+                (0..test.count())
+                    .find(|&row| test.text(row, 1) == "12")
+                    .unwrap(),
+            );
+            let request = navigation::Request::Services(id);
+            unsafe {
+                navigation::begin(test.p, request.clone());
+            }
+            test.search("pid:120");
+            test.select(
+                (0..test.count())
+                    .find(|&row| test.text(row, 1) == "120")
+                    .unwrap(),
+            );
+            test.result(JobResult::Navigate(
+                request,
+                Err("stale navigation failure".into()),
+            ));
+            assert_eq!(test.identity(), Some(Identity::Process(120, 300)));
+            unsafe {
+                assert!((*test.p).error.is_none());
+                assert!(!(*test.p).busy);
+            }
         }
     }
     #[test]
