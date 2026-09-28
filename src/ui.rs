@@ -811,6 +811,12 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
     // user comes back. The sampler stays warm across page switches; only a
     // pause (also minimized or modal) drops it, and that gap is recorded.
     let mut perf: Option<PerfSampler> = None;
+    // Firmware temperatures keep their cache and retry schedule across those
+    // pauses: the sampler moves out of a dropped PerfSampler into the next.
+    let mut thermal = crate::thermal::ThermalSampler::default();
+    let resume_perf = |thermal: &mut crate::thermal::ThermalSampler| {
+        PerfSampler::new().map(|sampler| sampler.with_thermal(std::mem::take(thermal)))
+    };
     // One GPU attribution tracker and one network trace for the monitor's
     // lifetime; the trace (an ETW session, elevated only) ends when this
     // thread returns on Stop.
@@ -849,7 +855,7 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
             let resource_data = resource.sample(&resource_request, processes);
             let resource_files = files.sample(processes, elapsed);
             if perf.is_none() {
-                match PerfSampler::new() {
+                match resume_perf(&mut thermal) {
                     Ok(s) => perf = Some(s),
                     Err(e) => {
                         let value = MonitorSample {
@@ -947,7 +953,9 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 paused = p;
                 if paused {
                     // Rates after a pause start over (the UI records the gap).
-                    perf = None;
+                    if let Some(sampler) = perf.take() {
+                        thermal = sampler.into_thermal();
+                    }
                 }
                 // A sample only milliseconds after the previous one measures
                 // CPU over a sliver of time: a needle at the start of every
@@ -960,7 +968,7 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 });
                 refresh = manual_refresh || (!paused && !recent);
                 if !paused && recent && perf.is_none() {
-                    if let Ok(mut sampler) = PerfSampler::new() {
+                    if let Ok(mut sampler) = resume_perf(&mut thermal) {
                         let _ = sampler.sample();
                         perf = Some(sampler);
                     }

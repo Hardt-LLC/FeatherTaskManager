@@ -484,6 +484,19 @@ impl PerfSampler {
         })
     }
 
+    /// Hands the thermal sampler to the next instance: a pause drops this
+    /// sampler's rate baselines, but the firmware query, its 5 s cache and
+    /// its 60 s retry belong to the monitor thread's lifetime.
+    pub fn into_thermal(self) -> ThermalSampler {
+        self.thermal
+    }
+
+    /// Continues with a thermal sampler handed over by [`Self::into_thermal`].
+    pub fn with_thermal(mut self, thermal: ThermalSampler) -> Self {
+        self.thermal = thermal;
+        self
+    }
+
     pub fn sample(&mut self) -> Result<PerfSnapshot, String> {
         let started = Instant::now();
         let mut snapshot = PerfSnapshot {
@@ -1975,6 +1988,19 @@ mod tests {
             array_name((ptr as usize + 1) as *const u16, &buffer, 8),
             None
         );
+    }
+
+    #[test]
+    fn thermal_schedule_survives_a_dropped_sampler() {
+        let mut first = PerfSampler::new().unwrap();
+        first.sample().unwrap();
+        // A pause drops the sampler; its thermal query was just read (or
+        // found missing), so the next instance must not read it again yet.
+        let thermal = first.into_thermal();
+        assert!(!thermal.due(Instant::now()));
+        let mut resumed = PerfSampler::new().unwrap().with_thermal(thermal);
+        resumed.sample().unwrap();
+        assert!(!resumed.into_thermal().due(Instant::now()));
     }
 
     /// Read-only native smoke: no service, startup or process mutations.
