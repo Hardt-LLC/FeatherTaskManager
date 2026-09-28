@@ -44,8 +44,6 @@ pub struct Row {
     pub path: String,
     pub read_bytes_per_sec: f64,
     pub write_bytes_per_sec: f64,
-    /// Unavailable: read/write request events do not establish completion time.
-    pub response_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -864,7 +862,6 @@ impl FileMonitor {
                 path: path.to_string(),
                 read_bytes_per_sec: counts.read as f64 / seconds,
                 write_bytes_per_sec: counts.write as f64 / seconds,
-                response_ms: None,
             })
             .collect();
         sample.measured = true;
@@ -1028,7 +1025,6 @@ mod tests {
             ),
             (500.0, 1000.0)
         );
-        assert!(sample.rows[0].response_ms.is_none());
         assert!(monitor
             .account(
                 &[process(20)],

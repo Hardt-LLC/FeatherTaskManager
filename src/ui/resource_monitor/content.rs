@@ -50,12 +50,6 @@ pub(super) fn columns(kind: Kind) -> Vec<table::Column> {
             col(tr("상태", "Status"), 96.0, false),
             col(tr("호스트 CPU", "Host CPU"), 100.0, true),
         ],
-        Kind::Handles => vec![
-            image(),
-            pid(),
-            col(tr("형식", "Type"), 90.0, false),
-            col(tr("핸들 이름", "Handle name"), 0.0, false),
-        ],
         Kind::Modules => vec![
             image(),
             pid(),
@@ -70,7 +64,6 @@ pub(super) fn columns(kind: Kind) -> Vec<table::Column> {
             col(tr("읽기", "Read"), 96.0, true),
             col(tr("쓰기", "Write"), 96.0, true),
             col(tr("합계", "Total"), 96.0, true),
-            col(tr("응답", "Response"), 86.0, true),
         ],
         Kind::Storage => vec![
             col(tr("볼륨", "Volume"), 0.0, false),
@@ -94,7 +87,6 @@ pub(super) fn columns(kind: Kind) -> Vec<table::Column> {
             col(tr("원격 주소", "Remote address"), 160.0, false),
             col(tr("포트", "Port"), 65.0, true),
             col(tr("상태", "State"), 120.0, false),
-            col(tr("지연 시간", "Latency"), 90.0, true),
         ],
         Kind::Listening => vec![
             image(),
@@ -110,6 +102,13 @@ pub(super) fn columns(kind: Kind) -> Vec<table::Column> {
         cols.insert(0, col("✓", 40.0, false));
     }
     cols
+}
+/// A [`Row::key`] from what identifies the row.
+pub(super) fn row_key(identity: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hasher);
+    hasher.finish()
 }
 fn integer(value: u64) -> Cell {
     Cell::num(value.to_string(), value as f64)
@@ -239,6 +238,7 @@ fn process_rows(s: &State, kind: Kind, at: Instant) -> Vec<Row> {
             }
             Row {
                 identity: Some((p.pid, p.created)),
+                key: row_key((p.pid, p.created)),
                 cells,
             }
         })
@@ -302,6 +302,7 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                         .and_then(|index| st.snapshot.as_ref()?.processes.get(*index));
                     Row {
                         identity: process.map(|p| (p.pid, p.created)),
+                        key: row_key(&service.name),
                         cells: vec![
                             Cell::text(&service.name),
                             if service.pid == 0 {
@@ -322,14 +323,6 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                     }
                 })
                 .collect()
-        }
-        Kind::Handles => {
-            empty = tr(
-                "핸들 이름 조회 미지원 · 전체 핸들 수는 작업 관리자 상세 열에서 확인하세요.",
-                "Handle names unavailable · see handle counts in Task Manager's detail columns.",
-            )
-            .into();
-            Vec::new()
         }
         Kind::Modules => {
             empty = if st.checked.len() != 1 {
@@ -358,7 +351,12 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 Cell::text(&module.path),
                                 bytes(module.size_bytes),
                             ]);
-                            Row { identity, cells }
+                            let key = row_key((id, &module.path));
+                            Row {
+                                identity,
+                                key,
+                                cells,
+                            }
                         })
                         .collect()
                 })
@@ -388,9 +386,13 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 rate(Some(row.read_bytes_per_sec)),
                                 rate(Some(row.write_bytes_per_sec)),
                                 rate(Some(row.read_bytes_per_sec + row.write_bytes_per_sec)),
-                                number(row.response_ms, |v| format!("{v:.1} ms")),
                             ]);
-                            Row { identity, cells }
+                            let key = row_key((row.pid, row.created, &row.path));
+                            Row {
+                                identity,
+                                key,
+                                cells,
+                            }
                         })
                         .collect()
                 } else {
@@ -435,7 +437,18 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 rate(Some(row.recv_bytes_per_sec)),
                                 rate(Some(row.send_bytes_per_sec + row.recv_bytes_per_sec)),
                             ]);
-                            Row { identity, cells }
+                            // Also the local endpoint, which the table does
+                            // not show: two connections to one server.
+                            let key = row_key((
+                                (row.pid, row.created, row.protocol),
+                                (row.local_addr, row.local_port),
+                                (row.remote_addr, row.remote_port),
+                            ));
+                            Row {
+                                identity,
+                                key,
+                                cells,
+                            }
                         })
                         .collect()
                 } else {
@@ -476,7 +489,6 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 e.remote_port
                                     .map_or_else(|| Cell::text("—"), |v| integer(v as u64)),
                                 Cell::text(e.state),
-                                Cell::text("—"),
                             ]);
                         } else {
                             cells.extend([
@@ -484,7 +496,16 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 Cell::text(tr("평가하지 않음", "Not evaluated")),
                             ]);
                         }
-                        Row { identity, cells }
+                        let key = row_key((
+                            (e.pid, e.created, e.protocol, e.listening),
+                            (&e.local_address, e.local_port),
+                            (&e.remote_address, e.remote_port),
+                        ));
+                        Row {
+                            identity,
+                            key,
+                            cells,
+                        }
                     })
                     .collect()
             })
@@ -501,6 +522,7 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                     .iter()
                     .map(|v| Row {
                         identity: None,
+                        key: row_key(&v.name),
                         cells: vec![
                             Cell::text(&v.name),
                             bytes(v.free_bytes),
@@ -557,8 +579,19 @@ pub(super) unsafe fn rebuild(s: *mut State, at: Instant) {
                 },
                 _ => Ordering::Equal,
             };
+            // Ties (equal rates, several rows of one process) keep one order
+            // across refreshes, whatever order the collectors produced.
+            fn names(r: &Row) -> Vec<&str> {
+                r.cells
+                    .iter()
+                    .filter(|c| c.number.is_none())
+                    .map(|c| c.text.as_str())
+                    .collect()
+            }
             (if descending { order.reverse() } else { order })
                 .then_with(|| a.identity.cmp(&b.identity))
+                .then_with(|| names(a).cmp(&names(b)))
+                .then_with(|| a.key.cmp(&b.key))
         });
         if rows.is_empty() && !(&(*s).query).is_empty() {
             empty = tr(
@@ -569,19 +602,18 @@ pub(super) unsafe fn rebuild(s: *mut State, at: Instant) {
         }
         let count = rows.len();
         let table = (&(*s).panels)[index].table;
-        // Native focus is an index, while CPU/IO sorting changes indices.
-        // Keep keyboard actions attached to the same process generation.
-        let selected = if kind.check() && !table.is_null() {
+        // Native focus is an index, while sorting and new rows move rows.
+        // Keep the selection (and keyboard actions) on the same row.
+        let selected = if table.is_null() {
+            None
+        } else {
             let row = SendMessageW(table, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
             (row >= 0).then_some(row as usize)
-        } else {
-            None
         };
-        let selected_identity = selected
+        let selected_key = selected
             .and_then(|row| (&(*s).panels)[index].rows.get(row))
-            .and_then(|row| row.identity);
-        let next_selected =
-            selected_identity.and_then(|id| rows.iter().position(|row| row.identity == Some(id)));
+            .map(|row| row.key);
+        let next_selected = selected_key.and_then(|key| rows.iter().position(|row| row.key == key));
         let count_changed = (&(*s).panels)[index].rows.len() != count;
         (&mut (*s).panels)[index].rows = rows;
         (&mut (*s).panels)[index].summary = summary;
@@ -776,28 +808,14 @@ impl table::Model for Model {
         self.row_height(0)
     }
     unsafe fn key(&self, row: usize) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let state = &*self.0;
-        let panel = &state.panels[self.1];
-        let Some(entry) = panel.rows.get(row) else {
-            return row as u64;
-        };
-        let Some((pid, created)) = entry.identity else {
-            return row as u64;
-        };
-        let process = created.rotate_left(13) ^ pid as u64;
-        if panel.kind.check() {
-            return process;
-        }
-        // One process owns several rows here (modules, endpoints, files,
-        // services); their text cells tell them apart, so a screen reader
+        // One process owns several rows in most panels (modules, endpoints,
+        // files, services): each keeps its own key, so a screen reader
         // announces each row instead of only the first of a process.
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        process.hash(&mut hasher);
-        for cell in entry.cells.iter().filter(|cell| cell.number.is_none()) {
-            cell.text.hash(&mut hasher);
-        }
-        hasher.finish()
+        let state = &*self.0;
+        state.panels[self.1]
+            .rows
+            .get(row)
+            .map_or(row as u64, |entry| entry.key)
     }
     unsafe fn header(&self, col: usize) -> table::HeaderCell {
         let state = &*self.0;

@@ -4391,6 +4391,14 @@ mod tests {
         }
     }
     #[test]
+    fn resource_monitor_rows_keep_their_identity_across_refreshes() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_rows_keep_identity(test.p);
+        }
+    }
+    #[test]
     fn counts_and_memory_use_thousands_separators() {
         assert_eq!(grouped(7u32), "7");
         assert_eq!(grouped(470u32), "470");

@@ -51,7 +51,7 @@ impl Tab {
     fn panels(self) -> &'static [Kind] {
         match self {
             Self::Overview => &[Kind::Cpu, Kind::Files, Kind::Traffic, Kind::Memory],
-            Self::Cpu => &[Kind::Cpu, Kind::Services, Kind::Handles, Kind::Modules],
+            Self::Cpu => &[Kind::Cpu, Kind::Services, Kind::Modules],
             Self::Memory => &[Kind::Memory, Kind::Physical],
             Self::Disk => &[Kind::Io, Kind::Files, Kind::Storage],
             Self::Network => &[Kind::Network, Kind::Traffic, Kind::Tcp, Kind::Listening],
@@ -66,7 +66,6 @@ enum Kind {
     Io,
     Network,
     Services,
-    Handles,
     Modules,
     Files,
     Storage,
@@ -91,7 +90,6 @@ impl Kind {
                 "Processes with network activity",
             ),
             Self::Services => tr("서비스", "Services"),
-            Self::Handles => tr("연결된 핸들", "Associated handles"),
             Self::Modules => tr("연결된 모듈", "Associated modules"),
             Self::Files => tr(
                 "파일 I/O 요청 · 캐시 포함",
@@ -127,6 +125,10 @@ impl Cell {
 }
 struct Row {
     identity: Option<(u32, u64)>,
+    /// Stable across refreshes: the process of a process row, otherwise what
+    /// the row is about (service, module, file, endpoint, volume) within
+    /// its process. Selection, sort ties and accessible keys follow it.
+    key: u64,
     cells: Vec<Cell>,
 }
 struct Panel {
@@ -406,7 +408,6 @@ pub(super) unsafe fn request(owner: *mut App) -> crate::resource::Request {
         endpoints: shown(Kind::Tcp) || shown(Kind::Listening),
         volumes: shown(Kind::Storage),
         modules: if shown(Kind::Modules) { selected } else { None },
-        handles: None,
     }
 }
 
@@ -1326,7 +1327,6 @@ pub(super) unsafe fn render_previews(owner: *mut App, dir: &std::path::Path) -> 
             endpoints: true,
             volumes: true,
             modules: identity,
-            handles: None,
         };
         let mut client = crate::resource::Client::default();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1411,6 +1411,73 @@ pub(super) unsafe fn render_previews(owner: *mut App, dir: &std::path::Path) -> 
 }
 
 #[cfg(test)]
+pub(super) unsafe fn assert_rows_keep_identity(owner: *mut App) {
+    create(owner, false);
+    let s = owner_state(owner);
+    assert!(!s.is_null());
+    let service = |name: &str| Service {
+        name: name.into(),
+        display_name: name.into(),
+        state: SERVICE_RUNNING,
+        pid: 0,
+        start_type: None,
+    };
+    set_tab(s, Tab::Cpu);
+    (*s).services = vec![service("Alpha"), service("Bravo")];
+    content::rebuild(s, Instant::now());
+    let index = (*s)
+        .panels
+        .iter()
+        .position(|p| p.kind == Kind::Services)
+        .unwrap();
+    let table = (&(*s).panels)[index].table;
+    let item = LVITEMW {
+        stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+        state: LVIS_SELECTED | LVIS_FOCUSED,
+        ..zeroed()
+    };
+    SendMessageW(table, LVM_SETITEMSTATE, 1, &item as *const LVITEMW as isize);
+    // A service sorted before the selected one moves its row: the
+    // selection stays on Bravo instead of on row 1.
+    (*s).services.insert(0, service("Aardvark"));
+    content::rebuild(s, Instant::now());
+    let selected = SendMessageW(table, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
+    assert_eq!(selected, 2);
+    assert_eq!((&(*s).panels)[index].rows[2].cells[0].text, "Bravo");
+    // Rows the collectors deliver in hash-map order, with equal rates, keep
+    // one order on every refresh.
+    set_tab(s, Tab::Disk);
+    (*s).detailed = true;
+    let process = (*s).snapshot.as_ref().unwrap().processes[0].clone();
+    let file = |path: &&str| crate::fileetw::Row {
+        pid: process.pid,
+        created: process.created,
+        path: (*path).into(),
+        read_bytes_per_sec: 10.0,
+        write_bytes_per_sec: 0.0,
+    };
+    for order in [["b.log", "a.log", "c.log"], ["c.log", "a.log", "b.log"]] {
+        (*s).files = Some(Arc::new(crate::fileetw::Sample {
+            enabled: true,
+            measured: true,
+            interval_seconds: 1.0,
+            rows: order.iter().map(file).collect(),
+            ..Default::default()
+        }));
+        content::rebuild(s, Instant::now());
+        let panel = (*s).panels.iter().find(|p| p.kind == Kind::Files).unwrap();
+        let paths: Vec<_> = panel
+            .rows
+            .iter()
+            .map(|r| r.cells[2].text.as_str())
+            .collect();
+        assert_eq!(paths, ["a.log", "b.log", "c.log"]);
+        assert!(panel.columns.len() == 6 && panel.rows.iter().all(|r| r.cells.len() == 6));
+    }
+    close(owner);
+}
+
+#[cfg(test)]
 pub(super) unsafe fn assert_snapshot_lifecycle(owner: *mut App) {
     create(owner, false);
     let s = owner_state(owner);
@@ -1451,6 +1518,7 @@ pub(super) unsafe fn assert_snapshot_lifecycle(owner: *mut App) {
             .iter()
             .map(|name| Row {
                 identity: Some(id),
+                key: content::row_key((id, *name)),
                 cells: vec![Cell::text(*name)],
             })
             .collect();

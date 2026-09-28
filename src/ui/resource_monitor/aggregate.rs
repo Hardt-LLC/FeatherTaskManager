@@ -430,7 +430,6 @@ impl Files {
                             path,
                             read_bytes_per_sec: bytes.send / self.seconds,
                             write_bytes_per_sec: bytes.recv / self.seconds,
-                            response_ms: None,
                         })
                     })
                     .collect()
@@ -490,7 +489,6 @@ mod tests {
                     path: "sample".into(),
                     read_bytes_per_sec: rate,
                     write_bytes_per_sec: 0.0,
-                    response_ms: None,
                 }],
                 ..Default::default()
             },
