@@ -701,10 +701,10 @@ pub fn run() {
             return;
         }
         let handle = hwnd as usize;
-        if let Err(e) = std::thread::Builder::new()
+        let monitor_thread = std::thread::Builder::new()
             .name("feather-monitor".into())
-            .spawn(move || monitor(handle, commands, snapshots))
-        {
+            .spawn(move || monitor(handle, commands, snapshots));
+        if let Err(e) = &monitor_thread {
             (*p).set_error(
                 ErrorSource::General,
                 tf!(
@@ -770,6 +770,17 @@ pub fn run() {
             }
         }
         dispose(p);
+        if let Ok(thread) = monitor_thread {
+            // The monitor owns the ETW sessions; let it stop them on Stop rather
+            // than ending the process under it. Bounded, so exit never hangs.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
         UnregisterClassW(class.as_ptr(), GetModuleHandleW(null()));
         gfx::buffered_paint_shutdown();
         gfx::shutdown();
@@ -808,6 +819,9 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
     let mut resource = crate::resource::Client::default();
     let mut resource_request = crate::resource::Request::default();
     let mut files = crate::fileetw::FileMonitor::new();
+    // A crash or kill skips the sessions' Drop; clear such leftovers now,
+    // not only when file tracing is next turned on.
+    crate::fileetw::stop_stale_sessions();
     let mut metadata = crate::process_metadata::Client::default();
     let mut metadata_needs = crate::process_metadata::Needs::default();
     let mut interval = 1000;

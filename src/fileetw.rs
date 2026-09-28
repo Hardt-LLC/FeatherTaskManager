@@ -164,12 +164,25 @@ impl Consumer {
         }) {
             return;
         }
-        if !self.names.contains_key(&key) && self.names.len() >= MAX_NAMES {
-            // Bounded cache: evicted names become unknown, never guessed.
-            if let Some(old) = self.names.keys().next().copied() {
-                self.names.remove(&old);
+        if !self.names.contains_key(&key) {
+            if path.is_none() {
+                // A delete for a name never seen (opened before tracing began)
+                // has nothing to shadow; storing it would only fill the cache.
+                return;
             }
-            self.batch.limited = true;
+            if self.names.len() >= MAX_NAMES {
+                // Deleted names only guard against late, older events: drop
+                // them all before any live name.
+                self.names.retain(|_, name| name.path.is_some());
+            }
+            if self.names.len() >= MAX_NAMES {
+                // Bounded cache: an evicted name makes its later requests
+                // unattributed (partial), never guessed or the interval lost.
+                if let Some(old) = self.names.keys().next().copied() {
+                    self.names.remove(&old);
+                }
+                self.batch.partial = true;
+            }
         }
         self.serial = self.serial.wrapping_add(1);
         self.names.insert(
@@ -516,6 +529,14 @@ fn alive(pid: u32, started: u64) -> bool {
     }
     running && identity.is_none_or(|value| value == started)
 }
+/// Stops file sessions left by Feather processes that no longer run (a crash
+/// or kill skips Session::drop). Live instances' sessions are kept.
+pub fn stop_stale_sessions() {
+    if crate::netetw::is_elevated() {
+        stale_sessions();
+    }
+}
+
 fn stale_sessions() {
     let mut buffers: Vec<Properties> = (0..64).map(|_| Properties::new(false)).collect();
     let mut pointers: Vec<_> = buffers.iter_mut().map(Properties::ptr).collect();
@@ -738,10 +759,13 @@ impl FileMonitor {
         let raw = session.shared.drain();
         if session.shared.ended.load(Ordering::Acquire) || loss == Err(ERROR_WMI_INSTANCE_NOT_FOUND)
         {
-            let reason = error(
-                "File I/O trace stopped",
-                session.shared.status.load(Ordering::Acquire),
-            );
+            let status = session.shared.status.load(Ordering::Acquire);
+            let reason = if status == ERROR_SUCCESS {
+                // Ended normally (or stopped by another tool): not an error code.
+                "File I/O trace stopped".to_owned()
+            } else {
+                error("File I/O trace stopped", status)
+            };
             self.session = None;
             self.reason = Some(reason.clone());
             return Sample {
@@ -914,11 +938,29 @@ mod tests {
         consumer.name(NameKey::FileKey(33), 120, None);
         consumer.name(NameKey::FileKey(33), 110, Some("stale".into()));
         assert!(consumer.names[&NameKey::FileKey(33)].path.is_none());
-        for key in 0..MAX_NAMES + 2 {
-            consumer.name(NameKey::FileKey(key as u64), 200, Some("file".into()));
+        // Deletes of never-seen names (files opened before tracing) are not kept.
+        let mut consumer = Consumer::new(Arc::new(Shared::new()));
+        for key in 0..MAX_NAMES as u64 * 2 {
+            consumer.name(NameKey::FileKey(1_000_000 + key), 150, None);
+        }
+        assert!(consumer.names.is_empty() && !consumer.batch.partial);
+        // A full cache drops deleted names before evicting any live one.
+        for key in 0..MAX_NAMES as u64 {
+            consumer.name(NameKey::FileKey(key), 200, Some("file".into()));
+            if key % 2 == 0 {
+                consumer.name(NameKey::FileKey(key), 210, None);
+            }
+        }
+        consumer.name(NameKey::FileKey(u64::MAX), 220, Some("new".into()));
+        assert_eq!(consumer.names.len(), MAX_NAMES / 2 + 1);
+        assert!(!consumer.batch.partial && !consumer.batch.limited);
+        // Evicting a live name only makes requests unattributed: the interval
+        // stays measured instead of "tracking limit reached".
+        for key in 0..MAX_NAMES as u64 + 2 {
+            consumer.name(NameKey::FileKey(5_000_000 + key), 230, Some("more".into()));
         }
         assert_eq!(consumer.names.len(), MAX_NAMES);
-        assert!(consumer.batch.limited);
+        assert!(consumer.batch.partial && !consumer.batch.limited);
         let path: Arc<str> = Arc::from("bounded");
         let mut batch = Batch::default();
         for serial in 0..=MAX_ROWS {
