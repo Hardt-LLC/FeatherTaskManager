@@ -81,6 +81,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
           ./scripts/test-release-source.ps1
           ./scripts/test-remote-release-tag.ps1
+          ./scripts/test-store-pipeline.ps1
       - name: Build without signing credentials
         run: ./scripts/build.ps1
       - name: Sign and verify app, installer, and uninstaller

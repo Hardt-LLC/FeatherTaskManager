@@ -1,0 +1,11 @@
+{
+  "ProductId": "e42e60ce-30cf-4d70-807d-f04095ce11c2",
+  "SellerId": "",
+  "TenantId": "",
+  "ClientId": "",
+  "CredentialMode": "Secret",
+  "CertificateThumbprint": "",
+  "PackageRepository": "Hardt-LLC/feather-store-packages",
+  "Architecture": "X64",
+  "Languages": ["en-us", "ko-kr"]
+}

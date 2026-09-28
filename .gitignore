@@ -20,6 +20,7 @@
 *.publishsettings
 .azure/
 installer/signing-metadata.local.json
+installer/store-metadata.local.json
 
 # Raw captures of a real PC (process, service and startup lists)
 *.bmp

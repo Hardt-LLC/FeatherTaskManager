@@ -32,6 +32,8 @@ Create and push the matching tag after review, then publish with the prepared re
 
 Publishing requires clean tracked source at the exact local release tag, with that commit in `origin/main` history. Immediately before creating the release it resolves the target GitHub repository's tag, including annotated tags, and checks the remote commit matches the local source. It also checks hashes, signatures and the app loader policy, and refuses to overwrite a release. Only the three explicitly named versioned assets and their manifests are uploaded. Fetch current remote refs before publishing; tags should be protected against modification.
 
+After the GitHub release, update the Microsoft Store with `./scripts/publish-store.ps1`; see [STORE.md](STORE.md).
+
 ## GitHub Actions
 
 Dispatch `Signed Windows release` from `main` against an existing version tag. Trusted inline workflow code checks the exact tag commit and main-branch ancestry **before** executing tagged scripts. The build job has read-only repository permission, checkout does not persist credentials, and Azure credentials are supplied only to the signing step after compilation. Publishing runs on a separate fresh runner with repository write permission and no Azure credentials; it downloads only the signed artifact from the same workflow run and checks the source again.
