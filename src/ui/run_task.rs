@@ -304,7 +304,9 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                         arguments: read(hwnd, ARGUMENTS),
                         elevated: state.admin,
                     };
-                    match crate::actions::task_command(&task) {
+                    // Resolve the program here: an unknown name or a
+                    // rejected path shows below the fields, not after closing.
+                    match crate::actions::check_task(&task) {
                         Ok(_) => {
                             state.result = Some(task);
                             EndDialog(hwnd, IDOK as isize);

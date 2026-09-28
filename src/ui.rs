@@ -4367,40 +4367,53 @@ mod tests {
 
     #[test]
     fn new_task_dialog_cancels_without_a_job_and_submits_exact_arguments() {
-        use std::cell::Cell;
+        use std::cell::{Cell, RefCell};
         use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        /// What the hook does with the dialog: Cancel, Run, or Run a missing
+        /// program (the dialog stays open with its error) and then Cancel.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Plan {
+            Cancel,
+            Run,
+            RunMissing,
+        }
         thread_local! {
-            static PLAN: Cell<(usize, bool)> = const { Cell::new((0, false)) };
+            static PLAN: Cell<(usize, Plan)> = const { Cell::new((0, Plan::Cancel)) };
+            static PROGRAM: RefCell<String> = const { RefCell::new(String::new()) };
             static INSPECTED: Cell<bool> = const { Cell::new(false) };
+            static ERROR_LINE: RefCell<String> = const { RefCell::new(String::new()) };
         }
         unsafe extern "system" fn dialog_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-            if code == HCBT_ACTIVATE as i32 {
-                let dialog = w as HWND;
-                let (owner, submit) = PLAN.get();
-                if GetWindow(dialog, GW_OWNER) as usize == owner
-                    && !GetDlgItem(dialog, 701).is_null()
-                {
-                    INSPECTED.set(IsWindowEnabled(GetDlgItem(dialog, IDOK)) == 0);
-                    SetDlgItemTextW(
-                        dialog,
-                        701,
-                        wide(r#""C:\Program Files\Example\app.exe" --inline"#).as_ptr(),
-                    );
-                    SetDlgItemTextW(dialog, 702, wide(r#""two words" &literal"#).as_ptr());
-                    // One click turns the owner-drawn administrator switch on
-                    // (BM_CLICK would re-activate the dialog inside this hook).
-                    SendMessageW(
-                        dialog,
-                        WM_COMMAND,
-                        (BN_CLICKED as usize) << 16 | 704,
-                        GetDlgItem(dialog, 704) as isize,
-                    );
-                    PostMessageW(
-                        dialog,
-                        WM_COMMAND,
-                        if submit { IDOK } else { IDCANCEL } as usize,
-                        0,
-                    );
+            let dialog = w as HWND;
+            let (owner, plan) = PLAN.get();
+            let ours = |dialog: HWND| unsafe {
+                GetWindow(dialog, GW_OWNER) as usize == owner && !GetDlgItem(dialog, 701).is_null()
+            };
+            if code == HCBT_DESTROYWND as i32 && ours(dialog) {
+                let mut text = [0u16; 512];
+                let length = GetDlgItemTextW(dialog, 705, text.as_mut_ptr(), text.len() as i32);
+                ERROR_LINE.with(|line| {
+                    *line.borrow_mut() = String::from_utf16_lossy(&text[..length as usize])
+                });
+            }
+            if code == HCBT_ACTIVATE as i32 && ours(dialog) {
+                INSPECTED.set(IsWindowEnabled(GetDlgItem(dialog, IDOK)) == 0);
+                let program = PROGRAM.with(|program| wide(&program.borrow()));
+                SetDlgItemTextW(dialog, 701, program.as_ptr());
+                SetDlgItemTextW(dialog, 702, wide(r#""two words" &literal"#).as_ptr());
+                // One click turns the owner-drawn administrator switch on
+                // (BM_CLICK would re-activate the dialog inside this hook).
+                SendMessageW(
+                    dialog,
+                    WM_COMMAND,
+                    (BN_CLICKED as usize) << 16 | 704,
+                    GetDlgItem(dialog, 704) as isize,
+                );
+                if plan != Plan::Cancel {
+                    PostMessageW(dialog, WM_COMMAND, IDOK as usize, 0);
+                }
+                if plan != Plan::Run {
+                    PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0);
                 }
             }
             CallNextHookEx(null_mut(), code, w, l)
@@ -4423,7 +4436,10 @@ mod tests {
                 GetCurrentThreadId(),
             ));
             assert!(!hook.0.is_null());
-            PLAN.set(((*test.p).hwnd as usize, false));
+            let set_program =
+                |text: &str| PROGRAM.with(|program| *program.borrow_mut() = text.into());
+            set_program(r#""C:\Program Files\Example\app.exe" --inline"#);
+            PLAN.set(((*test.p).hwnd as usize, Plan::Cancel));
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             assert!(
                 INSPECTED.get(),
@@ -4434,16 +4450,31 @@ mod tests {
                 "Cancel must never enqueue a task"
             );
             assert!(!(*test.p).modal && !(*test.p).busy);
-            PLAN.set(((*test.p).hwnd as usize, true));
+            // A program that does not resolve keeps the dialog open with the
+            // reason in its error line, before anything is enqueued.
+            PLAN.set(((*test.p).hwnd as usize, Plan::RunMissing));
+            SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
+            assert!(test.jobs.try_recv().is_err(), "nothing runs");
+            assert_eq!(
+                ERROR_LINE.with(|line| line.borrow().clone()),
+                tr(
+                    "로컬 드라이브의 실행 파일(.exe 또는 .com)을 선택하세요.",
+                    "Select an executable (.exe or .com) on a local drive.",
+                )
+            );
+            assert!(!(*test.p).modal && !(*test.p).busy);
+            let program = format!(
+                "\"{}\" --inline",
+                std::env::current_exe().unwrap().display()
+            );
+            set_program(&program);
+            PLAN.set(((*test.p).hwnd as usize, Plan::Run));
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             let Job::Action(Action::RunTask(task)) = test.jobs.try_recv().expect("submitted task")
             else {
                 panic!("unexpected job")
             };
-            assert_eq!(
-                task.command,
-                r#""C:\Program Files\Example\app.exe" --inline"#
-            );
+            assert_eq!(task.command, program);
             assert_eq!(task.arguments, r#""two words" &literal"#);
             assert!(task.elevated);
             assert!(!(*test.p).modal);

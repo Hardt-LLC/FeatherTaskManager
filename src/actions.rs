@@ -680,8 +680,35 @@ pub fn launch_system_tool(tool: SystemTool) -> Result<(), String> {
     )
 }
 
+/// An absolute path that starts with a drive letter (`C:\`, `\\?\C:\`).
+fn local_path(value: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    value.is_absolute()
+        && matches!(
+            value.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        )
+}
+
+/// Whether the drive of a [`local_path`] is local: a mapped network drive also
+/// has a drive letter, so it is rejected explicitly.
+fn local_drive(path: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    let drive = match prefix.kind() {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+        _ => return false,
+    };
+    let root = [u16::from(drive), b':' as u16, b'\\' as u16, 0];
+    let drive_type =
+        unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) };
+    matches!(drive_type, 2 | 3 | 5 | 6)
+}
+
 fn task_executable(path: &str) -> Result<std::path::PathBuf, String> {
-    use std::path::{Component, Path, Prefix};
+    use std::path::{Component, Path};
     let invalid = || {
         tr(
             "로컬 드라이브의 실행 파일(.exe 또는 .com)을 선택하세요.",
@@ -693,20 +720,20 @@ fn task_executable(path: &str) -> Result<std::path::PathBuf, String> {
         return Err(invalid());
     }
     let candidate = Path::new(path);
-    let local_path = |value: &Path| {
-        value.is_absolute()
-            && matches!(
-                value.components().next(),
-                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-            )
-    };
-    if !local_path(candidate) {
+    // The drive is checked before any file system access: the dialog
+    // validates on the UI thread, where a stalled network drive must not hang.
+    if !local_path(candidate) || !local_drive(candidate) {
         return Err(invalid());
     }
-    let resolved = candidate.canonicalize().map_err(|_| invalid())?;
+    let (resolved, alias) = match candidate.canonicalize() {
+        Ok(resolved) => (resolved, false),
+        // Store app execution aliases (wt, winget) cannot be opened or
+        // canonicalized; only process creation follows them.
+        Err(_) => (app_execution_alias(candidate).ok_or_else(invalid)?, true),
+    };
     // Canonicalization prevents a local-looking junction from selecting a UNC
     // executable; arguments and elevation are handled only after this check.
-    if !local_path(&resolved) || !resolved.is_file() || resolved.components().any(|component| {
+    if !local_path(&resolved) || !(alias || resolved.is_file()) || resolved.components().any(|component| {
         matches!(component, Component::Normal(name) if name.encode_wide().any(|unit| unit == b':' as u16))
     }) {
         return Err(invalid());
@@ -718,21 +745,96 @@ fn task_executable(path: &str) -> Result<std::path::PathBuf, String> {
     if !extension.eq_ignore_ascii_case("exe") && !extension.eq_ignore_ascii_case("com") {
         return Err(invalid());
     }
-    let Some(Component::Prefix(prefix)) = resolved.components().next() else {
-        return Err(invalid());
-    };
-    let drive = match prefix.kind() {
-        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
-        _ => return Err(invalid()),
-    };
-    // A mapped network drive also has a drive letter; reject it explicitly.
-    let root = [u16::from(drive), b':' as u16, b'\\' as u16, 0];
-    let drive_type =
-        unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) };
-    if !matches!(drive_type, 2 | 3 | 5 | 6) {
+    if !local_drive(&resolved) {
         return Err(invalid());
     }
     Ok(resolved)
+}
+
+/// The app execution alias at `path` (its canonical folder and name), when
+/// the file is one whose target is an executable on a local drive. Windows
+/// starts the packaged app from the alias itself.
+fn app_execution_alias(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let alias = path.parent()?.canonicalize().ok()?.join(path.file_name()?);
+    let target = std::path::PathBuf::from(alias_target(&alias)?);
+    let executable = target
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+    (executable && local_path(&target) && local_drive(&target)).then_some(alias)
+}
+
+/// The target executable an app execution alias names (None: `path` is not one).
+fn alias_target(path: &std::path::Path) -> Option<String> {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            MAXIMUM_REPARSE_DATA_BUFFER_SIZE, OPEN_EXISTING,
+        },
+        System::{Ioctl::FSCTL_GET_REPARSE_POINT, IO::DeviceIoControl},
+    };
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // The reparse point itself, not what it names; attribute access only.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let handle = ProcessHandle(handle);
+    let mut data = vec![0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize];
+    let mut length = 0;
+    let read = unsafe {
+        DeviceIoControl(
+            handle.0,
+            FSCTL_GET_REPARSE_POINT,
+            null(),
+            0,
+            data.as_mut_ptr().cast(),
+            data.len() as u32,
+            &mut length,
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    read.then(|| alias_target_from(data.get(..length as usize)?))
+        .flatten()
+}
+
+/// Parse an app execution alias's `REPARSE_DATA_BUFFER`: tag, data length,
+/// reserved word, then version 3 and NUL-terminated UTF-16 strings (package,
+/// application user model ID, target executable, application type).
+fn alias_target_from(data: &[u8]) -> Option<String> {
+    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_APPEXECLINK;
+    let tag = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+    let length = usize::from(u16::from_le_bytes(data.get(4..6)?.try_into().ok()?));
+    let payload = data.get(8..8 + length)?;
+    let version = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+    if tag != IO_REPARSE_TAG_APPEXECLINK || version != 3 {
+        return None;
+    }
+    let units: Vec<u16> = payload[4..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    let mut strings = units.split(|&unit| unit == 0);
+    let target = strings.nth(2)?;
+    // A truncated buffer has no terminator after the target.
+    strings.next()?;
+    (!target.is_empty())
+        .then(|| String::from_utf16(target).ok())
+        .flatten()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -826,6 +928,13 @@ fn resolve_task_executable(file: &str) -> Result<std::path::PathBuf, String> {
         "Program not found. Use Browse to choose its executable.",
     )
     .into())
+}
+
+/// The checks [`launch_task`] makes before starting anything, for the dialog
+/// to report in its own error line (the launch repeats them).
+pub fn check_task(task: &TaskLaunch) -> Result<(), String> {
+    let (file, _) = task_command(task)?;
+    resolve_task_executable(&file).map(|_| ())
 }
 
 /// Programs and arguments remain separate; only an explicit admin choice uses runas.
@@ -1395,6 +1504,97 @@ mod tests {
             "cmd.exe"
         );
         assert!(task_command(&request("cmd.exe", "\0")).is_err());
+        // The dialog shows resolution errors before it closes.
+        assert!(check_task(&request("cmd /c echo", "")).is_ok());
+        assert_eq!(
+            check_task(&request("feather-no-such-program-4f2a", "")),
+            Err(tr(
+                "프로그램을 찾을 수 없습니다. 찾아보기에서 실행 파일을 선택하세요.",
+                "Program not found. Use Browse to choose its executable.",
+            )
+            .into())
+        );
+        assert!(check_task(&request("script.ps1", "")).is_err());
+    }
+
+    fn alias_buffer(strings: &[&str], version: u32) -> Vec<u8> {
+        let mut payload = version.to_le_bytes().to_vec();
+        for text in strings {
+            for unit in text.encode_utf16().chain(Some(0)) {
+                payload.extend(unit.to_le_bytes());
+            }
+        }
+        let mut data = windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_APPEXECLINK
+            .to_le_bytes()
+            .to_vec();
+        data.extend((payload.len() as u16).to_le_bytes());
+        data.extend([0, 0]);
+        data.extend(payload);
+        data
+    }
+
+    #[test]
+    fn app_execution_alias_buffers_name_their_target() {
+        let target =
+            r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.0_x64__8wekyb3d8bbwe\wt.exe";
+        let strings = [
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App",
+            target,
+            "0",
+        ];
+        assert_eq!(
+            alias_target_from(&alias_buffer(&strings, 3)).as_deref(),
+            Some(target)
+        );
+        assert_eq!(alias_target_from(&alias_buffer(&strings, 2)), None);
+        let mut other_tag = alias_buffer(&strings, 3);
+        other_tag[..4].copy_from_slice(&0xA000_000Cu32.to_le_bytes());
+        assert_eq!(alias_target_from(&other_tag), None, "a symbolic link");
+        let whole = alias_buffer(&strings, 3);
+        assert_eq!(alias_target_from(&whole[..whole.len() - 12]), None);
+        assert_eq!(alias_target_from(&alias_buffer(&strings[..2], 3)), None);
+        assert_eq!(alias_target_from(&[]), None);
+    }
+
+    /// Read-only: resolves this PC's app execution aliases, if it has any.
+    #[test]
+    fn store_app_aliases_resolve_like_ordinary_programs() {
+        let Some(folder) = std::env::var_os("LOCALAPPDATA")
+            .map(|base| std::path::PathBuf::from(base).join(r"Microsoft\WindowsApps"))
+        else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            return;
+        };
+        let aliases: Vec<_> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                    && path.canonicalize().is_err()
+                    && alias_target(path).is_some()
+            })
+            .collect();
+        for alias in aliases.iter().take(3) {
+            let resolved = task_executable(alias.to_str().unwrap()).unwrap();
+            assert_eq!(resolved.file_name(), alias.file_name());
+            assert!(!shell_path(&resolved).to_str().unwrap().starts_with(r"\\?\"));
+            let stem = alias.file_stem().unwrap().to_str().unwrap();
+            // By name too (the default PATH lists the aliases' folder),
+            // unless a Windows tool of the same name is found first.
+            if std::env::var_os("PATH")
+                .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir == folder))
+            {
+                assert!(resolve_task_executable(stem).is_ok(), "{stem}");
+            }
+        }
+        // An ordinary file is not an alias.
+        let current = std::env::current_exe().unwrap();
+        assert_eq!(alias_target(&current), None);
+        assert_eq!(app_execution_alias(&current), None);
     }
 
     #[test]
