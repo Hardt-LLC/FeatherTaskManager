@@ -19,7 +19,9 @@ $name = "FeatherTaskManager-$Version-Setup-x64.exe"
 $tag = "v$Version"
 
 # The Store must receive the exact bytes of the published, immutable release asset.
-$releaseJson = & gh api "repos/$Repository/releases/tags/$tag"
+# Only the fields checked below: the notes are UTF-8 text that the console
+# code page could garble into invalid JSON.
+$releaseJson = & gh api "repos/$Repository/releases/tags/$tag" --jq '{draft, prerelease, immutable, assets: [.assets[] | {name, digest}]}'
 if ($LASTEXITCODE -ne 0) { throw "GitHub release $tag was not found in $Repository." }
 $release = $releaseJson | ConvertFrom-Json
 if ($release.draft -or $release.prerelease -or -not $release.immutable) { throw "$tag must be a published, immutable, non-prerelease GitHub release." }
@@ -50,6 +52,12 @@ if (-not (Test-Path -LiteralPath (Join-Path $work '.git'))) {
     if ($LASTEXITCODE -ne 0) { throw "Cloning $PackageRepository failed." }
 }
 if ((Invoke-PackageGit remote get-url origin) -cne $remote) { throw "$work is not a clone of $PackageRepository." }
+# Commit as the project's author: the identity is often set only in the
+# project's own repository configuration, which a fresh clone lacks.
+foreach ($key in @('user.name', 'user.email')) {
+    $value = & git -C $root config $key
+    if ($value -and -not (& git -C $work config --local $key)) { Invoke-PackageGit config --local $key $value | Out-Null }
+}
 if (Invoke-PackageGit status --porcelain) { throw "$work has local changes. Inspect and clean it before staging." }
 Invoke-PackageGit fetch -q origin | Out-Null
 Invoke-PackageGit checkout -q main | Out-Null

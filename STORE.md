@@ -42,7 +42,7 @@ The GitHub release must already be published. It is immutable, so the Store pack
    ./scripts/publish-store.ps1
    ```
 
-   This stages the installer, sets the draft's x64 package URL, commits the package, waits until the Store has downloaded it, and sets What's new. Re-running it changes nothing that is already current.
+   This stages the installer, sets the draft's x64 package URL and silent switches, commits the package, waits until the Store has downloaded it, and sets What's new. Re-running it changes nothing that is already current. The switches come from `InstallerParameters` in the metadata (default `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`). The API accepts at most 40 characters, and `/SP-` is not needed because Inno Setup 6 already disables the startup prompt.
 3. Check the draft with `./scripts/store-status.ps1`, then send it to certification:
 
    ```powershell

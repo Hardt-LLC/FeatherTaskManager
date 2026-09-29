@@ -7,5 +7,6 @@
   "CertificateThumbprint": "",
   "PackageRepository": "Hardt-LLC/feather-store-packages",
   "Architecture": "X64",
+  "InstallerParameters": "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
   "Languages": ["en-us", "ko-kr"]
 }

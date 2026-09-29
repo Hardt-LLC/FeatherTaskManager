@@ -6,6 +6,9 @@ $ErrorActionPreference = 'Stop'
 $script:ApiBase = 'https://api.store.microsoft.com'
 $script:Scope = 'https://api.store.microsoft.com/.default'
 $script:GuidPattern = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+# Inno Setup's silent switches. The API allows at most 40 characters, and
+# /SP- is not needed: Inno Setup 6 disables the startup prompt by default.
+$script:DefaultInstallerParameters = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
 $script:Token = $null
 $script:TokenExpires = [datetimeoffset]::MinValue
 # Tests replace these to run the pipeline against scripted responses.
@@ -38,6 +41,10 @@ function Read-StoreConfig([string]$Path) {
     if ($config.Architecture -cnotin @('X64', 'X86', 'Arm64', 'Arm', 'Neutral')) { throw 'Store metadata Architecture is invalid.' }
     if (@($config.Languages).Count -lt 1) { throw 'Store metadata must list at least one listing language.' }
     if ([string]$config.PackageRepository -cnotmatch '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$') { throw 'Store metadata PackageRepository must be owner/name.' }
+    if (-not $config.PSObject.Properties['InstallerParameters'] -or [string]::IsNullOrWhiteSpace($config.InstallerParameters)) {
+        $config | Add-Member -NotePropertyName InstallerParameters -NotePropertyValue $script:DefaultInstallerParameters -Force
+    }
+    if (([string]$config.InstallerParameters).Length -gt 40) { throw 'Store metadata InstallerParameters must be at most 40 characters (the Store API limit).' }
     return $config
 }
 
@@ -341,10 +348,11 @@ function Update-StoreDraft {
     $packages = @((Invoke-StoreApi $Config GET (Get-StoreProductPath $Config '/packages')).packages)
     $target = @($packages | Where-Object { $_.packageType -eq 'exe' -and @($_.architectures) -contains $Config.Architecture })
     if ($target.Count -ne 1) { throw "Expected exactly one $($Config.Architecture) EXE package in the draft; found $($target.Count)." }
-    if ([string]$target[0].packageUrl -cne $PackageUrl) {
+    if ([string]$target[0].packageUrl -cne $PackageUrl -or [string]$target[0].installerParameters -cne $Config.InstallerParameters) {
         $patch = [ordered]@{}
         foreach ($property in $target[0].PSObject.Properties) { if ($property.Name -ne 'packageId') { $patch[$property.Name] = $property.Value } }
         $patch.packageUrl = $PackageUrl
+        $patch.installerParameters = [string]$Config.InstallerParameters
         $null = Invoke-StoreApi $Config PATCH (Get-StoreProductPath $Config "/packages/$($target[0].packageId)") $patch
         $null = Invoke-StoreApi $Config POST (Get-StoreProductPath $Config '/packages/commit')
         Wait-StoreDraftReady $Config -TimeoutMinutes $ReadyTimeoutMinutes

@@ -53,6 +53,8 @@ function New-Server {
     $server.Calls = [Collections.Generic.List[object]]::new(); $server.Ongoing = $Ongoing; $server.NotReady = 0; $server.UploadError = [bool]$UploadError
     $server.PackageCount = $PackageCount; $server.Throttle = $Throttle; $server.RejectListing = [bool]$RejectListing
     $server.PackageUrl = $oldUrl; $server.WhatsNew = @{ 'en-us' = 'old'; 'ko-kr' = 'old' }; $server.Sleeps = [Collections.Generic.List[int]]::new()
+    # The 44-character switches the first, manual submission used.
+    $server.InstallerParameters = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'
 }
 $transport = {
     param($Request)
@@ -76,12 +78,16 @@ $transport = {
         '^GET .*/packages$' {
             $packages = @(1..$s.PackageCount | ForEach-Object {
                 @{ packageId = "p$_"; packageUrl = $s.PackageUrl; languages = @('en-us', 'ko-kr'); architectures = @('X64'); isSilentInstall = $false
-                   installerParameters = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'; genericDocUrl = 'https://jrsoftware.org/ishelp/topic_setupexitcodes.htm'
+                   installerParameters = $s.InstallerParameters; genericDocUrl = 'https://jrsoftware.org/ishelp/topic_setupexitcodes.htm'
                    errorDetails = @(@{ errorScenario = 'rebootRequired'; errorScenarioDetails = @(@{ errorValue = '8'; errorUrl = '' }) }); packageType = 'exe' }
             })
             return & $reply @{ isSuccess = $true; responseData = @{ packages = $packages } }
         }
-        '^PATCH .*/packages/p1$' { $s.PackageUrl = $body.packageUrl; return & $reply @{ isSuccess = $true; responseData = @{ pollingUrl = ''; ongoingSubmissionId = '' } } }
+        '^PATCH .*/packages/p1$' {
+            if (([string]$body.installerParameters).Length -gt 40) { return & $reply @{ isSuccess = $false; errors = @(@{ code = 'badrequest'; message = 'Packages, maximum length allowed for InstallerParameters is 40.'; target = 'packages' }) } 400 }
+            $s.PackageUrl = $body.packageUrl; $s.InstallerParameters = $body.installerParameters
+            return & $reply @{ isSuccess = $true; responseData = @{ pollingUrl = ''; ongoingSubmissionId = '' } }
+        }
         '^POST .*/packages/commit$' { $s.NotReady = 1; return & $reply @{ isSuccess = $true; responseData = @{ pollingUrl = "$product/status"; ongoingSubmissionId = '' } } }
         '^GET .*/metadata/listings$' {
             $listings = @('en-us', 'ko-kr' | ForEach-Object { @{ language = $_; whatsNew = $s.WhatsNew[$_]; description = 'fixture' } })
@@ -113,7 +119,8 @@ $result = Update-StoreDraft -Config $config -PackageUrl $newUrl -WhatsNew $notes
 $writes = Get-Writes
 $patch = @($writes | Where-Object { $_.Path -like '*/packages/p1' })
 Assert ($patch.Count -eq 1 -and $patch[0].Body.packageUrl -ceq $newUrl) 'the package URL is patched once'
-Assert ($patch[0].Body.installerParameters -ceq '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -and $patch[0].Body.errorDetails[0].errorScenario -eq 'rebootRequired') 'package fields other than the URL are preserved'
+Assert ($patch[0].Body.installerParameters -ceq '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -and $config.InstallerParameters.Length -le 40) 'installer parameters are set to the configured switches within the API limit'
+Assert ($patch[0].Body.errorDetails[0].errorScenario -eq 'rebootRequired' -and $patch[0].Body.genericDocUrl -like 'https://jrsoftware.org/*') 'other package fields are preserved'
 Assert (-not $patch[0].Body.PSObject.Properties['packageId']) 'the package ID is not sent in the body'
 Assert (@($writes | Where-Object { $_.Path -like '*/packages/commit' }).Count -eq 1) 'packages are committed'
 $listingWrites = @($writes | Where-Object { $_.Path -like '*/metadata' })
