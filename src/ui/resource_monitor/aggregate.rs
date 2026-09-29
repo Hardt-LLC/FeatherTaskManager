@@ -430,7 +430,6 @@ impl Files {
                             path,
                             read_bytes_per_sec: bytes.send / self.seconds,
                             write_bytes_per_sec: bytes.recv / self.seconds,
-                            response_ms: None,
                         })
                     })
                     .collect()
@@ -490,7 +489,6 @@ mod tests {
                     path: "sample".into(),
                     read_bytes_per_sec: rate,
                     write_bytes_per_sec: 0.0,
-                    response_ms: None,
                 }],
                 ..Default::default()
             },
@@ -543,5 +541,23 @@ mod tests {
         pending.push(at + Duration::from_millis(3550), &network, &files);
         assert!(pending.take().0.measured);
         pending.clear();
+    }
+
+    /// Reasons are stable codes, translated where they are shown: a cached
+    /// frame must follow a language change.
+    #[test]
+    fn reasons_are_codes_whatever_the_ui_language() {
+        use crate::i18n::{with_language, Language};
+        let skipped = with_language(Language::Korean, || {
+            let at = Instant::now();
+            let mut pending = Pending::default();
+            let (network, files) = sample(0.5, 100.0);
+            pending.push(at, &network, &files);
+            pending.push(at + Duration::from_secs(3), &network, &files);
+            pending.take()
+        });
+        let code = "Some resource samples were skipped; waiting for a complete interval";
+        assert_eq!(skipped.0.reason.as_deref(), Some(code));
+        assert_eq!(skipped.1.reason.as_deref(), Some(code));
     }
 }

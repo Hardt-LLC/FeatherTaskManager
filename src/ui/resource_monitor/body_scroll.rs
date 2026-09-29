@@ -34,6 +34,35 @@ unsafe fn update(s: *mut State, offset: i32) {
     view::layout_body(s);
     InvalidateRect((*s).body, null(), 0);
 }
+/// Scroll the panel list so the panel holding `focus` (its header, or its
+/// table from the header down) is in view, with the list's 16 px margin.
+pub(super) unsafe fn reveal(s: *mut State, focus: HWND) {
+    let Some(panel) = (*s).panels.iter().find(|p| {
+        p.header == focus
+            || (!p.table.is_null() && (p.table == focus || IsChild(p.table, focus) != 0))
+    }) else {
+        return;
+    };
+    let px = |v| gfx::pxi((*s).dpi, v);
+    let (top, bottom) = if panel.header == focus {
+        (panel.bounds.top, panel.bounds.top + px(44.0))
+    } else {
+        (panel.bounds.top, panel.bounds.bottom)
+    };
+    let mut area: RECT = zeroed();
+    GetClientRect((*s).body, &mut area);
+    let mut offset = (*s).scroll;
+    if bottom + px(16.0) > offset + area.bottom {
+        offset = bottom + px(16.0) - area.bottom;
+    }
+    // A panel taller than the view shows from its header.
+    if top - px(16.0) < offset {
+        offset = top - px(16.0);
+    }
+    if offset != (*s).scroll {
+        update(s, offset.max(0));
+    }
+}
 pub(super) unsafe fn paint(s: *mut State, pt: &Painter) {
     let (area, lane, thumb) = geometry(s);
     if (*s).content_height <= area.bottom {

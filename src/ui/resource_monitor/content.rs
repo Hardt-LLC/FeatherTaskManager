@@ -50,12 +50,6 @@ pub(super) fn columns(kind: Kind) -> Vec<table::Column> {
             col(tr("상태", "Status"), 96.0, false),
             col(tr("호스트 CPU", "Host CPU"), 100.0, true),
         ],
-        Kind::Handles => vec![
-            image(),
-            pid(),
-            col(tr("형식", "Type"), 90.0, false),
-            col(tr("핸들 이름", "Handle name"), 0.0, false),
-        ],
         Kind::Modules => vec![
             image(),
             pid(),
@@ -70,7 +64,6 @@ pub(super) fn columns(kind: Kind) -> Vec<table::Column> {
             col(tr("읽기", "Read"), 96.0, true),
             col(tr("쓰기", "Write"), 96.0, true),
             col(tr("합계", "Total"), 96.0, true),
-            col(tr("응답", "Response"), 86.0, true),
         ],
         Kind::Storage => vec![
             col(tr("볼륨", "Volume"), 0.0, false),
@@ -94,7 +87,6 @@ pub(super) fn columns(kind: Kind) -> Vec<table::Column> {
             col(tr("원격 주소", "Remote address"), 160.0, false),
             col(tr("포트", "Port"), 65.0, true),
             col(tr("상태", "State"), 120.0, false),
-            col(tr("지연 시간", "Latency"), 90.0, true),
         ],
         Kind::Listening => vec![
             image(),
@@ -110,6 +102,13 @@ pub(super) fn columns(kind: Kind) -> Vec<table::Column> {
         cols.insert(0, col("✓", 40.0, false));
     }
     cols
+}
+/// A [`Row::key`] from what identifies the row.
+pub(super) fn row_key(identity: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hasher);
+    hasher.finish()
 }
 fn integer(value: u64) -> Cell {
     Cell::num(value.to_string(), value as f64)
@@ -154,11 +153,184 @@ fn identity_columns(s: &State, pid: u32, created: Option<u64>) -> (Option<(u32, 
         ],
     )
 }
+/// Korean for the English codes the collectors (`netetw`, `fileetw`,
+/// `resource`) and the aggregation report. A code matches whole, or as a
+/// prefix followed by its detail (`: <Windows message>`, ` (Windows 5)`).
+const REASONS: &[(&str, &str)] = &[
+    // aggregate.rs
+    (
+        "Some resource samples were skipped; waiting for a complete interval",
+        "일부 리소스 샘플을 건너뛰어 완전한 구간을 기다리는 중입니다",
+    ),
+    (
+        "Network sample unavailable",
+        "네트워크 샘플을 사용할 수 없습니다",
+    ),
+    (
+        "Process network tracking limit reached",
+        "프로세스 네트워크 추적 한도에 도달했습니다",
+    ),
+    (
+        "Endpoint traffic unavailable",
+        "원격 주소별 전송량을 사용할 수 없습니다",
+    ),
+    (
+        "Endpoint tracking limit reached",
+        "원격 주소 추적 한도에 도달했습니다",
+    ),
+    (
+        "File I/O requests unavailable",
+        "파일 I/O 요청을 사용할 수 없습니다",
+    ),
+    // netetw.rs (endpoint traffic)
+    (
+        "Preparing endpoint traffic",
+        "원격 주소별 전송량을 준비하는 중입니다",
+    ),
+    (
+        "Endpoint limit reached",
+        "원격 주소 추적 한도에 도달했습니다",
+    ),
+    (
+        "Endpoint event format unavailable",
+        "이 Windows의 연결 이벤트 형식을 해석할 수 없습니다",
+    ),
+    // fileetw.rs
+    ("Requires administrator", "관리자 권한이 필요합니다"),
+    (
+        "Cannot start file I/O trace",
+        "파일 I/O 추적을 시작할 수 없습니다",
+    ),
+    (
+        "Cannot enable file I/O trace",
+        "파일 I/O 추적을 켤 수 없습니다",
+    ),
+    (
+        "Cannot open file I/O trace",
+        "파일 I/O 추적을 열 수 없습니다",
+    ),
+    ("File I/O trace stopped", "파일 I/O 추적이 중지되었습니다"),
+    (
+        "Cannot check file I/O event loss",
+        "파일 I/O 이벤트 손실을 확인할 수 없습니다",
+    ),
+    (
+        "File I/O events dropped",
+        "파일 I/O 이벤트가 누락되어 이 구간은 표시하지 않습니다",
+    ),
+    (
+        "Preparing file I/O requests",
+        "파일 I/O 요청을 준비하는 중입니다",
+    ),
+    (
+        "File I/O tracking limit reached",
+        "파일 I/O 추적 한도에 도달했습니다",
+    ),
+    (
+        "Some file I/O requests could not be attributed",
+        "일부 파일 I/O 요청은 프로세스를 확인할 수 없어 제외했습니다",
+    ),
+    // resource.rs
+    (
+        "Resource details worker unavailable",
+        "리소스 세부 정보 작업을 시작할 수 없습니다",
+    ),
+    (
+        "Process details are unavailable or access was denied.",
+        "프로세스 정보를 사용할 수 없거나 액세스가 거부되었습니다.",
+    ),
+    (
+        "The selected process has exited or changed.",
+        "선택한 프로세스가 종료되었거나 바뀌었습니다.",
+    ),
+    (
+        "The selected process has exited.",
+        "선택한 프로세스가 종료되었습니다.",
+    ),
+    ("Module list unavailable", "모듈 목록을 사용할 수 없습니다"),
+    (
+        "Module list exceeds the 4096-entry limit.",
+        "모듈 목록이 4096개 제한을 넘습니다.",
+    ),
+    ("Volume list unavailable", "볼륨 목록을 사용할 수 없습니다"),
+    (
+        "Endpoint table reported an invalid length.",
+        "연결 테이블의 길이가 잘못되었습니다.",
+    ),
+    (
+        "Endpoint table unavailable",
+        "연결 테이블을 사용할 수 없습니다",
+    ),
+    (
+        "Endpoint table exceeds the 8 MiB limit.",
+        "연결 테이블이 8 MiB 제한을 넘습니다.",
+    ),
+    (
+        "Endpoint table changed too quickly to collect.",
+        "연결 테이블이 너무 빨리 바뀌어 수집하지 못했습니다.",
+    ),
+    ("Endpoint table is truncated.", "연결 테이블이 잘렸습니다."),
+    (
+        "Endpoint table exceeds the 16384-entry limit.",
+        "연결 테이블이 16384개 제한을 넘습니다.",
+    ),
+    (
+        "Endpoint table is malformed.",
+        "연결 테이블 형식이 잘못되었습니다.",
+    ),
+    (
+        "Endpoint list limited to 16384 entries.",
+        "연결 목록은 16384개까지만 표시합니다.",
+    ),
+];
+
+/// A collector's reason in the UI language, translated when shown: the
+/// collectors keep stable English codes (the main window matches
+/// `netetw`'s), so a frozen frame follows a language change too. `network`:
+/// the per-process network reasons, worded like the main window's notes.
+fn reason(text: &str, network: bool) -> String {
+    if network
+        && (text == "Requires administrator"
+            || text == "Network events dropped"
+            || text.starts_with("Network trace stopped")
+            || text.starts_with("Cannot check network event loss")
+            || text.starts_with("Cannot enable the network provider")
+            || text.starts_with("Cannot open the network trace")
+            || text.starts_with("Cannot start the network")
+            || text.starts_with("Cannot read this process"))
+    {
+        return paint::network_note(text).0.into();
+    }
+    if language() == Language::English {
+        return text.into();
+    }
+    for (english, korean) in REASONS {
+        if let Some(detail) = text.strip_prefix(english) {
+            if detail.is_empty() || detail.starts_with(": ") || detail.starts_with(" (") {
+                return format!("{korean}{detail}");
+            }
+        }
+    }
+    // `resource`'s "C:\ capacity unavailable: <Windows message>".
+    if let Some((volume, detail)) = text.split_once(" capacity unavailable") {
+        return format!("{volume} 용량을 확인할 수 없습니다{detail}");
+    }
+    text.into()
+}
 fn error_text(s: &State, fallback: &str) -> String {
     s.data
         .as_ref()
         .filter(|d| !d.errors.is_empty())
-        .map_or_else(|| fallback.into(), |d| d.errors.join(" · "))
+        .map_or_else(
+            || fallback.into(),
+            |d| {
+                d.errors
+                    .iter()
+                    .map(|error| reason(error, false))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            },
+        )
 }
 fn process_rows(s: &State, kind: Kind, at: Instant) -> Vec<Row> {
     let at = s.accepted_at.unwrap_or(at);
@@ -239,6 +411,7 @@ fn process_rows(s: &State, kind: Kind, at: Instant) -> Vec<Row> {
             }
             Row {
                 identity: Some((p.pid, p.created)),
+                key: row_key((p.pid, p.created)),
                 cells,
             }
         })
@@ -272,7 +445,7 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                     if st.network.as_ref().is_none_or(|n| !n.measured) {
                         st.network
                             .as_ref()
-                            .and_then(|n| n.reason.clone())
+                            .and_then(|n| n.reason.as_deref().map(|r| reason(r, true)))
                             .unwrap_or_else(|| {
                                 tr(
                                     "프로세스별 측정에는 관리자 권한이 필요합니다",
@@ -302,6 +475,7 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                         .and_then(|index| st.snapshot.as_ref()?.processes.get(*index));
                     Row {
                         identity: process.map(|p| (p.pid, p.created)),
+                        key: row_key(&service.name),
                         cells: vec![
                             Cell::text(&service.name),
                             if service.pid == 0 {
@@ -322,14 +496,6 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                     }
                 })
                 .collect()
-        }
-        Kind::Handles => {
-            empty = tr(
-                "핸들 이름 조회 미지원 · 전체 핸들 수는 작업 관리자 상세 열에서 확인하세요.",
-                "Handle names unavailable · see handle counts in Task Manager's detail columns.",
-            )
-            .into();
-            Vec::new()
         }
         Kind::Modules => {
             empty = if st.checked.len() != 1 {
@@ -358,7 +524,12 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 Cell::text(&module.path),
                                 bytes(module.size_bytes),
                             ]);
-                            Row { identity, cells }
+                            let key = row_key((id, &module.path));
+                            Row {
+                                identity,
+                                key,
+                                cells,
+                            }
                         })
                         .collect()
                 })
@@ -368,8 +539,9 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                 empty=tr("상세 추적을 켜면 파일별 I/O 요청을 수집합니다. 캐시를 포함하며 물리 디스크 전송량과 다릅니다.","Turn on tracing to collect file I/O requests. These include cache activity and differ from physical disk transfers.").into();
                 Vec::new()
             } else if let Some(files) = &st.files {
-                summary = files.reason.clone().unwrap_or_default();
-                empty = files.reason.clone().unwrap_or_else(|| {
+                let shown = files.reason.as_deref().map(|r| reason(r, false));
+                summary = shown.clone().unwrap_or_default();
+                empty = shown.unwrap_or_else(|| {
                     tr(
                         "이 구간에 프로세스와 파일을 확인할 수 있는 요청이 없습니다.",
                         "No attributable process/file requests in this interval.",
@@ -388,9 +560,13 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 rate(Some(row.read_bytes_per_sec)),
                                 rate(Some(row.write_bytes_per_sec)),
                                 rate(Some(row.read_bytes_per_sec + row.write_bytes_per_sec)),
-                                number(row.response_ms, |v| format!("{v:.1} ms")),
                             ]);
-                            Row { identity, cells }
+                            let key = row_key((row.pid, row.created, &row.path));
+                            Row {
+                                identity,
+                                key,
+                                cells,
+                            }
                         })
                         .collect()
                 } else {
@@ -407,8 +583,9 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                 Vec::new()
             } else if let Some(network) = &st.network {
                 let endpoints = &network.endpoints;
-                summary = endpoints.reason.clone().unwrap_or_default();
-                empty = endpoints.reason.clone().unwrap_or_else(|| {
+                let shown = endpoints.reason.as_deref().map(|r| reason(r, true));
+                summary = shown.clone().unwrap_or_default();
+                empty = shown.unwrap_or_else(|| {
                     tr(
                         "이 구간에 확인된 전송이 없습니다.",
                         "No attributable transfers in this interval.",
@@ -435,7 +612,18 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 rate(Some(row.recv_bytes_per_sec)),
                                 rate(Some(row.send_bytes_per_sec + row.recv_bytes_per_sec)),
                             ]);
-                            Row { identity, cells }
+                            // Also the local endpoint, which the table does
+                            // not show: two connections to one server.
+                            let key = row_key((
+                                (row.pid, row.created, row.protocol),
+                                (row.local_addr, row.local_port),
+                                (row.remote_addr, row.remote_port),
+                            ));
+                            Row {
+                                identity,
+                                key,
+                                cells,
+                            }
                         })
                         .collect()
                 } else {
@@ -476,7 +664,6 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 e.remote_port
                                     .map_or_else(|| Cell::text("—"), |v| integer(v as u64)),
                                 Cell::text(e.state),
-                                Cell::text("—"),
                             ]);
                         } else {
                             cells.extend([
@@ -484,7 +671,16 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                                 Cell::text(tr("평가하지 않음", "Not evaluated")),
                             ]);
                         }
-                        Row { identity, cells }
+                        let key = row_key((
+                            (e.pid, e.created, e.protocol, e.listening),
+                            (&e.local_address, e.local_port),
+                            (&e.remote_address, e.remote_port),
+                        ));
+                        Row {
+                            identity,
+                            key,
+                            cells,
+                        }
                     })
                     .collect()
             })
@@ -501,6 +697,7 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                     .iter()
                     .map(|v| Row {
                         identity: None,
+                        key: row_key(&v.name),
                         cells: vec![
                             Cell::text(&v.name),
                             bytes(v.free_bytes),
@@ -557,8 +754,19 @@ pub(super) unsafe fn rebuild(s: *mut State, at: Instant) {
                 },
                 _ => Ordering::Equal,
             };
+            // Ties (equal rates, several rows of one process) keep one order
+            // across refreshes, whatever order the collectors produced.
+            fn names(r: &Row) -> Vec<&str> {
+                r.cells
+                    .iter()
+                    .filter(|c| c.number.is_none())
+                    .map(|c| c.text.as_str())
+                    .collect()
+            }
             (if descending { order.reverse() } else { order })
                 .then_with(|| a.identity.cmp(&b.identity))
+                .then_with(|| names(a).cmp(&names(b)))
+                .then_with(|| a.key.cmp(&b.key))
         });
         if rows.is_empty() && !(&(*s).query).is_empty() {
             empty = tr(
@@ -569,19 +777,18 @@ pub(super) unsafe fn rebuild(s: *mut State, at: Instant) {
         }
         let count = rows.len();
         let table = (&(*s).panels)[index].table;
-        // Native focus is an index, while CPU/IO sorting changes indices.
-        // Keep keyboard actions attached to the same process generation.
-        let selected = if kind.check() && !table.is_null() {
+        // Native focus is an index, while sorting and new rows move rows.
+        // Keep the selection (and keyboard actions) on the same row.
+        let selected = if table.is_null() {
+            None
+        } else {
             let row = SendMessageW(table, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
             (row >= 0).then_some(row as usize)
-        } else {
-            None
         };
-        let selected_identity = selected
+        let selected_key = selected
             .and_then(|row| (&(*s).panels)[index].rows.get(row))
-            .and_then(|row| row.identity);
-        let next_selected =
-            selected_identity.and_then(|id| rows.iter().position(|row| row.identity == Some(id)));
+            .map(|row| row.key);
+        let next_selected = selected_key.and_then(|key| rows.iter().position(|row| row.key == key));
         let count_changed = (&(*s).panels)[index].rows.len() != count;
         (&mut (*s).panels)[index].rows = rows;
         (&mut (*s).panels)[index].summary = summary;
@@ -760,9 +967,6 @@ impl table::Model for Model {
     unsafe fn horizontal_columns(&self) -> bool {
         true
     }
-    unsafe fn themed_horizontal(&self) -> bool {
-        true
-    }
     unsafe fn dpi(&self) -> i32 {
         (*self.0).dpi
     }
@@ -779,28 +983,14 @@ impl table::Model for Model {
         self.row_height(0)
     }
     unsafe fn key(&self, row: usize) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let state = &*self.0;
-        let panel = &state.panels[self.1];
-        let Some(entry) = panel.rows.get(row) else {
-            return row as u64;
-        };
-        let Some((pid, created)) = entry.identity else {
-            return row as u64;
-        };
-        let process = created.rotate_left(13) ^ pid as u64;
-        if panel.kind.check() {
-            return process;
-        }
-        // One process owns several rows here (modules, endpoints, files,
-        // services); their text cells tell them apart, so a screen reader
+        // One process owns several rows in most panels (modules, endpoints,
+        // files, services): each keeps its own key, so a screen reader
         // announces each row instead of only the first of a process.
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        process.hash(&mut hasher);
-        for cell in entry.cells.iter().filter(|cell| cell.number.is_none()) {
-            cell.text.hash(&mut hasher);
-        }
-        hasher.finish()
+        let state = &*self.0;
+        state.panels[self.1]
+            .rows
+            .get(row)
+            .map_or(row as u64, |entry| entry.key)
     }
     unsafe fn header(&self, col: usize) -> table::HeaderCell {
         let state = &*self.0;
@@ -940,5 +1130,73 @@ impl table::Model for Model {
             },
             pt.c.row_border,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::{with_language, Language};
+
+    #[test]
+    fn collector_reasons_are_translated_when_shown() {
+        with_language(Language::Korean, || {
+            // Whole codes, and codes followed by their detail.
+            assert_eq!(
+                reason("Preparing file I/O requests", false),
+                "파일 I/O 요청을 준비하는 중입니다"
+            );
+            assert_eq!(
+                reason("Cannot start file I/O trace (Windows 1450)", false),
+                "파일 I/O 추적을 시작할 수 없습니다 (Windows 1450)"
+            );
+            assert_eq!(
+                reason(
+                    "Module list unavailable: Access is denied. (os error 5)",
+                    false
+                ),
+                "모듈 목록을 사용할 수 없습니다: Access is denied. (os error 5)"
+            );
+            assert_eq!(
+                reason(r"D:\ capacity unavailable: The device is not ready.", false),
+                r"D:\ 용량을 확인할 수 없습니다: The device is not ready."
+            );
+            assert_eq!(
+                reason(
+                    "Some resource samples were skipped; waiting for a complete interval",
+                    true
+                ),
+                "일부 리소스 샘플을 건너뛰어 완전한 구간을 기다리는 중입니다"
+            );
+            // The file trace's and the network's administrator notes differ.
+            assert_eq!(
+                reason("Requires administrator", false),
+                "관리자 권한이 필요합니다"
+            );
+            assert_eq!(
+                reason("Requires administrator", true),
+                paint::network_note("Requires administrator").0
+            );
+            assert_eq!(
+                reason("Network trace stopped (error 5)", true),
+                paint::network_note("Network trace stopped").0
+            );
+            // A prefix must be followed by a detail, not by more words.
+            assert_eq!(
+                reason("Endpoint table unavailableX", false),
+                "Endpoint table unavailableX"
+            );
+            assert_eq!(reason("unknown", false), "unknown");
+        });
+        with_language(Language::English, || {
+            assert_eq!(
+                reason("Endpoint limit reached", true),
+                "Endpoint limit reached"
+            );
+            assert_eq!(
+                reason("Requires administrator", false),
+                "Requires administrator"
+            );
+        });
     }
 }

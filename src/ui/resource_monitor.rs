@@ -51,7 +51,7 @@ impl Tab {
     fn panels(self) -> &'static [Kind] {
         match self {
             Self::Overview => &[Kind::Cpu, Kind::Files, Kind::Traffic, Kind::Memory],
-            Self::Cpu => &[Kind::Cpu, Kind::Services, Kind::Handles, Kind::Modules],
+            Self::Cpu => &[Kind::Cpu, Kind::Services, Kind::Modules],
             Self::Memory => &[Kind::Memory, Kind::Physical],
             Self::Disk => &[Kind::Io, Kind::Files, Kind::Storage],
             Self::Network => &[Kind::Network, Kind::Traffic, Kind::Tcp, Kind::Listening],
@@ -66,7 +66,6 @@ enum Kind {
     Io,
     Network,
     Services,
-    Handles,
     Modules,
     Files,
     Storage,
@@ -91,7 +90,6 @@ impl Kind {
                 "Processes with network activity",
             ),
             Self::Services => tr("서비스", "Services"),
-            Self::Handles => tr("연결된 핸들", "Associated handles"),
             Self::Modules => tr("연결된 모듈", "Associated modules"),
             Self::Files => tr(
                 "파일 I/O 요청 · 캐시 포함",
@@ -127,6 +125,10 @@ impl Cell {
 }
 struct Row {
     identity: Option<(u32, u64)>,
+    /// Stable across refreshes: the process of a process row, otherwise what
+    /// the row is about (service, module, file, endpoint, volume) within
+    /// its process. Selection, sort ties and accessible keys follow it.
+    key: u64,
     cells: Vec<Cell>,
 }
 struct Panel {
@@ -189,6 +191,8 @@ struct State {
     pid_index: HashMap<u32, usize>,
     preview: bool,
     creating: bool,
+    /// The control that had the focus when the window was deactivated.
+    focus: HWND,
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -298,6 +302,7 @@ unsafe fn create(owner: *mut App, visible: bool) {
         pid_index: HashMap::new(),
         preview: !visible,
         creating: true,
+        focus: null_mut(),
     }));
     let mut rect: RECT = zeroed();
     GetWindowRect((*owner).hwnd, &mut rect);
@@ -406,7 +411,6 @@ pub(super) unsafe fn request(owner: *mut App) -> crate::resource::Request {
         endpoints: shown(Kind::Tcp) || shown(Kind::Listening),
         volumes: shown(Kind::Storage),
         modules: if shown(Kind::Modules) { selected } else { None },
-        handles: None,
     }
 }
 
@@ -533,7 +537,10 @@ pub(super) unsafe fn refresh(owner: *mut App, _at: Instant) {
     (*s).network = Some(Arc::new(network));
     (*s).files = Some(Arc::new(files));
     if (*s).tab == Tab::Cpu && !(*s).collapsed.contains(&(Tab::Cpu, Kind::Services)) {
-        (*s).services = (*owner).services.clone();
+        (*s).services = (*owner)
+            .resource_services
+            .clone()
+            .unwrap_or_else(|| (*owner).services.clone());
     }
     (*s).process_index.clear();
     (*s).pid_index.clear();
@@ -608,11 +615,15 @@ unsafe fn invalidate(s: *mut State) {
     );
     EnableWindow((*s).clear, i32::from(!(*s).checked.is_empty()));
 }
+/// Rebuild after a view change. `new_data`: it may change what the monitor
+/// collects (tab, panel, checks, tracing, rate), so the monitor is told and
+/// the next sample is taken as soon as it arrives. A search or a sort only
+/// filters and reorders the current frame and never resamples.
 unsafe fn changed(s: *mut State, new_data: bool) {
     if new_data {
         (*s).last_refresh = None;
+        configure((*s).owner);
     }
-    configure((*s).owner);
     content::rebuild(s, (*s).accepted_at.unwrap_or_else(Instant::now));
     view::layout(s);
     invalidate(s);
@@ -870,6 +881,48 @@ unsafe fn toggle(s: *mut State, id: (u32, u64)) {
     }
     changed(s, true);
 }
+/// Most processes the End processes confirmation names; the rest are counted.
+const LISTED: usize = 12;
+
+/// The End processes confirmation for `names` (`name (PID n)`): heading,
+/// text and a warn line when `warnings` (the main window's End task line of
+/// each Windows process among them) is not empty.
+fn end_prompt(names: &[String], warnings: &[&str]) -> (String, String, Option<String>) {
+    let notice = tr(
+        "저장하지 않은 작업은 사라질 수 있습니다. 시스템 프로세스 보호는 그대로 적용됩니다.",
+        "Unsaved work may be lost. System process protections remain in effect.",
+    );
+    let (heading, body) = if let [name] = names {
+        (
+            tf!("{} 프로세스를 종료할까요?", "End {}?", name),
+            notice.to_owned(),
+        )
+    } else {
+        let mut list = names[..names.len().min(LISTED)].join("\n");
+        if names.len() > LISTED {
+            list.push('\n');
+            list.push_str(&tf!("외 {}개", "and {} more", names.len() - LISTED));
+        }
+        (
+            tf!(
+                "프로세스 {}개를 종료할까요?",
+                "End {} processes?",
+                names.len()
+            ),
+            format!("{list}\n\n{notice}"),
+        )
+    };
+    let warn = match warnings {
+        [] => None,
+        [one] if names.len() == 1 => Some((*one).to_owned()),
+        _ => Some(tf!(
+            "Windows 프로세스 {}개가 포함되어 있습니다. 종료하면 Windows가 불안정해지거나 로그아웃될 수 있습니다.",
+            "Includes {} Windows processes. Ending them can make Windows unstable or sign you out.",
+            warnings.len()
+        )),
+    };
+    (heading, body, warn)
+}
 unsafe fn end_processes(s: *mut State, ids: Vec<(u32, u64)>) {
     if ids.is_empty() || (*(*s).owner).busy || (*(*s).owner).modal {
         return;
@@ -882,35 +935,53 @@ unsafe fn end_processes(s: *mut State, ids: Vec<(u32, u64)>) {
                 .processes
                 .iter()
                 .find(|p| (p.pid, p.created) == *id)
-                .map(|p| format!("{} ({})", p.name, p.pid))
+                .map(|p| format!("{} (PID {})", p.name, p.pid))
         })
         .collect();
     if names.is_empty() {
         return;
     }
-    let message=format!("{}\n\n{}",names.iter().take(12).cloned().collect::<Vec<_>>().join("\n"),
-        tr("선택한 프로세스를 종료하시겠습니까? 저장하지 않은 작업은 사라집니다. 시스템 보호 정책이 적용됩니다.",
-           "End the selected processes? Unsaved work will be lost. System process protections remain in effect."));
+    // Only images that really live in the Windows directory, never a guess
+    // from the name (as for the main window's End task).
+    let warnings: Vec<_> = ids
+        .iter()
+        .filter_map(|&(pid, created)| controls::windows_image_warning(pid, created))
+        .collect();
+    let (heading, body, warn) = end_prompt(&names, &warnings);
     let owner = (*s).owner;
+    let focus = GetFocus();
     (*owner).modal = true;
     configure(owner);
-    EnableWindow((*owner).hwnd, 0);
-    let confirmed = MessageBoxW(
-        (*s).hwnd,
-        wide(&message).as_ptr(),
-        wide(&format!(
-            "{} ({})",
-            tr("프로세스 종료", "End processes"),
-            ids.len()
-        ))
-        .as_ptr(),
-        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-    ) == IDYES;
-    EnableWindow((*owner).hwnd, 1);
+    // Feather's confirm dialog over this window (not a MessageBox): Cancel
+    // has the focus; the window's input waits until it closes.
+    let hwnd = (*s).hwnd;
+    let confirmed = popup::confirm_dialog_on(
+        popup::Host {
+            hwnd,
+            dpi: (*s).dpi,
+            fonts: &(*s).fonts,
+        },
+        &popup::ConfirmSpec {
+            title: &heading,
+            body: &body,
+            warn: warn.as_deref(),
+            action: tr("프로세스 종료", "End processes"),
+            cancel: tr("취소", "Cancel"),
+            danger: true,
+        },
+    );
     (*owner).modal = false;
     configure(owner);
     PostMessageW((*owner).hwnd, SNAPSHOT_READY, 0, 0);
     PostMessageW((*owner).hwnd, JOB_READY, 0, 0);
+    // The dialog's message loop ran: act only if this window still exists.
+    let s = owner_state(owner);
+    if s.is_null() || (*s).hwnd != hwnd {
+        return;
+    }
+    if IsWindow(focus) != 0 && IsChild(hwnd, focus) != 0 {
+        SetFocus(focus);
+    }
     if confirmed {
         begin_action(owner, Action::EndMany(ids));
         invalidate(s);
@@ -926,7 +997,8 @@ unsafe fn notify(s: *mut State, l: LPARAM) -> LRESULT {
         LVN_COLUMNCLICK => {
             let n = &*(l as *const NMLISTVIEW);
             let col = n.iSubItem.max(0) as usize;
-            if (&(*s).panels)[index].kind.check() && col == 0 {
+            let check_all = (&(*s).panels)[index].kind.check() && col == 0;
+            if check_all {
                 let ids: Vec<_> = (&(*s).panels)[index]
                     .rows
                     .iter()
@@ -949,7 +1021,9 @@ unsafe fn notify(s: *mut State, l: LPARAM) -> LRESULT {
                     panel.descending = panel.columns.get(col).is_some_and(|c| c.right);
                 }
             }
-            changed(s, false);
+            // Checks can change what is collected (one checked process's
+            // modules); a sort only reorders what the window already has.
+            changed(s, check_all);
         }
         NM_CLICK => {
             let n = &*(l as *const NMITEMACTIVATE);
@@ -1106,7 +1180,21 @@ pub(super) unsafe fn keyboard(owner: *mut App, msg: &MSG) -> bool {
             }
         }
     }
-    if IsDialogMessageW((*s).hwnd, msg as *const MSG) != 0 {
+    let hwnd = (*s).hwnd;
+    let before = GetFocus();
+    if IsDialogMessageW(hwnd, msg as *const MSG) != 0 {
+        // Handling the message can close the window and free its state
+        // (Alt+F4, a button that closes it): use only what is current.
+        let s = owner_state(owner);
+        // Tab into a panel scrolled out of the list brings it into view.
+        // Only keys: a click that focuses a partly visible table must not
+        // move its rows between the press and the release.
+        if matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) && !s.is_null() && (*s).hwnd == hwnd {
+            let focus = GetFocus();
+            if focus != before {
+                body_scroll::reveal(s, focus);
+            }
+        }
         return true;
     }
     false
@@ -1189,8 +1277,32 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             1
         }
         WM_NOTIFY => notify(s, l),
-        WM_CONTEXTMENU => {
+        // A panel's rows; anything else (the caption strip's system menu)
+        // keeps the default handling.
+        WM_CONTEXTMENU if (*s).panels.iter().any(|p| p.table == w as HWND) => {
             context(s, w as HWND, l);
+            0
+        }
+        WM_ACTIVATE if (w >> 16) & 0xffff == 0 => {
+            if (w & 0xffff) as u32 == WA_INACTIVE {
+                let focus = GetFocus();
+                if !focus.is_null() && IsChild(hwnd, focus) != 0 {
+                    (*s).focus = focus;
+                }
+            } else {
+                // Back to the control that had the focus (DefWindowProc
+                // would focus the frame), else the current tab.
+                let saved = (*s).focus;
+                let usable = IsWindow(saved) != 0
+                    && IsChild(hwnd, saved) != 0
+                    && IsWindowVisible(saved) != 0
+                    && IsWindowEnabled(saved) != 0;
+                SetFocus(if usable {
+                    saved
+                } else {
+                    (*s).nav[(*s).tab as usize]
+                });
+            }
             0
         }
         WM_COMMAND => {
@@ -1323,7 +1435,6 @@ pub(super) unsafe fn render_previews(owner: *mut App, dir: &std::path::Path) -> 
             endpoints: true,
             volumes: true,
             modules: identity,
-            handles: None,
         };
         let mut client = crate::resource::Client::default();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1408,6 +1519,292 @@ pub(super) unsafe fn render_previews(owner: *mut App, dir: &std::path::Path) -> 
 }
 
 #[cfg(test)]
+pub(super) unsafe fn assert_end_confirmation(owner: *mut App) {
+    use crate::i18n::{with_language, Language};
+    with_language(Language::English, || {
+        let names: Vec<String> = (0..14).map(|i| format!("app{i}.exe (PID {i})")).collect();
+        let (heading, body, warn) = end_prompt(&names[..1], &[]);
+        assert_eq!(heading, "End app0.exe (PID 0)?");
+        assert!(!body.contains("app0") && warn.is_none());
+        let windows = "This is a Windows process.";
+        let (_, _, warn) = end_prompt(&names[..1], &[windows]);
+        assert_eq!(warn.as_deref(), Some(windows));
+        let (heading, body, warn) = end_prompt(&names, &[windows, windows]);
+        assert_eq!(heading, "End 14 processes?");
+        let lines: Vec<_> = body.lines().collect();
+        assert_eq!(
+            lines[..12],
+            names[..12].iter().map(String::as_str).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(lines[12], "and 2 more");
+        assert!(warn.unwrap().starts_with("Includes 2 Windows processes."));
+        assert!(!end_prompt(&names[..12], &[]).1.contains("more"));
+    });
+    // The dialog belongs to this window: its scrim and card are owned by it
+    // and centred on its client, not on the main window.
+    create(owner, false);
+    let s = owner_state(owner);
+    assert!(!s.is_null());
+    let host = popup::Host {
+        hwnd: (*s).hwnd,
+        dpi: (*s).dpi,
+        fonts: &(*s).fonts,
+    };
+    let spec = popup::ConfirmSpec {
+        title: "End 2 processes?",
+        body: "a
+b",
+        warn: None,
+        action: "End processes",
+        cancel: "Cancel",
+        danger: true,
+    };
+    let (scrim, dialog) = popup::stage_confirm_on(host, &spec).unwrap();
+    for popup in [scrim, dialog] {
+        assert_eq!(GetWindow(popup, GW_OWNER), (*s).hwnd);
+    }
+    let mut client: RECT = zeroed();
+    GetClientRect((*s).hwnd, &mut client);
+    MapWindowPoints((*s).hwnd, null_mut(), (&mut client as *mut RECT).cast(), 2);
+    // (The layered window also holds the card's shadow, deeper below.)
+    popup::settle(dialog);
+    let mut card: RECT = zeroed();
+    GetWindowRect(dialog, &mut card);
+    let centre = |a: i32, b: i32| (a + b) / 2;
+    assert!((centre(card.left, card.right) - centre(client.left, client.right)).abs() <= 2);
+    assert!(card.top > client.top && card.bottom < client.bottom);
+    popup::destroy(dialog);
+    popup::destroy(scrim);
+    close(owner);
+}
+
+/// Open the window shown (so it counts as active and its controls take the
+/// focus) without appearing on screen: transparent, not in the taskbar.
+#[cfg(test)]
+unsafe fn show_invisibly(owner: *mut App) -> *mut State {
+    create(owner, false);
+    let s = owner_state(owner);
+    assert!(!s.is_null());
+    let hwnd = (*s).hwnd;
+    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & !WS_EX_APPWINDOW;
+    SetWindowLongPtrW(
+        hwnd,
+        GWL_EXSTYLE,
+        (style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize,
+    );
+    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    s
+}
+
+/// [`show_invisibly`] with tracing on.
+#[cfg(test)]
+pub(super) unsafe fn show_traced(owner: *mut App) {
+    let s = show_invisibly(owner);
+    (*s).detailed = true;
+    changed(s, true);
+}
+
+#[cfg(test)]
+pub(super) unsafe fn assert_keyboard_focus(owner: *mut App) {
+    let s = show_invisibly(owner);
+    let hwnd = (*s).hwnd;
+    // Alt alone is consumed: DefWindowProc would enter an invisible menu
+    // mode that eats the next key.
+    assert_eq!(
+        chrome::message(s, hwnd, WM_SYSCOMMAND, SC_KEYMENU as usize, 0),
+        Some(0)
+    );
+    // A short window: the last panel starts below the visible list.
+    super::fit_client(hwnd, 780, 560);
+    view::layout(s);
+    (*s).scroll = 0;
+    view::layout_body(s);
+    let last = (*s).panels.last().unwrap();
+    let (header, table) = (last.header, last.table);
+    let mut body: RECT = zeroed();
+    GetClientRect((*s).body, &mut body);
+    assert!(
+        last.bounds.bottom > body.bottom,
+        "precondition: out of view"
+    );
+    // A click focuses the table without scrolling: the rows must stay
+    // under the pointer between the press and the release.
+    SetFocus((*s).nav[0]);
+    let at = (40 << 16 | 60) as isize;
+    for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+        let click = MSG {
+            hwnd: table,
+            message,
+            wParam: if message == WM_LBUTTONDOWN {
+                1 // MK_LBUTTON
+            } else {
+                0
+            },
+            lParam: at,
+            ..zeroed()
+        };
+        assert!(keyboard(owner, &click));
+    }
+    assert_eq!(GetFocus(), table);
+    assert_eq!((*s).scroll, 0, "a click does not scroll the list");
+    SetFocus(header);
+    let tab = MSG {
+        hwnd: header,
+        message: WM_KEYDOWN,
+        wParam: VK_TAB as usize,
+        ..zeroed()
+    };
+    assert!(keyboard(owner, &tab));
+    assert_eq!(GetFocus(), table, "Tab moves from the header to its table");
+    let mut shown: RECT = zeroed();
+    GetWindowRect(table, &mut shown);
+    MapWindowPoints(null_mut(), (*s).body, (&mut shown as *mut RECT).cast(), 2);
+    assert!(
+        shown.top >= 0 && shown.top < body.bottom,
+        "the focused table is scrolled into view: {} in 0..{}",
+        shown.top,
+        body.bottom
+    );
+    assert!((*s).scroll > 0);
+    // Deactivating keeps the focused control; activating returns to it.
+    SendMessageW(hwnd, WM_ACTIVATE, WA_INACTIVE as usize, 0);
+    SetFocus((*s).search);
+    SendMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE as usize, 0);
+    assert_eq!(GetFocus(), table);
+    // A control that no longer exists falls back to the current tab.
+    (*s).focus = null_mut();
+    SendMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE as usize, 0);
+    assert_eq!(GetFocus(), (*s).nav[(*s).tab as usize]);
+    // A key that closes the window while IsDialogMessage handles it (here
+    // through the search box) frees its state: nothing may use it after.
+    unsafe extern "system" fn close_on_f9(
+        control: HWND,
+        msg: u32,
+        w: WPARAM,
+        l: LPARAM,
+        id: usize,
+        window: usize,
+    ) -> LRESULT {
+        if msg == WM_NCDESTROY {
+            RemoveWindowSubclass(control, Some(close_on_f9), id);
+        }
+        if msg == WM_KEYDOWN && w == VK_F9 as usize {
+            DestroyWindow(window as HWND);
+            return 0;
+        }
+        DefSubclassProc(control, msg, w, l)
+    }
+    let search = (*s).search;
+    SetWindowSubclass(search, Some(close_on_f9), 0xF9, hwnd as usize);
+    SetFocus(search);
+    let key = MSG {
+        hwnd: search,
+        message: WM_KEYDOWN,
+        wParam: VK_F9 as usize,
+        ..zeroed()
+    };
+    assert!(keyboard(owner, &key));
+    assert!((*owner).resource_window.is_null() && IsWindow(hwnd) == 0);
+}
+
+/// A kept frame's reasons follow a language change on the next rebuild:
+/// the collectors report codes, translated only when shown.
+#[cfg(test)]
+pub(super) unsafe fn assert_reasons_follow_the_language(owner: *mut App) {
+    use crate::i18n::{with_language, Language};
+    create(owner, false);
+    let s = owner_state(owner);
+    assert!(!s.is_null());
+    set_tab(s, Tab::Disk);
+    (*s).detailed = true;
+    (*s).files = Some(Arc::new(crate::fileetw::Sample {
+        enabled: true,
+        reason: Some("Preparing file I/O requests".into()),
+        ..Default::default()
+    }));
+    let shown = |language| {
+        with_language(language, || {
+            content::rebuild(s, Instant::now());
+            let panel = (*s).panels.iter().find(|p| p.kind == Kind::Files).unwrap();
+            (panel.summary.clone(), panel.empty.clone())
+        })
+    };
+    let korean = "파일 I/O 요청을 준비하는 중입니다";
+    assert_eq!(shown(Language::Korean), (korean.into(), korean.into()));
+    let english = "Preparing file I/O requests";
+    assert_eq!(shown(Language::English), (english.into(), english.into()));
+    close(owner);
+}
+
+#[cfg(test)]
+pub(super) unsafe fn assert_rows_keep_identity(owner: *mut App) {
+    create(owner, false);
+    let s = owner_state(owner);
+    assert!(!s.is_null());
+    let service = |name: &str| Service {
+        name: name.into(),
+        display_name: name.into(),
+        state: SERVICE_RUNNING,
+        pid: 0,
+        start_type: None,
+    };
+    set_tab(s, Tab::Cpu);
+    (*s).services = vec![service("Alpha"), service("Bravo")];
+    content::rebuild(s, Instant::now());
+    let index = (*s)
+        .panels
+        .iter()
+        .position(|p| p.kind == Kind::Services)
+        .unwrap();
+    let table = (&(*s).panels)[index].table;
+    let item = LVITEMW {
+        stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+        state: LVIS_SELECTED | LVIS_FOCUSED,
+        ..zeroed()
+    };
+    SendMessageW(table, LVM_SETITEMSTATE, 1, &item as *const LVITEMW as isize);
+    // A service sorted before the selected one moves its row: the
+    // selection stays on Bravo instead of on row 1.
+    (*s).services.insert(0, service("Aardvark"));
+    content::rebuild(s, Instant::now());
+    let selected = SendMessageW(table, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
+    assert_eq!(selected, 2);
+    assert_eq!((&(*s).panels)[index].rows[2].cells[0].text, "Bravo");
+    // Rows the collectors deliver in hash-map order, with equal rates, keep
+    // one order on every refresh.
+    set_tab(s, Tab::Disk);
+    (*s).detailed = true;
+    let process = (*s).snapshot.as_ref().unwrap().processes[0].clone();
+    let file = |path: &&str| crate::fileetw::Row {
+        pid: process.pid,
+        created: process.created,
+        path: (*path).into(),
+        read_bytes_per_sec: 10.0,
+        write_bytes_per_sec: 0.0,
+    };
+    for order in [["b.log", "a.log", "c.log"], ["c.log", "a.log", "b.log"]] {
+        (*s).files = Some(Arc::new(crate::fileetw::Sample {
+            enabled: true,
+            measured: true,
+            interval_seconds: 1.0,
+            rows: order.iter().map(file).collect(),
+            ..Default::default()
+        }));
+        content::rebuild(s, Instant::now());
+        let panel = (*s).panels.iter().find(|p| p.kind == Kind::Files).unwrap();
+        let paths: Vec<_> = panel
+            .rows
+            .iter()
+            .map(|r| r.cells[2].text.as_str())
+            .collect();
+        assert_eq!(paths, ["a.log", "b.log", "c.log"]);
+        assert!(panel.columns.len() == 6 && panel.rows.iter().all(|r| r.cells.len() == 6));
+    }
+    close(owner);
+}
+
+#[cfg(test)]
 pub(super) unsafe fn assert_snapshot_lifecycle(owner: *mut App) {
     create(owner, false);
     let s = owner_state(owner);
@@ -1448,6 +1845,7 @@ pub(super) unsafe fn assert_snapshot_lifecycle(owner: *mut App) {
             .iter()
             .map(|name| Row {
                 identity: Some(id),
+                key: content::row_key((id, *name)),
                 cells: vec![Cell::text(*name)],
             })
             .collect();

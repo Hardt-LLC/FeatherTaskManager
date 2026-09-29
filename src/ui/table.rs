@@ -152,13 +152,11 @@ pub(super) trait Model {
     unsafe fn horizontal_columns(&self) -> bool {
         self.editable_columns()
     }
-    /// Use the theme-aware client scrollbar instead of Windows' native bar.
-    unsafe fn themed_horizontal(&self) -> bool {
-        false
-    }
     unsafe fn resize_column(&self, _column: usize, _width: f32) {}
     unsafe fn reorder_column(&self, _from: usize, _to: usize) {}
-    unsafe fn column_menu(&self, _column: usize, _point: POINT) {}
+    /// The column menu at the screen point `point`: for the shown column
+    /// `column`, or (None, opened from the keyboard) for any of them.
+    unsafe fn column_menu(&self, _column: Option<usize>, _point: POINT) {}
     /// Clickable parts of `row` laid out in the row rectangle `r` with the
     /// column cells `cells` (same geometry the painter uses).
     unsafe fn parts(&self, _row: usize, _r: RECT, _cells: &[RECT]) -> Parts {
@@ -346,7 +344,6 @@ struct State {
     horizontal_offset: i32,
     horizontal_max: i32,
     horizontal_page: i32,
-    horizontal_syncing: bool,
     horizontal_bar: horizontal::Bar,
     redraw: bool,
     typed: String,
@@ -452,7 +449,6 @@ impl State {
             horizontal_offset: 0,
             horizontal_max: 0,
             horizontal_page: 0,
-            horizontal_syncing: false,
             horizontal_bar: horizontal::Bar::default(),
             redraw: true,
             typed: String::new(),
@@ -658,6 +654,22 @@ pub(super) unsafe fn scroll_offset(hwnd: HWND) -> f32 {
     }
 }
 
+/// Horizontal overflow (tests): offset, maximum offset and the height of
+/// the themed bar (0 while the columns fit), in device px.
+#[cfg(test)]
+pub(super) unsafe fn horizontal_state(hwnd: HWND) -> (i32, i32, i32) {
+    let s = state(hwnd);
+    if s.is_null() {
+        (0, 0, 0)
+    } else {
+        (
+            (*s).horizontal_offset,
+            (*s).horizontal_max,
+            horizontal::height(s),
+        )
+    }
+}
+
 /// The scrollable extent (content, view) in device px.
 pub(super) unsafe fn extent(hwnd: HWND) -> Extent {
     let s = state(hwnd);
@@ -758,9 +770,6 @@ unsafe fn column_spans(s: *mut State) -> Vec<(i32, i32)> {
 }
 
 unsafe fn sync_horizontal(s: *mut State) {
-    if (*s).horizontal_syncing {
-        return;
-    }
     let area = client(s);
     let maximum = if (*s).model.horizontal_columns() {
         (column_spans(s)
@@ -777,21 +786,6 @@ unsafe fn sync_horizontal(s: *mut State) {
     (*s).horizontal_max = maximum;
     (*s).horizontal_page = area.right;
     (*s).horizontal_offset = (*s).horizontal_offset.clamp(0, maximum);
-    if (*s).model.themed_horizontal() {
-        return;
-    }
-    (*s).horizontal_syncing = true;
-    let info = SCROLLINFO {
-        cbSize: size_of::<SCROLLINFO>() as u32,
-        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
-        nMin: 0,
-        nMax: (maximum + area.right - 1).max(0),
-        nPage: area.right.max(0) as u32,
-        nPos: (*s).horizontal_offset,
-        ..zeroed()
-    };
-    SetScrollInfo((*s).hwnd, SB_HORZ, &info, 1);
-    (*s).horizontal_syncing = false;
 }
 
 unsafe fn horizontal_to(s: *mut State, position: i32) {
@@ -800,15 +794,6 @@ unsafe fn horizontal_to(s: *mut State, position: i32) {
         return;
     }
     (*s).horizontal_offset = next;
-    let info = SCROLLINFO {
-        cbSize: size_of::<SCROLLINFO>() as u32,
-        fMask: SIF_POS,
-        nPos: next,
-        ..zeroed()
-    };
-    if !(*s).model.themed_horizontal() {
-        SetScrollInfo((*s).hwnd, SB_HORZ, &info, 1);
-    }
     (*s).painted_offset = None;
     InvalidateRect((*s).hwnd, null(), 0);
 }
@@ -2334,13 +2319,31 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         WM_CONTEXTMENU if (*s).model.editable_columns() => {
-            let mut pt = point(l);
-            if l != -1 {
+            let keyboard =
+                (l & 0xffff) as u16 as i16 == -1 && ((l >> 16) & 0xffff) as u16 as i16 == -1;
+            let target = if keyboard {
+                // Shift+F10 / the menu key while pointing at a header cell:
+                // that column's menu below the cell (rows keep their menu).
+                (*s).hover_header.and_then(|column| {
+                    let (left, _) = *column_spans(s).get(column)?;
+                    let mut at = POINT {
+                        x: left.max(0),
+                        y: (*s).model.header_height(),
+                    };
+                    ClientToScreen(hwnd, &mut at);
+                    Some((column, at))
+                })
+            } else {
+                let mut pt = point(l);
                 ScreenToClient(hwnd, &mut pt);
-                if let Hit::Header(column) = hit(s, pt) {
-                    (*s).model.column_menu(column, point(l));
-                    return 0;
+                match hit(s, pt) {
+                    Hit::Header(column) => Some((column, point(l))),
+                    _ => None,
                 }
+            };
+            if let Some((column, at)) = target {
+                (*s).model.column_menu(Some(column), at);
+                return 0;
             }
             DefWindowProcW(hwnd, msg, w, l)
         }
@@ -2354,13 +2357,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             }
             0
         }
+        // The themed bar replaces Windows' native one (which ignores the
+        // dark theme); scroll requests from other sources still work.
         WM_HSCROLL => {
-            let mut info = SCROLLINFO {
-                cbSize: size_of::<SCROLLINFO>() as u32,
-                fMask: SIF_TRACKPOS,
-                ..zeroed()
-            };
-            GetScrollInfo(hwnd, SB_HORZ, &mut info);
             let now = (*s).horizontal_offset;
             let page = client(s).right.max(1);
             let next = match (w & 0xffff) as i32 {
@@ -2370,7 +2369,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 SB_PAGERIGHT => now + page,
                 SB_LEFT => 0,
                 SB_RIGHT => (*s).horizontal_max,
-                SB_THUMBPOSITION | SB_THUMBTRACK => info.nTrackPos,
                 _ => now,
             };
             horizontal_to(s, next);
@@ -2404,7 +2402,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                     y: (*s).model.header_height(),
                 };
                 ClientToScreen(hwnd, &mut at);
-                (*s).model.column_menu(0, at);
+                (*s).model.column_menu(None, at);
                 return 0;
             }
             if key_down(s, w as u16) {
@@ -2981,7 +2979,7 @@ impl Model for AppRows {
     unsafe fn reorder_column(&self, from: usize, to: usize) {
         process_columns::reorder(self.0, from, to);
     }
-    unsafe fn column_menu(&self, column: usize, point: POINT) {
+    unsafe fn column_menu(&self, column: Option<usize>, point: POINT) {
         process_columns::menu(self.0, column, point);
     }
     unsafe fn parts(&self, row: usize, r: RECT, cells: &[RECT]) -> Parts {
@@ -3292,6 +3290,9 @@ mod tests {
         }
     }
 
+    /// The column menus a test table asked for: (column, screen x, y).
+    type Menus = Rc<RefCell<Vec<(Option<usize>, i32, i32)>>>;
+
     fn events() -> Vec<(u32, i32)> {
         EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()))
     }
@@ -3304,9 +3305,19 @@ mod tests {
         /// Row 1's expanded state and row 3's switch, shared with the test.
         open: Rc<Cell<bool>>,
         on: Rc<Cell<bool>>,
+        /// Editable columns: the column menus asked for.
+        menus: Option<Menus>,
     }
 
     impl Model for Fake {
+        unsafe fn editable_columns(&self) -> bool {
+            self.menus.is_some()
+        }
+        unsafe fn column_menu(&self, column: Option<usize>, point: POINT) {
+            if let Some(menus) = &self.menus {
+                menus.borrow_mut().push((column, point.x, point.y));
+            }
+        }
         unsafe fn dpi(&self) -> i32 {
             96
         }
@@ -3388,10 +3399,14 @@ mod tests {
         table: HWND,
         open: Rc<Cell<bool>>,
         on: Rc<Cell<bool>>,
+        menus: Menus,
     }
 
     impl Harness {
         fn new(mode: Mode, rows: usize) -> Self {
+            Self::build(mode, rows, false)
+        }
+        fn build(mode: Mode, rows: usize, editable: bool) -> Self {
             unsafe {
                 gfx::startup();
                 static PARENT: OnceLock<Vec<u16>> = OnceLock::new();
@@ -3423,11 +3438,13 @@ mod tests {
                 assert!(!parent.is_null());
                 let open = Rc::new(Cell::new(false));
                 let on = Rc::new(Cell::new(true));
+                let menus = Rc::new(RefCell::new(Vec::new()));
                 let model = Box::new(Fake {
                     fonts: Fonts::new(96, Language::English),
                     groups: vec![0, 10],
                     open: open.clone(),
                     on: on.clone(),
+                    menus: editable.then(|| menus.clone()),
                 });
                 let table = create(parent, 7, "fake", mode, model);
                 assert!(!table.is_null());
@@ -3469,6 +3486,7 @@ mod tests {
                     table,
                     open,
                     on,
+                    menus,
                 }
             }
         }
@@ -3533,6 +3551,43 @@ mod tests {
         assert_eq!(step(10, g, Some(6), Nav::End, 3), Some(8));
         assert_eq!(step(3, |_| true, None, Nav::Down, 3), None, "only groups");
         assert_eq!(step(0, g, None, Nav::Down, 3), None);
+    }
+
+    #[test]
+    fn column_menus_target_the_pointed_header_or_every_column_from_the_keyboard() {
+        let h = Harness::build(Mode::Table, 3, true);
+        unsafe {
+            let screen = |x: i32, y: i32| {
+                let mut at = POINT { x, y };
+                ClientToScreen(h.table, &mut at);
+                (at.x, at.y)
+            };
+            let keyboard = 0xFFFF_FFFF_isize;
+            let value = column_spans(state(h.table))[1].0;
+            // Shift+F10 over the rows keeps the row menu (the parent's).
+            SendMessageW(h.table, WM_CONTEXTMENU, h.table as usize, keyboard);
+            assert!(h.menus.borrow().is_empty());
+            // Right-click on a header cell: that column, at the pointer.
+            let (x, y) = screen(20, 10);
+            SendMessageW(h.table, WM_CONTEXTMENU, h.table as usize, Harness::at(x, y));
+            assert_eq!(h.menus.borrow().last(), Some(&(Some(0), x, y)));
+            // Shift+F10 while pointing at the Value header: below its cell.
+            SendMessageW(h.table, WM_MOUSEMOVE, 0, Harness::at(value + 20, 10));
+            SendMessageW(h.table, WM_CONTEXTMENU, h.table as usize, keyboard);
+            let (x, y) = screen(value, 34);
+            assert_eq!(h.menus.borrow().last(), Some(&(Some(1), x, y)));
+            // Ctrl+Shift+C: no header is pointed at, every column is offered.
+            let mut keys = [0u8; 256];
+            GetKeyboardState(keys.as_mut_ptr());
+            let saved = keys;
+            keys[VK_CONTROL as usize] = 0x80;
+            keys[VK_SHIFT as usize] = 0x80;
+            SetKeyboardState(keys.as_ptr());
+            h.key(b'C' as u16);
+            SetKeyboardState(saved.as_ptr());
+            assert_eq!(h.menus.borrow().last().map(|m| m.0), Some(None));
+            assert_eq!(h.menus.borrow().len(), 3);
+        }
     }
 
     #[test]

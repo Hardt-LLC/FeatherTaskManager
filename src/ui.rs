@@ -396,6 +396,9 @@ struct App {
     resource_window: HWND,
     resource_snapshot: Option<Arc<Snapshot>>,
     resource_performance: Option<Arc<PerfSnapshot>>,
+    /// A services list only the Resource Monitor asked for while the
+    /// Services page was paused (whose rows index `services`).
+    resource_services: Option<Vec<Service>>,
     resource_network: Option<Arc<ProcessNetworkSample>>,
     resource_data: Option<Arc<crate::resource::Snapshot>>,
     resource_files: Option<Arc<crate::fileetw::Sample>>,
@@ -460,6 +463,8 @@ struct App {
     /// clears it and the switch slides back.
     startup_pending: Option<(String, bool)>,
     services_loading: bool,
+    /// The services job in flight is the Resource Monitor's alone.
+    services_for_monitor: bool,
     startup_loaded: bool,
     services_loaded: bool,
     error: Option<String>,
@@ -529,6 +534,7 @@ impl App {
             resource_window: null_mut(),
             resource_snapshot: None,
             resource_performance: None,
+            resource_services: None,
             resource_network: None,
             resource_data: None,
             resource_files: None,
@@ -579,6 +585,7 @@ impl App {
             startup_refresh_pending: false,
             startup_pending: None,
             services_loading: false,
+            services_for_monitor: false,
             startup_loaded: false,
             services_loaded: false,
             error: None,
@@ -811,6 +818,12 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
     // user comes back. The sampler stays warm across page switches; only a
     // pause (also minimized or modal) drops it, and that gap is recorded.
     let mut perf: Option<PerfSampler> = None;
+    // Firmware temperatures keep their cache and retry schedule across those
+    // pauses: the sampler moves out of a dropped PerfSampler into the next.
+    let mut thermal = crate::thermal::ThermalSampler::default();
+    let resume_perf = |thermal: &mut crate::thermal::ThermalSampler| {
+        PerfSampler::new().map(|sampler| sampler.with_thermal(std::mem::take(thermal)))
+    };
     // One GPU attribution tracker and one network trace for the monitor's
     // lifetime; the trace (an ETW session, elevated only) ends when this
     // thread returns on Stop.
@@ -828,11 +841,16 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
     let mut paused = false;
     let mut refresh = true;
     let mut manual_refresh = false;
+    // What a sample collects changed since the last one (a panel opened, a
+    // column or trace turned on): the next Configure samples at once.
+    let mut new_work = false;
+    let mut traces = (false, false);
     // When the last sample was taken: the next one is due one interval
     // later, whatever commands arrive in between.
     let mut last: Option<Instant> = None;
     loop {
         if refresh {
+            new_work = false;
             let elapsed = last.map_or(Duration::from_millis(interval), |at| at.elapsed());
             last = Some(Instant::now());
             if sampler.is_err() {
@@ -849,7 +867,7 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
             let resource_data = resource.sample(&resource_request, processes);
             let resource_files = files.sample(processes, elapsed);
             if perf.is_none() {
-                match PerfSampler::new() {
+                match resume_perf(&mut thermal) {
                     Ok(s) => perf = Some(s),
                     Err(e) => {
                         let value = MonitorSample {
@@ -918,7 +936,9 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
         };
         match result {
             Ok(Command::Resource(request, file_trace, endpoint_trace)) => {
+                new_work |= request != resource_request || (file_trace, endpoint_trace) != traces;
                 resource_request = request;
+                traces = (file_trace, endpoint_trace);
                 // Stop optional work even when both windows are paused and
                 // no further sampling iteration is scheduled.
                 if request == crate::resource::Request::default() {
@@ -929,6 +949,7 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 refresh = false;
             }
             Ok(Command::Metadata(needs)) => {
+                new_work |= needs != metadata_needs;
                 metadata_needs = needs;
                 refresh = false;
             }
@@ -937,6 +958,9 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 interval: i,
                 paused: p,
             }) => {
+                // Resizes, keystrokes and page switches re-send the same
+                // configuration: only a change samples ahead of schedule.
+                let changed = i != interval || p != paused || std::mem::take(&mut new_work);
                 interval = i;
                 if p && !paused {
                     // Bytes counted while paused are not shown: the first
@@ -947,7 +971,9 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 paused = p;
                 if paused {
                     // Rates after a pause start over (the UI records the gap).
-                    perf = None;
+                    if let Some(sampler) = perf.take() {
+                        thermal = sampler.into_thermal();
+                    }
                 }
                 // A sample only milliseconds after the previous one measures
                 // CPU over a sliver of time: a needle at the start of every
@@ -958,9 +984,9 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 let recent = last.is_some_and(|at| {
                     at.elapsed() < Duration::from_millis((interval / 2).max(100))
                 });
-                refresh = manual_refresh || (!paused && !recent);
+                refresh = manual_refresh || (changed && !paused && !recent);
                 if !paused && recent && perf.is_none() {
-                    if let Ok(mut sampler) = PerfSampler::new() {
+                    if let Ok(mut sampler) = resume_perf(&mut thermal) {
                         let _ = sampler.sample();
                         perf = Some(sampler);
                     }
@@ -2297,10 +2323,16 @@ unsafe fn configure(p: *mut App) {
         let _ = (*p).tx.send(Command::Metadata(needs));
     }
     let main_paused = (*p).paused || (*p).minimized || (*p).modal;
-    let resource_active = !(*p).modal && resource_monitor::interval((*p).resource_window).is_some();
+    let resource_shown = resource_monitor::interval((*p).resource_window).is_some();
+    let resource_active = !(*p).modal && resource_shown;
     let request = if resource_active {
         let (files, endpoints) = resource_monitor::tracing((*p).resource_window);
         (resource_monitor::request(p), files, endpoints)
+    } else if resource_shown {
+        // A menu or dialog pauses sampling but keeps the request: stopping
+        // the file and endpoint traces for it would restart (and re-prime)
+        // their ETW sessions after every menu.
+        (*p).resource_request
     } else {
         Default::default()
     };
@@ -2330,6 +2362,11 @@ unsafe fn configure(p: *mut App) {
     });
 }
 unsafe fn request_list(p: *mut App, page: Page) {
+    if page == Page::Services {
+        // The main window asked: it gets the next list, also one that is
+        // already in flight for the Resource Monitor.
+        (*p).services_for_monitor = false;
+    }
     let job = match page {
         Page::Startup if !(*p).startup_loading => {
             (*p).startup_loading = true;
@@ -3423,15 +3460,26 @@ unsafe fn drain_snapshot(p: *mut App) {
         (*p).resource_files = Some(Arc::new(sample.resource_files));
         resource_monitor::refresh(p, sample.at);
     }
-    if (((*p).page == Page::Services && !(*p).paused && !(*p).minimized)
-        || resource_monitor::needs_services((*p).resource_window))
-        && !(*p).busy
-        && (*p).last_services.elapsed() >= Duration::from_secs(5)
-    {
-        request_list(p, Page::Services);
-    }
+    refresh_services(p);
     if main_updates {
         redraw(p);
+    }
+}
+/// Reload services every 5 s while a live Services page or the Resource
+/// Monitor's Services panel shows them.
+unsafe fn refresh_services(p: *mut App) {
+    let main = (*p).page == Page::Services && !(*p).paused && !(*p).minimized;
+    if !(main || resource_monitor::needs_services((*p).resource_window))
+        || (*p).busy
+        || (*p).last_services.elapsed() < Duration::from_secs(5)
+    {
+        return;
+    }
+    if main {
+        request_list(p, Page::Services);
+    } else if !(*p).services_loading {
+        request_list(p, Page::Services);
+        (*p).services_for_monitor = (*p).services_loading;
     }
 }
 unsafe fn drain_jobs(p: *mut App) {
@@ -3488,8 +3536,23 @@ unsafe fn drain_jobs(p: *mut App) {
                     rebuild(p, identity);
                 }
             }
+            JobResult::Services(result)
+                if std::mem::take(&mut (*p).services_for_monitor)
+                    && (*p).page == Page::Services
+                    && ((*p).paused || (*p).minimized) =>
+            {
+                // A paused Services page keeps its frame; only the Resource
+                // Monitor takes this list.
+                (*p).services_loading = false;
+                if let Ok(services) = result {
+                    (*p).resource_services = Some(services);
+                }
+            }
             JobResult::Services(result) => {
                 (*p).services_loading = false;
+                if result.is_ok() {
+                    (*p).resource_services = None;
+                }
                 match result {
                     Ok(s) => {
                         if let Some(detail) = &mut (*p).service_details {
@@ -4374,6 +4437,73 @@ mod tests {
         }
     }
     #[test]
+    fn menus_and_dialogs_pause_sampling_but_keep_resource_monitor_tracing() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::show_traced(test.p);
+            let traced = (*test.p).resource_request;
+            assert!(traced.1 && traced.2, "file and endpoint tracing are on");
+            while test.commands.try_recv().is_ok() {}
+            // A menu or confirm dialog: modal while it runs.
+            (*test.p).modal = true;
+            configure(test.p);
+            (*test.p).modal = false;
+            configure(test.p);
+            let sent: Vec<_> = test.commands.try_iter().collect();
+            assert!(
+                !sent.iter().any(|c| matches!(c, Command::Resource(..))),
+                "the traces are neither stopped nor restarted"
+            );
+            assert!(sent
+                .iter()
+                .any(|c| matches!(c, Command::Configure { paused: true, .. })));
+            assert!(matches!(
+                sent.last(),
+                Some(Command::Configure { paused: false, .. })
+            ));
+            assert_eq!((*test.p).resource_request, traced);
+            // Closing the window still stops them.
+            resource_monitor::close(test.p);
+            assert!(test.commands.try_iter().any(|c| matches!(
+                c,
+                Command::Resource(request, false, false) if request == Default::default()
+            )));
+        }
+    }
+    #[test]
+    fn resource_monitor_confirms_ending_processes_over_its_own_window() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_end_confirmation(test.p);
+        }
+    }
+    #[test]
+    fn resource_monitor_keyboard_focus_scrolls_into_view_and_survives_activation() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_keyboard_focus(test.p);
+        }
+    }
+    #[test]
+    fn resource_monitor_reasons_follow_a_language_change() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_reasons_follow_the_language(test.p);
+        }
+    }
+    #[test]
+    fn resource_monitor_rows_keep_their_identity_across_refreshes() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_rows_keep_identity(test.p);
+        }
+    }
+    #[test]
     fn counts_and_memory_use_thousands_separators() {
         assert_eq!(grouped(7u32), "7");
         assert_eq!(grouped(470u32), "470");
@@ -4388,40 +4518,82 @@ mod tests {
 
     #[test]
     fn new_task_dialog_cancels_without_a_job_and_submits_exact_arguments() {
-        use std::cell::Cell;
+        use std::cell::{Cell, RefCell};
         use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        /// What the hook does with the dialog: Cancel, Run, or Run a missing
+        /// program (the dialog stays open with its error) and then Cancel.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Plan {
+            Cancel,
+            Run,
+            RunMissing,
+            /// Run, then Cancel once the dialog says the check is slow.
+            RunSlow,
+        }
         thread_local! {
-            static PLAN: Cell<(usize, bool)> = const { Cell::new((0, false)) };
+            static PLAN: Cell<(usize, Plan)> = const { Cell::new((0, Plan::Cancel)) };
+            static PROGRAM: RefCell<String> = const { RefCell::new(String::new()) };
             static INSPECTED: Cell<bool> = const { Cell::new(false) };
+            static ERROR_LINE: RefCell<String> = const { RefCell::new(String::new()) };
+            static WAITED: Cell<u32> = const { Cell::new(0) };
+            static LABELED: Cell<bool> = const { Cell::new(false) };
+        }
+        /// Run resolves the program on a worker thread: wait (a pumped
+        /// timer) for its rejection, then cancel; never wait over 10 s.
+        unsafe extern "system" fn await_error(dialog: HWND, _: u32, timer: usize, _: u32) {
+            let mut text = [0u16; 512];
+            let length = GetDlgItemTextW(dialog, 705, text.as_mut_ptr(), text.len() as i32);
+            let line = String::from_utf16_lossy(&text[..length as usize]);
+            WAITED.set(WAITED.get() + 1);
+            let labeled = line == run_task::checking_text();
+            LABELED.set(LABELED.get() || labeled);
+            let done = if PLAN.get().1 == Plan::RunSlow {
+                labeled
+            } else {
+                !line.is_empty() && !labeled
+            };
+            if done || WAITED.get() > 500 {
+                KillTimer(dialog, timer);
+                PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0);
+            }
         }
         unsafe extern "system" fn dialog_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-            if code == HCBT_ACTIVATE as i32 {
-                let dialog = w as HWND;
-                let (owner, submit) = PLAN.get();
-                if GetWindow(dialog, GW_OWNER) as usize == owner
-                    && !GetDlgItem(dialog, 701).is_null()
-                {
-                    INSPECTED.set(IsWindowEnabled(GetDlgItem(dialog, IDOK)) == 0);
-                    SetDlgItemTextW(
-                        dialog,
-                        701,
-                        wide(r#""C:\Program Files\Example\app.exe" --inline"#).as_ptr(),
-                    );
-                    SetDlgItemTextW(dialog, 702, wide(r#""two words" &literal"#).as_ptr());
-                    // One click turns the owner-drawn administrator switch on
-                    // (BM_CLICK would re-activate the dialog inside this hook).
-                    SendMessageW(
-                        dialog,
-                        WM_COMMAND,
-                        (BN_CLICKED as usize) << 16 | 704,
-                        GetDlgItem(dialog, 704) as isize,
-                    );
-                    PostMessageW(
-                        dialog,
-                        WM_COMMAND,
-                        if submit { IDOK } else { IDCANCEL } as usize,
-                        0,
-                    );
+            let dialog = w as HWND;
+            let (owner, plan) = PLAN.get();
+            let ours = |dialog: HWND| unsafe {
+                GetWindow(dialog, GW_OWNER) as usize == owner && !GetDlgItem(dialog, 701).is_null()
+            };
+            if code == HCBT_DESTROYWND as i32 && ours(dialog) {
+                let mut text = [0u16; 512];
+                let length = GetDlgItemTextW(dialog, 705, text.as_mut_ptr(), text.len() as i32);
+                ERROR_LINE.with(|line| {
+                    *line.borrow_mut() = String::from_utf16_lossy(&text[..length as usize])
+                });
+            }
+            if code == HCBT_ACTIVATE as i32 && ours(dialog) {
+                INSPECTED.set(IsWindowEnabled(GetDlgItem(dialog, IDOK)) == 0);
+                let program = PROGRAM.with(|program| wide(&program.borrow()));
+                SetDlgItemTextW(dialog, 701, program.as_ptr());
+                SetDlgItemTextW(dialog, 702, wide(r#""two words" &literal"#).as_ptr());
+                // One click turns the owner-drawn administrator switch on
+                // (BM_CLICK would re-activate the dialog inside this hook).
+                SendMessageW(
+                    dialog,
+                    WM_COMMAND,
+                    (BN_CLICKED as usize) << 16 | 704,
+                    GetDlgItem(dialog, 704) as isize,
+                );
+                WAITED.set(0);
+                match plan {
+                    Plan::Cancel => {
+                        PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0);
+                    }
+                    Plan::Run | Plan::RunMissing | Plan::RunSlow => {
+                        PostMessageW(dialog, WM_COMMAND, IDOK as usize, 0);
+                        // A valid program closes the dialog itself; an error
+                        // line cancels it (so a failing test never hangs).
+                        SetTimer(dialog, 0x7E57, 20, Some(await_error));
+                    }
                 }
             }
             CallNextHookEx(null_mut(), code, w, l)
@@ -4444,7 +4616,10 @@ mod tests {
                 GetCurrentThreadId(),
             ));
             assert!(!hook.0.is_null());
-            PLAN.set(((*test.p).hwnd as usize, false));
+            let set_program =
+                |text: &str| PROGRAM.with(|program| *program.borrow_mut() = text.into());
+            set_program(r#""C:\Program Files\Example\app.exe" --inline"#);
+            PLAN.set(((*test.p).hwnd as usize, Plan::Cancel));
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             assert!(
                 INSPECTED.get(),
@@ -4455,16 +4630,52 @@ mod tests {
                 "Cancel must never enqueue a task"
             );
             assert!(!(*test.p).modal && !(*test.p).busy);
-            PLAN.set(((*test.p).hwnd as usize, true));
+            // A program that does not resolve keeps the dialog open with the
+            // reason in its error line, before anything is enqueued.
+            PLAN.set(((*test.p).hwnd as usize, Plan::RunMissing));
+            SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
+            assert!(test.jobs.try_recv().is_err(), "nothing runs");
+            assert_eq!(
+                ERROR_LINE.with(|line| line.borrow().clone()),
+                tr(
+                    "로컬 드라이브의 실행 파일(.exe 또는 .com)을 선택하세요.",
+                    "Select an executable (.exe or .com) on a local drive.",
+                )
+            );
+            assert!(!(*test.p).modal && !(*test.p).busy);
+            // A slow drive: the check runs off the UI thread, the dialog
+            // says it is checking, and Cancel closes it before the check
+            // ends, starting nothing.
+            let program = format!(
+                "\"{}\" --inline",
+                std::env::current_exe().unwrap().display()
+            );
+            set_program(&program);
+            run_task::set_check_delay(Duration::from_millis(2500));
+            PLAN.set(((*test.p).hwnd as usize, Plan::RunSlow));
+            let started = Instant::now();
+            SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
+            run_task::set_check_delay(Duration::ZERO);
+            assert!(started.elapsed() < Duration::from_millis(2500));
+            assert!(LABELED.get(), "a slow check is labelled");
+            assert!(test.jobs.try_recv().is_err(), "Cancel starts nothing");
+            // Reopened while that check still runs: the new request waits,
+            // and cancelling the dialog withdraws it from the queue.
+            LABELED.set(false);
+            SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
+            assert!(LABELED.get());
+            assert!(
+                run_task::nothing_waits(),
+                "the closed dialog's request is gone"
+            );
+            assert!(test.jobs.try_recv().is_err());
+            PLAN.set(((*test.p).hwnd as usize, Plan::Run));
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             let Job::Action(Action::RunTask(task)) = test.jobs.try_recv().expect("submitted task")
             else {
                 panic!("unexpected job")
             };
-            assert_eq!(
-                task.command,
-                r#""C:\Program Files\Example\app.exe" --inline"#
-            );
+            assert_eq!(task.command, program);
             assert_eq!(task.arguments, r#""two words" &literal"#);
             assert!(task.elevated);
             assert!(!(*test.p).modal);
@@ -4699,24 +4910,25 @@ mod tests {
             SendMessageW(list, WM_MOUSEMOVE, 0, at(edge + 600));
             SendMessageW(list, WM_LBUTTONUP, 0, at(edge + 600));
             assert!((*p).process_columns.columns()[4].width > 400.0);
+            // The overflow bar is the themed one: Windows' native bar (which
+            // ignores the dark theme) never appears.
+            let (offset, maximum, bar) = table::horizontal_state(list);
+            assert_eq!(offset, 0);
+            assert!(maximum > 0, "extra width must remain reachable");
+            assert!(bar > 0);
+            assert_eq!(GetWindowLongW(list, GWL_STYLE) as u32 & WS_HSCROLL, 0);
             let mut scroll = SCROLLINFO {
                 cbSize: size_of::<SCROLLINFO>() as u32,
                 fMask: SIF_ALL,
                 ..zeroed()
             };
-            assert_ne!(GetScrollInfo(list, SB_HORZ, &mut scroll), 0);
-            assert!(
-                scroll.nMax as u32 >= scroll.nPage,
-                "extra width must remain reachable"
-            );
+            assert_eq!(GetScrollInfo(list, SB_HORZ, &mut scroll), 0);
             SendMessageW(list, WM_HSCROLL, SB_RIGHT as usize, 0);
-            GetScrollInfo(list, SB_HORZ, &mut scroll);
-            assert!(scroll.nPos > 0);
+            assert_eq!(table::horizontal_state(list).0, maximum);
             // Resizing and scrolling never change the semantic sort column.
             assert_eq!((*p).sort, process_columns::ProcessColumn::Cpu as usize);
             test.page(Page::Services);
-            GetScrollInfo(list, SB_HORZ, &mut scroll);
-            assert_eq!(scroll.nPos, 0);
+            assert_eq!(table::horizontal_state(list), (0, 0, 0));
             (*p).process_columns
                 .toggle(process_columns::ProcessColumn::Memory);
             test.page(Page::Processes);
@@ -4832,6 +5044,46 @@ mod tests {
         assert_eq!(total.network, Some(1000.));
         assert_eq!(GroupTotal::of(&snapshot.processes[2..]).gpu, None);
     }
+    #[test]
+    fn a_services_list_for_the_resource_monitor_leaves_a_paused_page_alone() {
+        let test = TestWindow::new();
+        test.page(Page::Services);
+        assert!(matches!(test.jobs.try_recv(), Ok(Job::Services)));
+        test.result(JobResult::Services(Ok(vec![service(
+            "Alpha",
+            SERVICE_RUNNING,
+            120,
+            Some(2),
+        )])));
+        assert_eq!(test.count(), 1);
+        let two = || {
+            vec![
+                service("Alpha", SERVICE_STOPPED, 0, Some(2)),
+                service("Beta", SERVICE_RUNNING, 7, Some(3)),
+            ]
+        };
+        unsafe {
+            (*test.p).paused = true;
+            // The Resource Monitor's periodic request while the page is paused.
+            (*test.p).services_loading = true;
+            (*test.p).services_for_monitor = true;
+            test.result(JobResult::Services(Ok(two())));
+            assert_eq!(test.count(), 1, "the paused page keeps its frame");
+            assert_eq!(test.text(0, 3), "실행 중");
+            assert_eq!((*test.p).services.len(), 1);
+            assert_eq!((*test.p).resource_services.as_ref().map(Vec::len), Some(2));
+            assert!(!(*test.p).services_loading);
+            // F5 is the main window's own request, even while one for the
+            // Resource Monitor is still in flight: that list is shown.
+            (*test.p).services_loading = true;
+            (*test.p).services_for_monitor = true;
+            command(test.p, REFRESH, 0);
+            test.result(JobResult::Services(Ok(two())));
+            assert_eq!(test.count(), 2);
+            assert!((*test.p).resource_services.is_none());
+        }
+    }
+
     fn service(name: &str, state: u32, pid: u32, start_type: Option<u32>) -> Service {
         Service {
             name: name.into(),
@@ -6380,8 +6632,7 @@ mod tests {
         let third = next("third sample");
         // Where the per-CPU counters work (not every machine exposes them),
         // a page switch (Configure without a pause) must not restart the
-        // sampler: past the "recent sample" window (125 ms here) the switch
-        // samples at once, and that sample still has rates.
+        // sampler: its next sample still has rates.
         let counters_work = warm(&third);
         std::thread::sleep(Duration::from_millis(150));
         configure(false);
@@ -6389,6 +6640,24 @@ mod tests {
         if counters_work {
             assert!(warm(&after_switch), "the page switch kept the sampler");
         }
+        // Page switches, resizes and keystrokes re-send the same
+        // configuration: past the "recent sample" window (125 ms here) each
+        // one used to sample at once. The schedule stands instead: about 6
+        // samples in 1.5 s, not one per Configure (10).
+        let mut samples = 0;
+        for _ in 0..10 {
+            configure(false);
+            let until = Instant::now() + Duration::from_millis(150);
+            while let Ok(sample) = rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                assert!(sample.snapshot.is_ok());
+                samples += 1;
+            }
+        }
+        assert!(
+            (4..=7).contains(&samples),
+            "{samples} samples for 10 unchanged configurations"
+        );
         // A pause drops it (the UI records the gap); sampling resumes with
         // performance data every interval.
         configure(true);

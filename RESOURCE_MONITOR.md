@@ -26,7 +26,8 @@ same identity and critical-process protections as Task Manager, after confirmati
   their visible expanded panels. These use bounded, in-memory Windows ETW data.
   Connection attribution reuses Feather's existing network session. Administrator
   rights may be required; turning tracing on never changes privileges or installs
-  a driver. Turning it off stops its additional work.
+  a driver. Turning it off stops its additional work. Menus and confirmation
+  dialogs pause sampling but keep an enabled trace running instead of restarting it.
 - No DNS lookups, traffic probes, packet payload capture, file reads, trace files,
   external telemetry, or new runtime dependency are introduced.
 
@@ -41,8 +42,9 @@ same identity and critical-process protections as Task Manager, after confirmati
 | Private working set | Resident private pages from the bulk process snapshot, distinct from private committed bytes. |
 | Hard faults/sec | Delta of the bulk process hard-fault counter across a valid interval. A new/reused PID is unmeasured first. |
 | Associated modules | One checked process, guarded by PID and creation time; protected processes can deny access. |
-| Handle names | Unavailable. Arbitrary handle-name queries can block, so lightweight monitoring shows the measured handle count instead. |
-| File response time, TCP latency/loss, firewall policy, per-volume queue | Unavailable where the chosen passive providers do not supply a trustworthy value. |
+| Handle names | Not collected, so there is no associated-handles panel: arbitrary handle-name queries can block. Task Manager's Handles column shows each process's measured count. |
+| File response time, TCP latency/loss, per-volume queue | Not collected, so these columns are left out: the chosen passive providers do not supply a trustworthy value. |
+| Firewall policy | Not evaluated; the listening-ports panel says so in its row. |
 
 `—` means unmeasured, not zero. First intervals prime rate counters. Event loss,
 tracking limits and access failures are surfaced; incomplete attribution is never

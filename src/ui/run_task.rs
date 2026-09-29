@@ -1,4 +1,7 @@
-//! On-demand native modal dialog; no timers, polling, or retained command history.
+//! On-demand native modal dialog; no polling or retained command history. The
+//! program is resolved on the app's one check thread (a one-shot timer only
+//! labels a slow check), so a slow drive never blocks the dialog or the app's
+//! windows, and a stalled one never accumulates threads.
 use super::*;
 use crate::actions::TaskLaunch;
 use windows_sys::Win32::{
@@ -11,6 +14,139 @@ const ARGUMENTS: i32 = 702;
 const BROWSE: i32 = 703;
 const ADMIN: i32 = 704;
 const ERROR: i32 = 705;
+/// A program check finished (its result waits in `State::checked`).
+const CHECKED: u32 = WM_APP + 0x70;
+/// Shows [`checking_text`] when a check takes longer than `CHECK_LABEL_MS`.
+const CHECK_TIMER: usize = 0x7A5;
+const CHECK_LABEL_MS: u32 = 250;
+
+type Checked = (u64, Result<(), String>);
+
+/// Set when a request is withdrawn (its dialog was edited or closed).
+type Cancelled = Arc<std::sync::atomic::AtomicBool>;
+
+/// One program check and what to do with its result.
+struct Check {
+    task: TaskLaunch,
+    cancelled: Cancelled,
+    done: Box<dyn FnOnce(Result<(), String>) + Send>,
+}
+
+#[derive(Default)]
+struct Queue {
+    /// The check thread exists (it exits when nothing waits).
+    running: bool,
+    /// The newest request behind the one being checked. A newer request
+    /// replaces it: it came from an edited, re-run or closed dialog.
+    waiting: Option<Check>,
+}
+
+/// Program checks, app-wide: one thread at most, however slow a drive is
+/// and however often the dialog is re-run or reopened meanwhile.
+#[derive(Default)]
+struct Checks {
+    queue: std::sync::Mutex<Queue>,
+    /// Tests stand in for a slow drive by delaying each check.
+    #[cfg(test)]
+    delay_ms: std::sync::atomic::AtomicU64,
+    /// Threads started (tests).
+    #[cfg(test)]
+    started: std::sync::atomic::AtomicUsize,
+    /// Checks past the withdrawal test, i.e. really started (tests).
+    #[cfg(test)]
+    begun: std::sync::atomic::AtomicUsize,
+}
+
+impl Checks {
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn submit(self: &Arc<Self>, check: Check) -> Result<(), String> {
+        let mut queue = self.queue();
+        queue.waiting = Some(check);
+        if queue.running {
+            return Ok(());
+        }
+        queue.running = true;
+        let checks = Arc::clone(self);
+        match std::thread::Builder::new()
+            .name("feather-run-task-check".into())
+            .spawn(move || checks.work())
+        {
+            Ok(_) => {
+                #[cfg(test)]
+                self.started
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                queue.running = false;
+                queue.waiting = None;
+                Err(error.to_string())
+            }
+        }
+    }
+    /// Withdraw a request: one that has not started leaves the queue now, and
+    /// the thread skips it if it was just taken. A running check cannot be
+    /// interrupted; its result is ignored.
+    fn withdraw(&self, cancelled: &Cancelled) {
+        cancelled.store(true, std::sync::atomic::Ordering::Release);
+        let mut queue = self.queue();
+        if queue
+            .waiting
+            .as_ref()
+            .is_some_and(|check| Arc::ptr_eq(&check.cancelled, cancelled))
+        {
+            queue.waiting = None;
+        }
+    }
+    fn work(&self) {
+        loop {
+            let Some(check) = self.queue().waiting.take() else {
+                // Checked under the lock: a request submitted now starts a
+                // new thread instead of waiting for this one.
+                let mut queue = self.queue();
+                if queue.waiting.is_none() {
+                    queue.running = false;
+                    return;
+                }
+                continue;
+            };
+            if check.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            #[cfg(test)]
+            self.begun
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            #[cfg(test)]
+            std::thread::sleep(Duration::from_millis(
+                self.delay_ms.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+            (check.done)(crate::actions::check_task(&check.task));
+        }
+    }
+}
+
+fn checks() -> &'static Arc<Checks> {
+    static CHECKS: std::sync::OnceLock<Arc<Checks>> = std::sync::OnceLock::new();
+    CHECKS.get_or_init(Default::default)
+}
+
+/// No request waits for the check thread (tests).
+#[cfg(test)]
+pub(super) fn nothing_waits() -> bool {
+    checks().queue().waiting.is_none()
+}
+
+#[cfg(test)]
+pub(super) fn set_check_delay(delay: Duration) {
+    checks().delay_ms.store(
+        delay.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 struct State {
     app: *mut App,
@@ -20,12 +156,127 @@ struct State {
     /// The administrator switch (owner-drawn; always on when Feather is elevated).
     admin: bool,
     result: Option<TaskLaunch>,
+    /// The Run request whose program is being resolved. An edit or closing
+    /// the dialog withdraws it (a late result for it is then ignored).
+    checking: Option<Pending>,
+    requests: u64,
+    checked: (mpsc::Sender<Checked>, mpsc::Receiver<Checked>),
+}
+
+struct Pending {
+    request: u64,
+    task: TaskLaunch,
+    cancelled: Cancelled,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
+        // Closed (Cancel, Esc, the close button) while a check waits: it
+        // must not hold the check thread for a dialog that is gone.
+        if let Some(pending) = self.checking.take() {
+            checks().withdraw(&pending.cancelled);
+        }
         unsafe {
             DeleteObject(self.surface);
+        }
+    }
+}
+
+/// The error line while a program check is slow (muted, not an error).
+pub(super) fn checking_text() -> &'static str {
+    tr("프로그램을 확인하는 중…", "Checking the program…")
+}
+
+/// Forget the check in flight: the fields it was made for changed.
+unsafe fn discard_check(hwnd: HWND, state: &mut State) {
+    if let Some(pending) = state.checking.take() {
+        checks().withdraw(&pending.cancelled);
+        KillTimer(hwnd, CHECK_TIMER);
+        SetDlgItemTextW(hwnd, ERROR, wide("").as_ptr());
+    }
+}
+
+/// Run: the command's syntax is checked at once; resolving the program
+/// searches folders and reads the file system, so it runs on the check
+/// thread and its result arrives as [`CHECKED`]. Cancel works meanwhile.
+unsafe fn start_check(hwnd: HWND, state: &mut State) {
+    if state.checking.is_some() {
+        return;
+    }
+    let task = TaskLaunch {
+        command: read(hwnd, PROGRAM),
+        arguments: read(hwnd, ARGUMENTS),
+        elevated: state.admin,
+    };
+    if let Err(error) = crate::actions::task_command(&task) {
+        SetDlgItemTextW(hwnd, ERROR, wide(&error).as_ptr());
+        SetFocus(GetDlgItem(hwnd, PROGRAM));
+        return;
+    }
+    state.requests += 1;
+    let request = state.requests;
+    let sender = state.checked.0.clone();
+    let dialog = hwnd as usize;
+    let cancelled = Cancelled::default();
+    let started = checks().submit(Check {
+        task: task.clone(),
+        cancelled: Arc::clone(&cancelled),
+        done: Box::new(move |result| {
+            // A closed dialog dropped the receiver: nothing is posted.
+            if sender.send((request, result)).is_ok() {
+                unsafe { PostMessageW(dialog as HWND, CHECKED, 0, 0) };
+            }
+        }),
+    });
+    match started {
+        Ok(_) => {
+            state.checking = Some(Pending {
+                request,
+                task,
+                cancelled,
+            });
+            SetDlgItemTextW(hwnd, ERROR, wide("").as_ptr());
+            SetTimer(hwnd, CHECK_TIMER, CHECK_LABEL_MS, None);
+        }
+        Err(error) => {
+            SetDlgItemTextW(
+                hwnd,
+                ERROR,
+                wide(&tf!(
+                    "프로그램을 확인할 수 없습니다: {}",
+                    "Cannot check the program: {}",
+                    error
+                ))
+                .as_ptr(),
+            );
+        }
+    }
+}
+
+/// Results of finished checks: the current one closes the dialog with its
+/// task or shows why the program was rejected; discarded ones are dropped.
+unsafe fn finish_checks(hwnd: HWND, state: &mut State) {
+    while let Ok((request, result)) = state.checked.1.try_recv() {
+        if state
+            .checking
+            .as_ref()
+            .is_none_or(|pending| pending.request != request)
+        {
+            continue;
+        }
+        let Some(Pending { task, .. }) = state.checking.take() else {
+            continue;
+        };
+        KillTimer(hwnd, CHECK_TIMER);
+        match result {
+            Ok(()) => {
+                state.result = Some(task);
+                EndDialog(hwnd, IDOK as isize);
+            }
+            Err(error) => {
+                SetDlgItemTextW(hwnd, ERROR, wide(&error).as_ptr());
+                SetFocus(GetDlgItem(hwnd, PROGRAM));
+            }
         }
     }
 }
@@ -298,32 +549,24 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         WM_COMMAND => {
             let id = (w & 0xffff) as i32;
             match id {
-                IDOK => {
-                    let task = TaskLaunch {
-                        command: read(hwnd, PROGRAM),
-                        arguments: read(hwnd, ARGUMENTS),
-                        elevated: state.admin,
-                    };
-                    match crate::actions::task_command(&task) {
-                        Ok(_) => {
-                            state.result = Some(task);
-                            EndDialog(hwnd, IDOK as isize);
-                        }
-                        Err(error) => {
-                            SetDlgItemTextW(hwnd, ERROR, wide(&error).as_ptr());
-                            SetFocus(GetDlgItem(hwnd, PROGRAM));
-                        }
-                    }
-                }
+                // An unknown name or a rejected path shows below the fields,
+                // not after closing.
+                IDOK => start_check(hwnd, state),
                 IDCANCEL => {
                     EndDialog(hwnd, IDCANCEL as isize);
                 }
-                BROWSE => browse(hwnd),
+                BROWSE => {
+                    discard_check(hwnd, state);
+                    browse(hwnd);
+                }
                 ADMIN if w >> 16 == BN_CLICKED as usize => {
+                    discard_check(hwnd, state);
                     state.admin = !state.admin;
                     InvalidateRect(l as HWND, null(), 0);
                 }
+                ARGUMENTS if w >> 16 == EN_CHANGE as usize => discard_check(hwnd, state),
                 PROGRAM if w >> 16 == EN_CHANGE as usize => {
+                    discard_check(hwnd, state);
                     EnableWindow(
                         GetDlgItem(hwnd, IDOK),
                         i32::from(!read(hwnd, PROGRAM).trim().is_empty()),
@@ -331,6 +574,17 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     SetDlgItemTextW(hwnd, ERROR, wide("").as_ptr());
                 }
                 _ => return 0,
+            }
+            1
+        }
+        CHECKED => {
+            finish_checks(hwnd, state);
+            1
+        }
+        WM_TIMER if w == CHECK_TIMER => {
+            KillTimer(hwnd, CHECK_TIMER);
+            if state.checking.is_some() {
+                SetDlgItemTextW(hwnd, ERROR, wide(checking_text()).as_ptr());
             }
             1
         }
@@ -343,10 +597,10 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             SetBkColor(w as HDC, colors().surface);
             SetTextColor(
                 w as HDC,
-                if GetDlgCtrlID(l as HWND) == ERROR {
-                    colors().danger
-                } else {
-                    colors().fg
+                match GetDlgCtrlID(l as HWND) {
+                    ERROR if state.checking.is_some() => colors().muted,
+                    ERROR => colors().danger,
+                    _ => colors().fg,
                 },
             );
             state.surface as isize
@@ -416,6 +670,9 @@ pub(super) unsafe fn show(app: *mut App) -> Option<TaskLaunch> {
         surface: CreateSolidBrush(colors().surface),
         admin: crate::netetw::is_elevated(),
         result: None,
+        checking: None,
+        requests: 0,
+        checked: mpsc::channel(),
     };
     let result = DialogBoxIndirectParamW(
         GetModuleHandleW(null()),
@@ -435,4 +692,111 @@ pub(super) unsafe fn show(app: *mut App) -> Option<TaskLaunch> {
         );
     }
     state.result.take()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wait until the thread has really started `count` checks: taken from
+    /// the queue and past the withdrawal test.
+    fn await_begun(checks: &Checks, count: usize) {
+        while checks.begun.load(std::sync::atomic::Ordering::Acquire) < count {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn submit_to(
+        checks: &Arc<Checks>,
+        sender: &mpsc::Sender<(&'static str, bool)>,
+        name: &'static str,
+    ) -> Cancelled {
+        let sender = sender.clone();
+        let cancelled = Cancelled::default();
+        checks
+            .submit(Check {
+                task: TaskLaunch {
+                    command: "cmd".into(),
+                    arguments: String::new(),
+                    elevated: false,
+                },
+                cancelled: Arc::clone(&cancelled),
+                done: Box::new(move |result| {
+                    let _ = sender.send((name, result.is_ok()));
+                }),
+            })
+            .unwrap();
+        cancelled
+    }
+
+    /// A request withdrawn before it starts (its dialog was edited or
+    /// closed) never reaches the drive, whether it still waited or the
+    /// thread had just taken it.
+    #[test]
+    fn withdrawn_requests_are_never_checked() {
+        let checks = Arc::new(Checks::default());
+        checks
+            .delay_ms
+            .store(300, std::sync::atomic::Ordering::Relaxed);
+        let (sender, results) = mpsc::channel();
+        let running = submit_to(&checks, &sender, "running");
+        // An emptied queue is not enough: the thread may not have tested the
+        // token yet, and would then (rightly) skip the withdrawn request.
+        await_begun(&checks, 1);
+        let waiting = submit_to(&checks, &sender, "withdrawn");
+        // Withdrawing the running check only marks it: the waiting one stays.
+        checks.withdraw(&running);
+        assert!(checks.queue().waiting.is_some());
+        checks.withdraw(&waiting);
+        assert!(
+            checks.queue().waiting.is_none(),
+            "it left the queue at once"
+        );
+        // The same request already taken by the thread: only its token says
+        // it was withdrawn (as when the thread takes it just before).
+        let taken = submit_to(&checks, &sender, "cancelled");
+        taken.store(true, std::sync::atomic::Ordering::Release);
+        let wait = || results.recv_timeout(Duration::from_secs(10));
+        assert_eq!(wait().unwrap(), ("running", true));
+        // Neither withdrawn request is checked; the thread goes idle.
+        assert!(results.recv_timeout(Duration::from_millis(800)).is_err());
+        while checks.queue().running {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A stalled drive: re-running and reopening the dialog meanwhile never
+    /// adds threads, and only the newest waiting request is checked.
+    #[test]
+    fn checks_share_one_thread_and_keep_only_the_newest_request() {
+        let checks = Arc::new(Checks::default());
+        checks
+            .delay_ms
+            .store(300, std::sync::atomic::Ordering::Relaxed);
+        let (sender, results) = mpsc::channel();
+        let submit = |name: &'static str| {
+            submit_to(&checks, &sender, name);
+        };
+        submit("first");
+        // Once the thread has started it, later requests wait behind it.
+        await_begun(&checks, 1);
+        for name in ["second", "third", "newest"] {
+            submit(name);
+        }
+        let wait = || results.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(wait(), ("first", true), "the running check finishes");
+        assert_eq!(wait(), ("newest", true), "then only the newest waiting one");
+        assert!(results.recv_timeout(Duration::from_millis(500)).is_err());
+        assert_eq!(checks.started.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // The idle thread has exited; the next request starts one again.
+        while checks.queue().running {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        checks
+            .delay_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        submit("later");
+        assert_eq!(wait(), ("later", true));
+        assert_eq!(checks.started.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
 }

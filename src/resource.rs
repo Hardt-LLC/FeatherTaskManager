@@ -49,16 +49,11 @@ pub struct Request {
     pub endpoints: bool,
     pub volumes: bool,
     pub modules: Option<(u32, u64)>,
-    pub handles: Option<(u32, u64)>,
 }
 
 impl Request {
     fn enabled(self) -> bool {
-        self.memory
-            || self.endpoints
-            || self.volumes
-            || self.modules.is_some()
-            || self.handles.is_some()
+        self.memory || self.endpoints || self.volumes || self.modules.is_some()
     }
 }
 
@@ -188,7 +183,6 @@ impl Client {
         let mut request = *request;
         let live = |identity| processes.iter().any(|p| (p.pid, p.created) == identity);
         request.modules = request.modules.filter(|&id| live(id));
-        request.handles = request.handles.filter(|&id| live(id));
         if request != self.request {
             self.request = request;
             self.cached = None;
@@ -317,9 +311,6 @@ impl Collector {
             }
         } else {
             self.modules = None;
-        }
-        if request.handles.is_some() {
-            result.errors.push("Handle names are unavailable in lightweight monitoring; the process table shows the measured handle count.".into());
         }
         result
     }

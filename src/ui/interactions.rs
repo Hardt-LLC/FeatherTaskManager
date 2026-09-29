@@ -1110,7 +1110,7 @@ unsafe fn dispatch_extra(p: *mut App, id: usize, process: Option<Process>) {
             GetWindowRect((*p).more, &mut bounds);
             process_columns::menu(
                 p,
-                0,
+                None,
                 POINT {
                     x: bounds.left,
                     y: bounds.bottom,

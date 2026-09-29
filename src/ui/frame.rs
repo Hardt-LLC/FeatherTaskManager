@@ -997,7 +997,7 @@ pub(super) fn keyboard_menu_point(l: &layout::Layout) -> POINT {
 /// The window's system menu with its top-left corner at a screen point
 /// (right-click on the strip: the cursor; Alt+Space: [`keyboard_menu_point`]).
 /// From the keyboard the first item is highlighted, like DefWindowProc's.
-unsafe fn system_menu(hwnd: HWND, x: i32, y: i32, keyboard: bool) {
+pub(super) unsafe fn system_menu(hwnd: HWND, x: i32, y: i32, keyboard: bool) {
     let menu = GetSystemMenu(hwnd, 0);
     if menu.is_null() {
         return;

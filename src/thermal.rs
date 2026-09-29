@@ -2,8 +2,9 @@
 //!
 //! ACPI zones describe firmware-selected sensor locations, not a guaranteed
 //! CPU package or motherboard sensor. No driver, WMI, helper process or timer
-//! is started. This sampler is owned by PerfSampler, so pause/minimize drops
-//! the query and resume starts with a fresh reading.
+//! is started. The monitor thread keeps one sampler for its lifetime and hands
+//! it between PerfSampler instances, so a pause (menus and dialogs count) does
+//! not re-open the query; a reading is never older than [`POLL_INTERVAL`].
 //!
 //! Microsoft documents the Temperature counter in kelvins:
 //! https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/examples--requirements-and-diagnostics
@@ -53,7 +54,7 @@ impl ThermalSampler {
         &self.zones
     }
 
-    fn due(&self, now: Instant) -> bool {
+    pub(crate) fn due(&self, now: Instant) -> bool {
         let interval = if self.zones.is_empty() {
             RETRY_INTERVAL
         } else {
@@ -198,6 +199,6 @@ mod tests {
         assert!(sampler.zones.is_empty());
         assert!(!sampler.due(now + POLL_INTERVAL + RETRY_INTERVAL - Duration::from_millis(1)));
         assert!(sampler.due(now + POLL_INTERVAL + RETRY_INTERVAL));
-        assert!(ThermalSampler::default().due(now)); // A resumed sampler reads immediately.
+        assert!(ThermalSampler::default().due(now)); // A new sampler reads immediately.
     }
 }
