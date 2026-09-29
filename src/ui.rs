@@ -4004,6 +4004,25 @@ unsafe fn fit_client(hwnd: HWND, width: i32, height: i32) {
     }
 }
 
+/// Tests: [`fit_client`] to `width` × `height` DIP at the window's DPI, like
+/// `run` sizes the real window (the reference's 1200 × 820 is 1800 × 1230 px
+/// at 150 %; the same numbers in device px would land on the 980 × 660 DIP
+/// minimum above 100 %). Returns the client size in device px.
+#[cfg(test)]
+unsafe fn fit_client_dip(p: *mut App, width: f32, height: f32) -> (i32, i32) {
+    let size = (gfx::pxi((*p).dpi, width), gfx::pxi((*p).dpi, height));
+    fit_client((*p).hwnd, size.0, size.1);
+    let mut client: RECT = zeroed();
+    GetClientRect((*p).hwnd, &mut client);
+    assert_eq!(
+        (client.right, client.bottom),
+        size,
+        "a {width} × {height} DIP client at {} DPI must fit the monitor",
+        (*p).dpi
+    );
+    size
+}
+
 /// Preview captures of layout states that need interaction: a selected
 /// process (enabled head actions) with the ⋯ button hovered, the process
 /// telemetry drawer and the service details panel inside the content rect.
@@ -5660,25 +5679,27 @@ mod tests {
         ])));
         unsafe {
             let p = test.p;
-            fit_client((*p).hwnd, 1200, 820);
+            let (width, height) = fit_client_dip(p, 1200.0, 820.0);
             assert_eq!(table::column_count((*p).list), 5);
             (*p).show_details = true;
             layout(p);
             assert_eq!(table::column_count((*p).list), 4, "Startup type hides");
             let l = current_layout(p);
             let panel = l.details(true).1.unwrap();
-            let mut frame = gfx::Dib::new(1200, 820).unwrap();
+            let mut frame = gfx::Dib::new(width, height).unwrap();
             // Ink (anything but the panel background) inside a band.
+            let inset = l.px(16.0);
             let ink = |frame: &mut gfx::Dib, top: i32, bottom: i32| {
                 let bg = colors().bg;
                 let bg = (bg & 0xff) << 16 | (bg & 0xff00) | (bg >> 16 & 0xff);
                 (top..bottom)
-                    .flat_map(|y| (panel.left + 16..panel.right - 16).map(move |x| (x, y)))
+                    .flat_map(|y| (panel.left + inset..panel.right - inset).map(move |x| (x, y)))
                     .filter(|&(x, y)| frame.pixel(x, y) & 0x00ff_ffff != bg)
                     .count()
             };
-            let header = layout::table_header_height(Page::Services, 96);
-            let first_row = panel.top + header..panel.top + header + 34;
+            let header = layout::table_header_height(Page::Services, l.dpi);
+            let first_row =
+                panel.top + header..panel.top + header + layout::table_row_height(l.dpi);
             paint::paint_to(p, frame.dc());
             assert!(
                 ink(&mut frame, first_row.start, first_row.end) > 0,
@@ -5692,7 +5713,7 @@ mod tests {
             // Loading: the name on the first row's line, the state pill below.
             paint::paint_to(p, frame.dc());
             assert!(ink(&mut frame, first_row.start, first_row.end) > 0);
-            assert!(ink(&mut frame, first_row.end, first_row.end + 40) > 0);
+            assert!(ink(&mut frame, first_row.end, first_row.end + l.px(40.0)) > 0);
             let details = crate::services::ServiceDetails {
                 name: "NoDescription".into(),
                 display_name: "NoDescription".into(),
@@ -6379,10 +6400,10 @@ mod tests {
         test.snapshot(rows());
         unsafe {
             let p = test.p;
-            fit_client((*p).hwnd, 1200, 820);
+            let size = fit_client_dip(p, 1200.0, 820.0);
             let mut client: RECT = zeroed();
             GetClientRect((*p).hwnd, &mut client);
-            assert_eq!((client.right, client.bottom), (1200, 820));
+            assert_eq!((client.right, client.bottom), size);
             for page in [
                 Page::Processes,
                 Page::Performance,
@@ -6423,11 +6444,12 @@ mod tests {
                     IsWindowEnabled((*p).search) != 0,
                     !matches!(page, Page::Performance | Page::Settings)
                 );
-                // Status bar Refresh select: 22 px at the right padding.
+                // Status bar Refresh select: 22 px at the right padding,
+                // centred in the bar (y 795 at 100 %, see `layout::tests`).
                 let rate = child(p, (*p).rate);
                 assert_eq!(rate.right, l.status_inner.right);
-                assert_eq!(rate.bottom - rate.top, 22);
-                assert_eq!(rate.top, 795);
+                assert_eq!(rate.bottom - rate.top, l.px(22.0));
+                assert_eq!(edges(rate), edges(l.rate(rate.right - rate.left)));
                 // Page head: right-aligned, 8 px apart, 32 px buttons / 28 px
                 // selects, vertically centred in the head's content box.
                 let controls: Vec<HWND> = head_items(p)
@@ -6446,19 +6468,22 @@ mod tests {
                     // 28 px selects; 32 px buttons, but ⋯ matches Startup's
                     // 28 px head.
                     let height = if is_select(p, h) || page == Page::Startup {
-                        28
+                        28.0
                     } else {
-                        32
+                        32.0
                     };
-                    assert_eq!(r.bottom - r.top, height);
+                    assert_eq!(r.bottom - r.top, l.px(height));
                     assert!(
                         (r.top - l.head_inner.top - (l.head_inner.bottom - r.bottom)).abs() <= 1
                     );
-                    right = r.left - 8;
+                    right = r.left - l.px(8.0);
                 }
                 if page == Page::Processes {
                     assert_eq!(controls.last(), Some(&(*p).more));
-                    assert_eq!(child(p, (*p).more).right - child(p, (*p).more).left, 32);
+                    assert_eq!(
+                        child(p, (*p).more).right - child(p, (*p).more).left,
+                        l.px(32.0)
+                    );
                 }
                 // The view fills the content rect exactly.
                 let list_page = matches!(page, Page::Processes | Page::Startup | Page::Services);
@@ -6467,13 +6492,16 @@ mod tests {
                     assert_eq!(edges(child(p, (*p).list)), edges(l.content));
                     assert_eq!(
                         table::header_height((*p).list),
-                        layout::table_header_height(page, 96)
+                        layout::table_header_height(page, l.dpi)
                     );
                 }
                 assert_eq!(shown((*p).perf_list), page == Page::Performance);
                 if page == Page::Performance {
                     assert_eq!(edges(child(p, (*p).perf_list)), edges(l.perf_device_list()));
-                    assert_eq!(SendMessageW((*p).perf_list, LB_GETITEMHEIGHT, 0, 0), 58);
+                    assert_eq!(
+                        SendMessageW((*p).perf_list, LB_GETITEMHEIGHT, 0, 0),
+                        layout::device_item_height(l.dpi) as isize
+                    );
                 }
                 // Tab order follows the visual order.
                 let order = tab_order(p);
@@ -6487,21 +6515,27 @@ mod tests {
             test.page(Page::Settings);
             let l = current_layout(p);
             let s = l.settings();
+            // Switches keep a 4 px margin for their focus ring past the row's
+            // padding edge.
             for (id, group, row, inset) in [
-                (THEME_SYSTEM, 0, 0, 0),
-                (PREF_LANGUAGE, 0, 1, 0),
-                (PREF_RATE, 1, 0, 0),
-                (PREF_START, 1, 1, 0),
-                (PREF_TOP, 2, 0, 4),
-                (PREF_TRAY, 2, 1, 4),
-                (PREF_REPLACE, 2, 2, 4),
-                (PREF_ADMIN, 2, 3, 4),
+                (THEME_SYSTEM, 0, 0, 0.0),
+                (PREF_LANGUAGE, 0, 1, 0.0),
+                (PREF_RATE, 1, 0, 0.0),
+                (PREF_START, 1, 1, 0.0),
+                (PREF_TOP, 2, 0, 4.0),
+                (PREF_TRAY, 2, 1, 4.0),
+                (PREF_REPLACE, 2, 2, 4.0),
+                (PREF_ADMIN, 2, 3, 4.0),
             ] {
                 let h = GetDlgItem((*p).hwnd, id as i32);
                 let r = child(p, h);
                 let g = &s.groups[group];
                 assert!(shown(h));
-                assert_eq!(r.right, g.row_content(row, 96).right + inset, "{id}");
+                assert_eq!(
+                    r.right,
+                    g.row_content(row, l.dpi).right + l.px(inset),
+                    "{id}"
+                );
                 let (row_top, row_bottom) = (g.rows[row].top, g.rows[row].bottom);
                 assert!(
                     (r.top - row_top - (row_bottom - r.bottom)).abs() <= 1,
@@ -6524,8 +6558,9 @@ mod tests {
         test.snapshot(rows());
         unsafe {
             let p = test.p;
-            fit_client((*p).hwnd, 1200, 820);
+            fit_client_dip(p, 1200.0, 820.0);
             test.page(Page::Processes);
+            let gap = current_layout(p).px(8.0);
             let choose = |mode: usize| {
                 SendMessageW((*p).view_mode, CB_SETCURSEL, mode, 0);
                 SendMessageW(
@@ -6546,8 +6581,8 @@ mod tests {
                 child(p, (*p).expand_all),
                 child(p, (*p).nuclear),
             );
-            assert_eq!(view.right + 8, expand.left, "no gap before Expand all");
-            assert_eq!(expand.right + 8, nuclear.left);
+            assert_eq!(view.right + gap, expand.left, "no gap before Expand all");
+            assert_eq!(expand.right + gap, nuclear.left);
             assert!(tab_order(p).contains(&(*p).expand_all));
             // A relayout in tree mode (resize, page return), then flat again.
             layout(p);
@@ -6556,7 +6591,7 @@ mod tests {
                 assert!(!(*p).tree_mode);
                 assert!(!shown((*p).expand_all), "mode {mode}: stale Expand all");
                 let view = child(p, (*p).view_mode);
-                assert_eq!(view.right + 8, child(p, (*p).nuclear).left);
+                assert_eq!(view.right + gap, child(p, (*p).nuclear).left);
                 assert!(!intersects(view, child(p, (*p).expand_all)) || !shown((*p).expand_all));
                 assert!(!tab_order(p).contains(&(*p).expand_all));
                 choose(1);
@@ -6574,13 +6609,15 @@ mod tests {
         test.snapshot(rows());
         unsafe {
             let p = test.p;
-            fit_client((*p).hwnd, 1200, 820);
+            let (width, height) = fit_client_dip(p, 1200.0, 820.0);
             (*p).anim.anim = anim::Animator::new().with_reduced_motion(false);
             layout(p);
             let top_key = (anim::NAV_ID, anim::part::NAV_TOP);
             let bottom_key = (anim::NAV_ID, anim::part::NAV_BOTTOM);
             let l = current_layout(p);
-            let edges_of = |r: RECT| ((r.top + 12) as f32, (r.bottom - 12) as f32);
+            // The 3 × 16 bar: the item inset 12 px top and bottom.
+            let inset = l.px(12.0);
+            let edges_of = |r: RECT| ((r.top + inset) as f32, (r.bottom - inset) as f32);
             let value = move |key| (*p).anim.value(key);
             assert_eq!((value(top_key), value(bottom_key)), edges_of(l.nav[0]));
             assert!(!(*p).anim.is_running(), "a relayout jumps");
@@ -6597,7 +6634,7 @@ mod tests {
             let (target_top, target_bottom) = edges_of(l.nav[3]);
             assert!(top > edges_of(l.nav[0]).0 && top < target_top, "{top}");
             assert!(
-                bottom > top + 16.0,
+                bottom > top + (target_bottom - target_top),
                 "stretches while moving: {top}..{bottom}"
             );
             // Mid-slide paint: the bar shows in the rail gap between items 1
@@ -6605,7 +6642,7 @@ mod tests {
             // same edges.
             (*p).anim.tick_at(t0 + Duration::from_millis(40));
             let (top, bottom) = (value(top_key), value(bottom_key));
-            let mut frame = gfx::Dib::new(1200, 820).unwrap();
+            let mut frame = gfx::Dib::new(width, height).unwrap();
             capture::paint_client_and_children((*p).hwnd, frame.dc()).unwrap();
             let c = colors();
             let rgb = |pixel: u32| {
@@ -6643,7 +6680,7 @@ mod tests {
                 edges_of(current_layout(p).nav_settings)
             );
             // A resize while idle jumps to the new geometry.
-            fit_client((*p).hwnd, 1100, 700);
+            fit_client_dip(p, 1100.0, 700.0);
             assert!(!(*p).anim.is_running());
             assert_eq!(
                 (value(top_key), value(bottom_key)),
@@ -6659,18 +6696,21 @@ mod tests {
         test.snapshot(rows());
         unsafe {
             let p = test.p;
-            let mut dib = gfx::Dib::new(260, 58).unwrap();
+            let dpi = (*p).dpi;
+            // One owner-draw item: the 56 px card and its 2 px gap.
+            let item = RECT {
+                left: 0,
+                top: 0,
+                right: gfx::pxi(dpi, 260.0),
+                bottom: layout::device_item_height(dpi),
+            };
+            let mut dib = gfx::Dib::new(item.right, item.bottom).unwrap();
             let c = colors();
             let rgb = |pixel: u32| {
                 let (r, g, b) = (pixel >> 16 & 0xff, pixel >> 8 & 0xff, pixel & 0xff);
                 r | g << 8 | b << 16
             };
-            let item = RECT {
-                left: 0,
-                top: 0,
-                right: 260,
-                bottom: 58,
-            };
+            let x = gfx::pxi(dpi, 4.0);
             for (hover, selected, face) in [
                 (0.0, false, c.surface),
                 (1.0, false, c.fg_soft),
@@ -6679,11 +6719,15 @@ mod tests {
             ] {
                 paint::device_card(p, dib.dc(), item, 1, hover, selected);
                 assert_eq!(
-                    rgb(dib.pixel(4, 28)),
+                    rgb(dib.pixel(x, gfx::pxi(dpi, 28.0))),
                     face,
                     "hover {hover} selected {selected}"
                 );
-                assert_eq!(rgb(dib.pixel(4, 57)), c.surface, "gap below the card");
+                assert_eq!(
+                    rgb(dib.pixel(x, item.bottom - 1)),
+                    c.surface,
+                    "gap below the card"
+                );
             }
             // Out-of-range indices paint nothing (no panic).
             paint::device_card(p, dib.dc(), item, 99, 1.0, true);
@@ -6700,7 +6744,7 @@ mod tests {
         test.select(0);
         unsafe {
             let p = test.p;
-            fit_client((*p).hwnd, 1200, 820);
+            let (width, height) = fit_client_dip(p, 1200.0, 820.0);
             (*p).show_telemetry = true;
             layout(p);
             let l = current_layout(p);
@@ -6710,16 +6754,20 @@ mod tests {
             let end_tree = child(p, (*p).end_tree);
             assert!(shown((*p).end_tree));
             assert!(end_tree.top > drawer.top && end_tree.bottom < drawer.bottom);
-            let mut frame = gfx::Dib::new(1200, 820).unwrap();
+            let mut frame = gfx::Dib::new(width, height).unwrap();
             paint::paint_to(p, frame.dc());
             let c = colors();
             let rgb = |pixel: u32| {
                 let (r, g, b) = (pixel >> 16 & 0xff, pixel >> 8 & 0xff, pixel & 0xff);
                 r | g << 8 | b << 16
             };
-            assert_eq!(rgb(frame.pixel(l.main.left, drawer.top + 60)), c.border);
-            assert_eq!(rgb(frame.pixel(drawer.left + 4, drawer.top)), c.border);
-            assert_eq!(rgb(frame.pixel(drawer.left + 4, drawer.top + 1)), c.surface);
+            let x = drawer.left + l.px(4.0);
+            assert_eq!(
+                rgb(frame.pixel(l.main.left, drawer.top + l.px(60.0))),
+                c.border
+            );
+            assert_eq!(rgb(frame.pixel(x, drawer.top)), c.border);
+            assert_eq!(rgb(frame.pixel(x, drawer.top + l.hair)), c.surface);
             (*p).show_telemetry = false;
             layout(p);
             assert!(!shown((*p).end_tree));
@@ -6732,8 +6780,14 @@ mod tests {
             assert_eq!(edges(child(p, (*p).list)), edges(table));
             paint::paint_to(p, frame.dc());
             let panel = panel.unwrap();
-            assert_eq!(rgb(frame.pixel(panel.left, panel.top + 40)), c.border);
-            assert_eq!(rgb(frame.pixel(panel.left + 2, panel.bottom - 4)), c.bg);
+            assert_eq!(
+                rgb(frame.pixel(panel.left, panel.top + l.px(40.0))),
+                c.border
+            );
+            assert_eq!(
+                rgb(frame.pixel(panel.left + l.hair + 1, panel.bottom - l.px(4.0))),
+                c.bg
+            );
         }
     }
     /// Commands that left the rail stay reachable: Always on top is a plain
@@ -6813,7 +6867,7 @@ mod tests {
         test.snapshot(rows());
         unsafe {
             let p = test.p;
-            fit_client((*p).hwnd, 1200, 820);
+            fit_client_dip(p, 1200.0, 820.0);
             test.page(Page::Processes);
             assert!(shown((*p).nuclear));
             assert!(!shown((*p).extra), "Efficiency mode left the head");
