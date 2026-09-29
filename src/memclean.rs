@@ -432,10 +432,13 @@ pub enum PurgeError {
     Unavailable(String),
     /// An earlier list failed, so this one was not attempted.
     NotRun,
-    /// `SeProfileSingleProcessPrivilege` could not be enabled.
+    /// A privilege a chosen step needs could not be enabled (the text names
+    /// it: `SeProfileSingleProcessPrivilege` or `SeIncreaseQuotaPrivilege`).
     Privilege(String),
-    /// `NtSetSystemInformation` failed with this NTSTATUS.
+    /// The step failed with this NTSTATUS (Win32 errors converted).
     Status(i32),
+    /// The step could not start for a reason the user cannot act on.
+    Failed(String),
 }
 
 impl PurgeError {
@@ -453,11 +456,12 @@ impl PurgeError {
             )
             .into(),
             Self::Privilege(detail) => tf!(
-                "메모리 목록 권한을 사용할 수 없습니다: {}",
-                "The memory list privilege is unavailable: {}",
+                "필요한 권한을 사용할 수 없습니다: {}",
+                "A required privilege is unavailable: {}",
                 detail
             ),
             Self::Status(status) => status_text(*status),
+            Self::Failed(detail) => detail.clone(),
         }
     }
 }
@@ -519,8 +523,8 @@ impl EnabledPrivilege {
         // Success with ERROR_NOT_ALL_ASSIGNED: the token does not hold it.
         if unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
             return Err(tr(
-                "이 계정에 권한이 없습니다(관리자 권한 필요)",
-                "this account does not hold it (administrator required)",
+                "이 프로세스의 토큰에 없습니다(관리자 권한이 필요하거나 정책으로 제거됨)",
+                "this process's token does not hold it (administrator rights are needed, or a policy removed it)",
             )
             .into());
         }
@@ -586,20 +590,23 @@ pub fn purge_in_process(lists: &[MemoryList]) -> PurgeResults {
         (
             lists.iter().any(|list| list.command().is_some()),
             SE_PROF_SINGLE_PROCESS_NAME,
+            "SeProfileSingleProcessPrivilege",
         ),
         (
             lists.contains(&MemoryList::SystemWorkingSet),
             SE_INCREASE_QUOTA_NAME,
+            "SeIncreaseQuotaPrivilege",
         ),
     ];
     let mut privileges = Vec::new();
-    for (wanted, name) in needed {
+    for (wanted, name, label) in needed {
         if !wanted {
             continue;
         }
         match EnabledPrivilege::enable(name) {
             Ok(privilege) => privileges.push(privilege),
             Err(detail) => {
+                let detail = format!("{label}: {detail}");
                 return lists
                     .iter()
                     .map(|&list| (list, Err(PurgeError::Privilege(detail.clone()))))
@@ -1110,7 +1117,7 @@ pub fn run(options: CleanupOptions, mut progress: impl FnMut(Progress)) -> Clean
                 progress(Progress::Trimming(ids.len()));
                 TrimOutcome::Processes(trim_working_sets(&ids))
             })
-            .map_err(PurgeError::Unavailable)
+            .map_err(PurgeError::Failed)
     });
     let (mut system_working_set, mut modified, mut standby, mut low_standby) =
         (None, None, None, None);
@@ -1525,7 +1532,23 @@ mod tests {
                 "{result:?}"
             );
         }
-        // The system working set needs another privilege; it is refused too.
+        // Each missing privilege is named, including the system working set's.
+        for (lists, name) in [
+            (
+                &[MemoryList::Modified][..],
+                "SeProfileSingleProcessPrivilege",
+            ),
+            (
+                &[MemoryList::SystemWorkingSet][..],
+                "SeIncreaseQuotaPrivilege",
+            ),
+        ] {
+            let results = purge_in_process(lists);
+            assert!(
+                matches!(&results[0].1, Err(PurgeError::Privilege(detail)) if detail.starts_with(name)),
+                "{results:?}"
+            );
+        }
         let results = purge_in_process(&MemoryList::ALL);
         assert_eq!(results.len(), 5);
         for (_, result) in &results {

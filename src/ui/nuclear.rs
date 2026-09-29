@@ -363,7 +363,9 @@ fn purge_outcome(result: &Result<(), PurgeError>) -> (Status, String) {
             error @ (PurgeError::Declined | PurgeError::Unavailable(_) | PurgeError::Privilege(_)),
         ) => (Status::Attention, error.message()),
         Err(error @ PurgeError::NotRun) => (Status::Skipped, error.message()),
-        Err(error @ PurgeError::Status(_)) => (Status::Failed, error.message()),
+        Err(error @ (PurgeError::Status(_) | PurgeError::Failed(_))) => {
+            (Status::Failed, error.message())
+        }
     }
 }
 
@@ -2433,7 +2435,7 @@ fn preview_report() -> CleanupReport {
     let before = memclean::memory_state();
     let trim = memclean::process_ids()
         .map(|ids| TrimOutcome::Processes(memclean::count_trimmable(&ids)))
-        .map_err(PurgeError::Unavailable);
+        .map_err(PurgeError::Failed);
     let zombies = memclean::scan_zombies();
     CleanupReport {
         before,
@@ -2617,9 +2619,12 @@ mod tests {
                 text.contains("Clear priority 0 standby only: Done"),
                 "{text}"
             );
-            // A trim that could not start says why instead of failing silently.
-            all.trim = Some(Err(PurgeError::Unavailable("no list".into())));
-            assert_eq!(steps(&all)[0].1, Status::Attention);
+            // A trim that could not list processes is a failure, with its reason.
+            all.trim = Some(Err(PurgeError::Failed("no list".into())));
+            assert_eq!(
+                (steps(&all)[0].1, steps(&all)[0].2.as_str()),
+                (Status::Failed, "no list")
+            );
         });
         // Every memory step but the trim needs administrator rights.
         assert!(!needs_admin(TRIM) && !needs_admin(ZOMBIES));
