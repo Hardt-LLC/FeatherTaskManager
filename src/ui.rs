@@ -2652,7 +2652,14 @@ unsafe fn settings_menu(p: *mut App) {
     let mut bounds: RECT = zeroed();
     GetWindowRect((*p).settings, &mut bounds);
     // The layered menu above the Settings item (below it without room).
-    let command = popup::track_menu(p, menu, popup::Anchor::Above { r: bounds });
+    let command = popup::track_menu(
+        p,
+        menu,
+        popup::Anchor::Above {
+            r: bounds,
+            right: false,
+        },
+    );
     DestroyMenu(menu);
     (*p).modal = false;
     configure(p);
