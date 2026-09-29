@@ -52,6 +52,9 @@ struct Checks {
     /// Threads started (tests).
     #[cfg(test)]
     started: std::sync::atomic::AtomicUsize,
+    /// Checks past the withdrawal test, i.e. really started (tests).
+    #[cfg(test)]
+    begun: std::sync::atomic::AtomicUsize,
 }
 
 impl Checks {
@@ -114,6 +117,9 @@ impl Checks {
             if check.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 continue;
             }
+            #[cfg(test)]
+            self.begun
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             #[cfg(test)]
             std::thread::sleep(Duration::from_millis(
                 self.delay_ms.load(std::sync::atomic::Ordering::Relaxed),
@@ -692,6 +698,14 @@ pub(super) unsafe fn show(app: *mut App) -> Option<TaskLaunch> {
 mod tests {
     use super::*;
 
+    /// Wait until the thread has really started `count` checks: taken from
+    /// the queue and past the withdrawal test.
+    fn await_begun(checks: &Checks, count: usize) {
+        while checks.begun.load(std::sync::atomic::Ordering::Acquire) < count {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn submit_to(
         checks: &Arc<Checks>,
         sender: &mpsc::Sender<(&'static str, bool)>,
@@ -726,9 +740,9 @@ mod tests {
             .store(300, std::sync::atomic::Ordering::Relaxed);
         let (sender, results) = mpsc::channel();
         let running = submit_to(&checks, &sender, "running");
-        while checks.queue().waiting.is_some() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // An emptied queue is not enough: the thread may not have tested the
+        // token yet, and would then (rightly) skip the withdrawn request.
+        await_begun(&checks, 1);
         let waiting = submit_to(&checks, &sender, "withdrawn");
         // Withdrawing the running check only marks it: the waiting one stays.
         checks.withdraw(&running);
@@ -764,10 +778,8 @@ mod tests {
             submit_to(&checks, &sender, name);
         };
         submit("first");
-        // Once the thread has taken it, later requests wait behind it.
-        while checks.queue().waiting.is_some() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // Once the thread has started it, later requests wait behind it.
+        await_begun(&checks, 1);
         for name in ["second", "third", "newest"] {
             submit(name);
         }
