@@ -4622,12 +4622,12 @@ mod tests {
                 std::env::current_exe().unwrap().display()
             );
             set_program(&program);
-            run_task::set_check_delay(Duration::from_millis(3000));
+            run_task::set_check_delay(Duration::from_millis(1500));
             PLAN.set(((*test.p).hwnd as usize, Plan::RunSlow));
             let started = Instant::now();
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             run_task::set_check_delay(Duration::ZERO);
-            assert!(started.elapsed() < Duration::from_millis(3000));
+            assert!(started.elapsed() < Duration::from_millis(1500));
             assert!(LABELED.get(), "a slow check is labelled");
             assert!(test.jobs.try_recv().is_err(), "Cancel starts nothing");
             PLAN.set(((*test.p).hwnd as usize, Plan::Run));

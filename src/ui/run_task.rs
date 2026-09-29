@@ -1,6 +1,7 @@
 //! On-demand native modal dialog; no polling or retained command history. The
-//! program is resolved on a worker thread (a one-shot timer only labels a
-//! slow check), so a slow drive never blocks the dialog or the app's windows.
+//! program is resolved on the app's one check thread (a one-shot timer only
+//! labels a slow check), so a slow drive never blocks the dialog or the app's
+//! windows, and a stalled one never accumulates threads.
 use super::*;
 use crate::actions::TaskLaunch;
 use windows_sys::Win32::{
@@ -21,12 +22,94 @@ const CHECK_LABEL_MS: u32 = 250;
 
 type Checked = (u64, Result<(), String>);
 
-/// Tests stand in for a slow drive by delaying the worker's check.
-#[cfg(test)]
-static CHECK_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// One program check and what to do with its result.
+struct Check {
+    task: TaskLaunch,
+    done: Box<dyn FnOnce(Result<(), String>) + Send>,
+}
+
+#[derive(Default)]
+struct Queue {
+    /// The check thread exists (it exits when nothing waits).
+    running: bool,
+    /// The newest request behind the one being checked. A newer request
+    /// replaces it: it came from an edited, re-run or closed dialog.
+    waiting: Option<Check>,
+}
+
+/// Program checks, app-wide: one thread at most, however slow a drive is
+/// and however often the dialog is re-run or reopened meanwhile.
+#[derive(Default)]
+struct Checks {
+    queue: std::sync::Mutex<Queue>,
+    /// Tests stand in for a slow drive by delaying each check.
+    #[cfg(test)]
+    delay_ms: std::sync::atomic::AtomicU64,
+    /// Threads started (tests).
+    #[cfg(test)]
+    started: std::sync::atomic::AtomicUsize,
+}
+
+impl Checks {
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn submit(self: &Arc<Self>, check: Check) -> Result<(), String> {
+        let mut queue = self.queue();
+        queue.waiting = Some(check);
+        if queue.running {
+            return Ok(());
+        }
+        queue.running = true;
+        let checks = Arc::clone(self);
+        match std::thread::Builder::new()
+            .name("feather-run-task-check".into())
+            .spawn(move || checks.work())
+        {
+            Ok(_) => {
+                #[cfg(test)]
+                self.started
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                queue.running = false;
+                queue.waiting = None;
+                Err(error.to_string())
+            }
+        }
+    }
+    fn work(&self) {
+        loop {
+            let Some(check) = self.queue().waiting.take() else {
+                // Checked under the lock: a request submitted now starts a
+                // new thread instead of waiting for this one.
+                let mut queue = self.queue();
+                if queue.waiting.is_none() {
+                    queue.running = false;
+                    return;
+                }
+                continue;
+            };
+            #[cfg(test)]
+            std::thread::sleep(Duration::from_millis(
+                self.delay_ms.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+            (check.done)(crate::actions::check_task(&check.task));
+        }
+    }
+}
+
+fn checks() -> &'static Arc<Checks> {
+    static CHECKS: std::sync::OnceLock<Arc<Checks>> = std::sync::OnceLock::new();
+    CHECKS.get_or_init(Default::default)
+}
+
 #[cfg(test)]
 pub(super) fn set_check_delay(delay: Duration) {
-    CHECK_DELAY_MS.store(
+    checks().delay_ms.store(
         delay.as_millis() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
@@ -69,7 +152,7 @@ unsafe fn discard_check(hwnd: HWND, state: &mut State) {
 }
 
 /// Run: the command's syntax is checked at once; resolving the program
-/// searches folders and reads the file system, so it runs on a worker
+/// searches folders and reads the file system, so it runs on the check
 /// thread and its result arrives as [`CHECKED`]. Cancel works meanwhile.
 unsafe fn start_check(hwnd: HWND, state: &mut State) {
     if state.checking.is_some() {
@@ -89,20 +172,15 @@ unsafe fn start_check(hwnd: HWND, state: &mut State) {
     let request = state.requests;
     let sender = state.checked.0.clone();
     let dialog = hwnd as usize;
-    let checked = task.clone();
-    let started = std::thread::Builder::new()
-        .name("feather-run-task-check".into())
-        .spawn(move || {
-            #[cfg(test)]
-            std::thread::sleep(Duration::from_millis(
-                CHECK_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed),
-            ));
-            let result = crate::actions::check_task(&checked);
+    let started = checks().submit(Check {
+        task: task.clone(),
+        done: Box::new(move |result| {
             // A closed dialog dropped the receiver: nothing is posted.
             if sender.send((request, result)).is_ok() {
                 unsafe { PostMessageW(dialog as HWND, CHECKED, 0, 0) };
             }
-        });
+        }),
+    });
     match started {
         Ok(_) => {
             state.checking = Some((request, task));
@@ -563,4 +641,58 @@ pub(super) unsafe fn show(app: *mut App) -> Option<TaskLaunch> {
         );
     }
     state.result.take()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stalled drive: re-running and reopening the dialog meanwhile never
+    /// adds threads, and only the newest waiting request is checked.
+    #[test]
+    fn checks_share_one_thread_and_keep_only_the_newest_request() {
+        let checks = Arc::new(Checks::default());
+        checks
+            .delay_ms
+            .store(300, std::sync::atomic::Ordering::Relaxed);
+        let (sender, results) = mpsc::channel();
+        let submit = |name: &'static str| {
+            let sender = sender.clone();
+            checks
+                .submit(Check {
+                    task: TaskLaunch {
+                        command: "cmd".into(),
+                        arguments: String::new(),
+                        elevated: false,
+                    },
+                    done: Box::new(move |result| {
+                        let _ = sender.send((name, result.is_ok()));
+                    }),
+                })
+                .unwrap();
+        };
+        submit("first");
+        // Once the thread has taken it, later requests wait behind it.
+        while checks.queue().waiting.is_some() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for name in ["second", "third", "newest"] {
+            submit(name);
+        }
+        let wait = || results.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(wait(), ("first", true), "the running check finishes");
+        assert_eq!(wait(), ("newest", true), "then only the newest waiting one");
+        assert!(results.recv_timeout(Duration::from_millis(500)).is_err());
+        assert_eq!(checks.started.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // The idle thread has exited; the next request starts one again.
+        while checks.queue().running {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        checks
+            .delay_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        submit("later");
+        assert_eq!(wait(), ("later", true));
+        assert_eq!(checks.started.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
 }
