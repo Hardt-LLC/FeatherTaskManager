@@ -14,7 +14,7 @@ Please report security issues privately through GitHub's **Report a vulnerabilit
 | --- | --- | --- | --- |
 | FTM-2026-05 | 높음 | FTM-2026-02의 수정은 EXE의 **정적** 가져오기만 System32로 제한했습니다. Windows 구성 요소가 실행 중 이름으로 불러오는 DLL(예: `gdi32full.dll`의 `opengl32.dll`)과 DLL 초기화 중 불러오는 DLL(`powrprof.dll`이 지연 로드하는 `umpdc.dll`)은 여전히 EXE 폴더부터 검색되었습니다. 공격자가 포터블 EXE 옆(예: 다운로드 폴더)에 DLL을 놓으면 Feather 안에서 실행되고, 사용자가 포터블 복사본을 관리자 권한으로 다시 실행하면 같은 권한을 얻습니다. | `main()`의 첫 동작으로 `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`를 호출하고, 실패하면 다른 코드를 실행하지 않고 종료 코드 3으로 끝납니다. 이어서 이미지 로드 정책 `PreferSystem32Images`·`NoRemoteImages`를 설정합니다(지원하지 않는 Windows에서는 무시). `main()`보다 먼저 `umpdc.dll`을 부르는 `powrprof.dll`은 `/DELAYLOAD`로 첫 사용 시점(제한 이후)에 불러옵니다. |
 | FTM-2026-06 | 중간 | 관리자 권한 UI에서 메모리 목록 비우기를 한 번 실행하면 `SeProfileSingleProcessPrivilege`가 프로세스가 끝날 때까지 켜진 채로 남았습니다. | `AdjustTokenPrivileges`가 바꾼 이전 상태를 저장하고 `NtSetSystemInformation` 직후 복원합니다. |
-| FTM-2026-07 | 중간 | `--purge-memory-lists`가 목록 이름 뒤의 인수를 검사하지 않았습니다. | `<standby\|lowstandby\|modified\|all>` 뒤에는 `--language ko\|en`만 허용하고, 그 밖의 인수는 사용법 오류(종료 코드 1)입니다. |
+| FTM-2026-07 | 중간 | `--purge-memory-lists`가 목록 이름 뒤의 인수를 검사하지 않았습니다. | `<목록>`(쉼표로 구분한 `workingsets\|systemworkingset\|modified\|lowstandby\|standby`, 또는 `all`) 뒤에는 `--language ko\|en`만 허용하고, 그 밖의 인수는 사용법 오류(종료 코드 1)입니다. |
 | FTM-2026-08 | 중간 | 진단 출력(`--self-test`, `--render-previews`, 새 `--dump-hardware`, `--memory-cleanup-dry-run`)을 다른 사용자가 쓸 수 있는 폴더에서 관리자 권한으로 실행하면, 미리 만든 심볼릭 링크·하드 링크·정션이 쓰기를 관리자 권한으로 다른 파일에 돌릴 수 있었습니다. | 두 새 인수는 출력 파일 경로가 필수입니다. 네 출력 모두 파일을 `FILE_FLAG_OPEN_REPARSE_POINT`로 열고, 경로의 폴더가 정션·심볼릭 링크·마운트 지점이거나 파일이 재분석 지점이거나 하드 링크가 둘 이상이면 쓰지 않습니다. 열린 파일과 폴더의 최종 경로가 검사한 폴더 체인과 일치할 때만 기존 파일을 비우며, 검사에 실패하면 새로 만든 빈 파일은 지웁니다. 일반 권한의 기본 파일 이름(`self-test.txt`, `previews`)은 그대로 동작합니다. |
 | FTM-2026-09 | 중간 | 프로세스별 네트워크 ETW 콜백이 이벤트의 공급자를 확인하지 않아, Feather의 세션을 제어할 수 있는 사용자가 다른 공급자를 세션에 추가하면 같은 이벤트 ID로 바이트 수를 주입할 수 있었습니다. | `EventHeader.ProviderId`가 Microsoft-Windows-Kernel-Network인 이벤트만 집계합니다. |
 
@@ -41,11 +41,11 @@ F01/F02의 높은 위험도는 **공격자에게 포터블 위치의 쓰기 권�
 
 ## 메모리 정리(Nuclear Zombie)의 권한 경계
 
-- 관리자 도우미 인수 `--purge-memory-lists <standby|lowstandby|modified|all>`가 추가되었습니다. UI는 Feather가 이미 관리자 권한이면 같은 프로세스에서 처리하고, 아니면 연결 설정 도우미와 같은 방식으로 **설치된 Program Files 이미지만** UAC로 실행합니다. 경로 구성 요소와 설치 파일을 잠그고, 실행 중인 EXE와 **바이트 단위로 같은 빌드**일 때만 시작합니다. 포터블 EXE의 `current_exe()` 경로는 관리자 실행에 쓰지 않습니다. 다른 빌드나 확인할 수 없는 설치는 거부하고 그 이유를 결과에 표시합니다.
-- 도우미는 정확히 `<목록 이름>` 또는 `<목록 이름> --language ko|en` 형식만 받고(UI가 언어를 덧붙임), 그 밖의 인수는 사용법 오류(종료 코드 1)로 끝냅니다(FTM-2026-07). `SeProfileSingleProcessPrivilege`만 켜고 `NtSetSystemInformation`의 메모리 목록 명령만 실행한 뒤 권한을 이전 상태로 되돌립니다. 관리자 권한 UI가 같은 프로세스에서 처리할 때도 마찬가지입니다(FTM-2026-06). 파일·레지스트리를 쓰지 않고 UI도 열지 않으며, 결과는 종료 코드로만 전달합니다.
+- 관리자 도우미 인수 `--purge-memory-lists <목록>`가 추가되었습니다. 목록은 `workingsets`, `systemworkingset`, `modified`, `lowstandby`, `standby`를 쉼표로 이은 것(각각 한 번, 알 수 없는 이름·중복은 사용법 오류) 또는 `all`(`modified,standby`)이며, 정해진 순서로 실행합니다. UI는 Feather가 이미 관리자 권한이면 같은 프로세스에서 처리하고, 아니면 연결 설정 도우미와 같은 방식으로 **설치된 Program Files 이미지만** UAC로 실행합니다. 경로 구성 요소와 설치 파일을 잠그고, 실행 중인 EXE와 **바이트 단위로 같은 빌드**일 때만 시작합니다. 포터블 EXE의 `current_exe()` 경로는 관리자 실행에 쓰지 않습니다. 다른 빌드나 확인할 수 없는 설치는 거부하고 그 이유를 결과에 표시합니다.
+- 도우미는 정확히 `<목록 이름>` 또는 `<목록 이름> --language ko|en` 형식만 받고(UI가 언어를 덧붙임), 그 밖의 인수는 사용법 오류(종료 코드 1)로 끝냅니다(FTM-2026-07). 선택한 단계에 필요한 권한만 켭니다: 메모리 목록 명령(`NtSetSystemInformation`: 작업 집합·수정된 목록·대기 목록·우선순위 0 대기 목록)에는 `SeProfileSingleProcessPrivilege`, 시스템 작업 집합(`SetSystemFileCacheSize(-1, -1)`)에는 `SeIncreaseQuotaPrivilege`를 켜고, 끝나면 이전 상태로 되돌립니다. 관리자 권한 UI가 같은 프로세스에서 처리할 때도 마찬가지입니다(FTM-2026-06). 파일·레지스트리를 쓰지 않고 UI도 열지 않으며, 결과는 종료 코드로만 전달합니다.
 - 도우미를 포함한 모든 실행은 `main()`의 첫 동작으로 DLL 검색을 System32로 제한합니다(FTM-2026-05). 설치된 이미지는 관리자만 쓸 수 있는 폴더에 있지만, 같은 제한을 둡니다.
 - 좀비 프로세스 검사는 **읽기 전용**입니다. 시스템 핸들 표를 읽고, 다른 프로세스의 프로세스 핸들을 Feather 안으로 제한된 권한(`SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`)으로 복제해 종료 여부를 확인합니다. `DUPLICATE_CLOSE_SOURCE`는 쓰지 않으며 Feather가 만든 복제본만 닫습니다. 다른 프로그램의 핸들을 닫거나 바꾸지 않습니다. 핸들 표 버퍼는 256 MB로 제한하고 항목 수를 버퍼 크기와 대조합니다.
-- 작업 집합 정리는 Feather가 열 수 있는 프로세스에만 `EmptyWorkingSet`을 호출합니다. 프로세스를 종료하지 않습니다. 보유 프로세스의 작업 끝내기는 자동으로 실행되지 않고 기존 확인 대화 상자와 PID·생성 시각 검증을 거칩니다.
+- 작업 집합 정리는 일반 권한에서는 Feather가 열 수 있는 프로세스에만 `EmptyWorkingSet`을 호출하고, 관리자 권한에서는 RAMMap의 Empty Working Sets와 같은 커널 명령으로 모든 프로세스를 한 번에 정리합니다. 어느 쪽도 프로세스를 종료하지 않고, 일반 권한의 정리는 UAC를 요청하지 않습니다. 보유 프로세스의 작업 끝내기는 자동으로 실행되지 않고 기존 확인 대화 상자와 PID·생성 시각 검증을 거칩니다.
 - 미리보기·테스트는 작업 집합 정리나 메모리 목록 비우기를 실행하지 않습니다. `--memory-cleanup-dry-run <파일>`도 읽기만 하며, 결과는 FTM-2026-08의 링크 검사를 거쳐 지정한 파일에만 씁니다.
 
 ## "항상 관리자 권한으로 실행" 설정의 권한 경계

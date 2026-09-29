@@ -1203,14 +1203,18 @@
   });
   $('#pal-list').addEventListener('click', e => { const li = e.target.closest('li'); li && runPal(+li.dataset.i); });
 
-  /* ─── Nuclear Zombie (simulated run; the real one trims working sets, purges memory lists and reads handles) ─── */
+  /* ─── Nuclear Zombie (simulated run; the real one runs every RAMMap Empty command and reads handles) ─── */
+  // Panel and run order; the five memory steps are Sysinternals RAMMap's Empty menu.
   const NZ_OPTS = [
-    ['Trim working sets', 'Moves idle pages of running apps out of RAM. They come back from the standby list when used again.', false],
-    ['Clear standby cache', 'Drops file data Windows keeps cached in otherwise unused memory. Apps may open a little slower until it is rebuilt.', true],
+    ['Trim working sets', 'Moves idle pages of running apps out of RAM (they return when used). As administrator every process, otherwise the ones Feather can open.', false],
+    ['Empty system working set', 'Moves the file cache and kernel memory Windows keeps in RAM (the system working set) out. It comes back from the standby list when used again.', true],
     ['Flush modified pages', 'Writes changed pages to disk so they can join the standby list.', true],
+    ['Clear standby cache', 'Drops file data Windows keeps cached in otherwise unused memory. Apps may open a little slower until it is rebuilt.', true],
+    ['Clear priority 0 standby only', 'Drops only priority 0 cached pages, the ones Windows reuses first, and keeps the rest of the standby cache. Cannot be combined with Clear standby cache.', true],
     ['Find zombie processes', 'Lists exited processes that another program still holds open. Read-only: nothing is closed.', false]
   ];
-  const NZ = { opts: [true, true, false, true], phase: 'idle', progress: '', report: null, shown: null, standby: 12.4 * 1024, modified: 402 };
+  const NZ_STANDBY = 3, NZ_LOW = 4;
+  const NZ = { opts: [true, false, false, true, false, true], phase: 'idle', progress: '', report: null, shown: null, standby: 12.4 * 1024, modified: 402 };
   const HOLDERS = [[code, [['git.exe', 7], ['conhost.exe', 2]]], [explorer, [['dllhost.exe', 3], ['rundll32.exe', 1]]], [teams, [['msedgewebview2.exe', 2]]], [term, [['pwsh.exe', 1]]]];
   // Unelevated, Feather can open only the signed-in user's processes; elevated, all but the protected ones.
   const PROTECTED = new Set(['System', 'Secure System', 'Registry', 'smss.exe', 'Memory Compression', 'csrss.exe', 'LsaIso.exe']);
@@ -1223,6 +1227,9 @@
   const delta = (a, b) => b > a ? '+' + human((b - a) * MB) : b < a ? '\u2212' + human((a - b) * MB) : '\u00B10 B';
   const partialText = r => r.uninspected ? `Partial scan: ${int(r.uninspected)} processes could not be inspected (other users, services or protected processes).${r.elevated ? '' : ' Run Feather as administrator to include more.'}` : '';
   const programs = n => n === 1 ? '1 program' : `${int(n)} programs`;
+  const trimText = t => t.all ? 'Done · every process' : `Done · ${int(t.trimmed)} trimmed, ${int(t.skipped)} skipped (no access)`;
+  // The administrator steps a run reported, in panel order.
+  const adminSteps = r => [['Empty system working set', r.system], ['Flush modified pages', r.modified], ['Clear standby cache', r.standby], ['Clear priority 0 standby only', r.low]].filter(([, v]) => v);
   function openNz(focus = true) {
     closeMenus(); closePalette();
     if (NZ.phase !== 'running') NZ.shown = memState();
@@ -1241,9 +1248,8 @@
     const res = $('#nz-res'); res.hidden = !r;
     if (r) {
       const steps = [];
-      if (r.trim) steps.push(['Trim working sets', '', `Done · ${int(r.trim.trimmed)} trimmed, ${int(r.trim.skipped)} skipped (no access)`]);
-      if (r.standby) steps.push(['Clear standby cache', r.standby === 'ok' ? '' : 'warn', r.standby === 'ok' ? 'Done' : 'The administrator request was declined']);
-      if (r.modified) steps.push(['Flush modified pages', r.modified === 'ok' ? '' : 'warn', r.modified === 'ok' ? 'Done' : 'The administrator request was declined']);
+      if (r.trim) steps.push(['Trim working sets', '', trimText(r.trim)]);
+      for (const [k, v] of adminSteps(r)) steps.push([k, v === 'ok' ? '' : 'warn', v === 'ok' ? 'Done' : 'The administrator request was declined']);
       const holders = r.zombies ? r.zombies.filter(h => byPid(h.pid)) : null;
       const total = holders ? holders.reduce((s, h) => s + h.n, 0) : 0;
       if (holders) steps.push(['Find zombie processes', '', `Done · ${exited(total)}`]);
@@ -1267,26 +1273,31 @@
     NZ.phase = 'running'; NZ.report = null;
     const step = async (label, ms) => { NZ.progress = label; renderNz(); if (!instant) await wait(ms); };
     await step('Starting…', 250);
-    let trim = null, standby = null, modified = null, zombies = null;
-    if (o[0]) {
+    let trim = null, system = null, modified = null, standby = null, low = null, zombies = null;
+    const trimAll = () => { for (const p of procs) { const cut = p.base.mem * (0.06 + rnd() * 0.12); p.base.mem -= cut; p.cur.mem = p.base.mem; NZ.standby += cut; } };
+    if (o[0] && !S.admin) {
+      // Unelevated: each process Feather can open, one by one (no UAC).
       const targets = procs.filter(p => !protectedProc(p));
       await step(`Trimming ${int(targets.length)} processes…`, 900);
       let freed = 0;
       for (const p of targets) { const cut = p.base.mem * (0.06 + rnd() * 0.12); p.base.mem -= cut; p.cur.mem = p.base.mem; freed += cut; }
       NZ.standby += freed; trim = { trimmed: targets.length, skipped: procs.length - targets.length };
     }
-    if (o[1] || o[2]) {
+    if ((o[0] && S.admin) || o[1] || o[2] || o[3] || o[4]) {
       if (!S.admin) await step('Waiting for administrator approval…', 1100);
-      await step('Clearing memory lists…', 600);
+      await step('Emptying memory…', 600);
+      if (o[0] && S.admin) { trimAll(); trim = { all: true }; }
+      if (o[1]) { const moved = Math.min(KERNEL * 0.2, 640); KERNEL -= moved; NZ.standby += moved; system = 'ok'; }
       if (o[2]) { const moved = Math.max(0, NZ.modified - 24); KERNEL -= moved; NZ.standby += moved; NZ.modified = 24; modified = 'ok'; }
-      if (o[1]) { NZ.standby = 310; standby = 'ok'; }
+      if (o[3]) { NZ.standby = 310; standby = 'ok'; }
+      else if (o[4]) { NZ.standby = Math.max(310, NZ.standby * 0.82); low = 'ok'; }
     }
-    if (o[3]) {
+    if (o[5]) {
       await step('Scanning handles…', 800);
       zombies = HOLDERS.filter(([p]) => byPid(p.pid)).map(([p, ex]) => ({ pid: p.pid, name: p.name, ex, n: ex.reduce((s, x) => s + x[1], 0) })).sort((a, b) => b.n - a.n);
     }
     NZ.shown = memState();
-    NZ.report = { before, after: NZ.shown, trim, standby, modified, zombies, uninspected: procs.filter(protectedProc).length, elevated: S.admin };
+    NZ.report = { before, after: NZ.shown, trim, system, modified, standby, low, zombies, uninspected: procs.filter(protectedProc).length, elevated: S.admin };
     NZ.phase = 'done';
     if ($('#nz').hidden) toast(`Memory cleanup finished · Available ${delta(before.avail, NZ.shown.avail)}`);
     else { renderNz(true); if (!instant) $('#nz-run').focus(); }
@@ -1298,9 +1309,8 @@
     const out = ['Feather Task Manager \u00B7 Nuclear Zombie', `Administrator: ${r.elevated ? 'yes' : 'no'}`, `Total memory: ${human(r.after.total * MB)}`];
     for (const [k, f] of [['Available', 'avail'], ['In use', 'inUse'], ['Standby', 'standby'], ['Modified', 'modified'], ['Free', 'free']])
       out.push(`${k}: ${human(r.before[f] * MB)} -> ${human(r.after[f] * MB)} (${delta(r.before[f], r.after[f])})`);
-    if (r.trim) out.push(`Trim working sets: Done \u00B7 ${int(r.trim.trimmed)} trimmed, ${int(r.trim.skipped)} skipped (no access)`);
-    if (r.standby) out.push('Clear standby cache: Done');
-    if (r.modified) out.push('Flush modified pages: Done');
+    if (r.trim) out.push(`Trim working sets: ${trimText(r.trim)}`);
+    for (const [k] of adminSteps(r)) out.push(`${k}: Done`);
     if (r.zombies) {
       const hs = r.zombies, total = hs.reduce((s, h) => s + h.n, 0);
       out.push(`Find zombie processes: Done \u00B7 ${exited(total)}`, total ? `${exited(total)} held open by ${programs(hs.length)}` : 'No zombie processes found.');
@@ -1310,7 +1320,13 @@
     return out.join('\r\n');
   }
   $('#nz-ico').outerHTML = TREFOIL;
-  $('#nz-opts').addEventListener('click', e => { const sw = e.target.closest('[data-nzopt]'); if (!sw || NZ.phase === 'running') return; NZ.opts[+sw.dataset.nzopt] = !NZ.opts[+sw.dataset.nzopt]; renderNz(); });
+  $('#nz-opts').addEventListener('click', e => {
+    const sw = e.target.closest('[data-nzopt]'); if (!sw || NZ.phase === 'running') return;
+    const i = +sw.dataset.nzopt; NZ.opts[i] = !NZ.opts[i];
+    // Clearing the whole standby cache already clears priority 0: the two exclude each other.
+    if (NZ.opts[i] && (i === NZ_STANDBY || i === NZ_LOW)) NZ.opts[i === NZ_STANDBY ? NZ_LOW : NZ_STANDBY] = false;
+    renderNz();
+  });
   // Like the app: the panel closes, then the usual End task confirmation says what ending it releases.
   $('#nz-res').addEventListener('click', e => {
     const b = e.target.closest('[data-nzend]'); if (!b) return;

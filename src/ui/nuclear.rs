@@ -22,8 +22,8 @@ use super::theme::{solid, Palette};
 use super::widgets::{self, ButtonState, ButtonStyle, Painter, PillKind};
 use super::*;
 use crate::memclean::{
-    self, CleanupOptions, CleanupReport, MemoryState, Progress, PurgeError, TrimReport,
-    ZombieHolder, ZombieScan,
+    self, CleanupOptions, CleanupReport, MemoryState, Progress, PurgeError, TrimOutcome,
+    TrimReport, ZombieHolder, ZombieScan,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -40,11 +40,15 @@ pub(super) enum CleanupEvent {
 
 type Key = (usize, u32);
 
-/// Option rows, in panel order.
+/// Option rows, in panel (and run) order. The five memory steps are the
+/// items of Sysinternals RAMMap's Empty menu.
 const TRIM: usize = 0;
-const STANDBY: usize = 1;
+const SYSTEM: usize = 1;
 const MODIFIED: usize = 2;
-const ZOMBIES: usize = 3;
+const STANDBY: usize = 3;
+const LOW_STANDBY: usize = 4;
+const ZOMBIES: usize = 5;
+const OPTIONS: usize = 6;
 /// `.dialog`-like panel width (DIP); `min(560px, 100% - 32px)`.
 const WIDTH: f32 = 560.0;
 /// Holder rows painted (Copy details lists every holder).
@@ -141,8 +145,13 @@ fn note() -> &'static str {
 fn option_title(index: usize) -> &'static str {
     match index {
         TRIM => tr("작업 집합 정리", "Trim working sets"),
-        STANDBY => tr("대기 캐시 비우기", "Clear standby cache"),
+        SYSTEM => tr("시스템 작업 집합 비우기", "Empty system working set"),
         MODIFIED => tr("수정된 페이지 기록", "Flush modified pages"),
+        STANDBY => tr("대기 캐시 비우기", "Clear standby cache"),
+        LOW_STANDBY => tr(
+            "우선순위 0 대기 캐시만 비우기",
+            "Clear priority 0 standby only",
+        ),
         _ => tr("좀비 프로세스 찾기", "Find zombie processes"),
     }
 }
@@ -150,8 +159,16 @@ fn option_title(index: usize) -> &'static str {
 fn option_description(index: usize) -> &'static str {
     match index {
         TRIM => tr(
-            "실행 중인 앱의 유휴 페이지를 RAM에서 내보냅니다. 다시 사용하면 대기 목록에서 돌아옵니다.",
-            "Moves idle pages of running apps out of RAM. They come back from the standby list when used again.",
+            "실행 중인 앱의 유휴 페이지를 RAM에서 내보냅니다(다시 쓰면 돌아옴). 관리자 권한이면 모든 프로세스, 아니면 열 수 있는 프로세스만 정리합니다.",
+            "Moves idle pages of running apps out of RAM (they return when used). As administrator every process, otherwise the ones Feather can open.",
+        ),
+        SYSTEM => tr(
+            "Windows가 RAM에 두는 파일 캐시와 커널 메모리(시스템 작업 집합)를 내보냅니다. 다시 쓰이면 대기 목록에서 돌아옵니다.",
+            "Moves the file cache and kernel memory Windows keeps in RAM (the system working set) out. It comes back from the standby list when used again.",
+        ),
+        LOW_STANDBY => tr(
+            "Windows가 가장 먼저 재사용하는 우선순위 0 캐시만 버리고 나머지 대기 캐시는 남깁니다. 대기 캐시 비우기와 함께 켤 수 없습니다.",
+            "Drops only priority 0 cached pages, the ones Windows reuses first, and keeps the rest of the standby cache. Cannot be combined with Clear standby cache.",
         ),
         STANDBY => tr(
             "Windows가 여유 메모리에 캐시해 둔 파일 데이터를 버립니다. 캐시가 다시 채워질 때까지 앱이 조금 느리게 열릴 수 있습니다.",
@@ -168,9 +185,28 @@ fn option_description(index: usize) -> &'static str {
     }
 }
 
-/// Standby and modified purges need administrator rights (UAC).
+/// The memory list and system working set steps need administrator rights
+/// (UAC). Trimming works without: then only the processes Feather can open.
 fn needs_admin(index: usize) -> bool {
-    matches!(index, STANDBY | MODIFIED)
+    matches!(index, SYSTEM | MODIFIED | STANDBY | LOW_STANDBY)
+}
+
+/// Flip option `index`. Clearing the whole standby cache already clears
+/// priority 0, so turning one of the two on turns the other off. Returns
+/// the new state and the option switched off with it, if any.
+fn flip(options: &mut [bool; OPTIONS], index: usize) -> (bool, Option<usize>) {
+    options[index] = !options[index];
+    let on = options[index];
+    let other = match index {
+        STANDBY => Some(LOW_STANDBY),
+        LOW_STANDBY => Some(STANDBY),
+        _ => None,
+    };
+    let released = other.filter(|&other| on && options[other]);
+    if let Some(other) = released {
+        options[other] = false;
+    }
+    (on, released)
 }
 
 fn progress_text(progress: Option<Progress>) -> String {
@@ -186,7 +222,7 @@ fn progress_text(progress: Option<Progress>) -> String {
             "Waiting for administrator approval…",
         )
         .into(),
-        Some(Progress::Purging) => tr("메모리 목록을 비우는 중…", "Clearing memory lists…").into(),
+        Some(Progress::Purging) => tr("메모리를 비우는 중…", "Emptying memory…").into(),
         Some(Progress::Scanning) => tr("핸들을 검사하는 중…", "Scanning handles…").into(),
     }
 }
@@ -213,6 +249,13 @@ fn exited(count: u32) -> String {
             "{} exited processes",
             grouped(count)
         )
+    }
+}
+
+fn trim_outcome_text(outcome: &TrimOutcome) -> String {
+    match outcome {
+        TrimOutcome::Processes(report) => trim_text(report),
+        TrimOutcome::AllProcesses => tr("완료 · 모든 프로세스", "Done · every process").into(),
     }
 }
 
@@ -329,11 +372,19 @@ fn steps(report: &CleanupReport) -> Vec<(usize, Status, String)> {
     let mut rows = Vec::new();
     if let Some(trim) = &report.trim {
         rows.push(match trim {
-            Ok(trim) => (TRIM, Status::Done, trim_text(trim)),
-            Err(error) => (TRIM, Status::Failed, error.clone()),
+            Ok(trim) => (TRIM, Status::Done, trim_outcome_text(trim)),
+            Err(error) => {
+                let (status, text) = purge_outcome(&Err(error.clone()));
+                (TRIM, status, text)
+            }
         });
     }
-    for (index, result) in [(STANDBY, &report.standby), (MODIFIED, &report.modified)] {
+    for (index, result) in [
+        (SYSTEM, &report.system_working_set),
+        (MODIFIED, &report.modified),
+        (STANDBY, &report.standby),
+        (LOW_STANDBY, &report.low_standby),
+    ] {
         if let Some(result) = result {
             let (status, text) = purge_outcome(result);
             rows.push((index, status, text));
@@ -666,7 +717,7 @@ struct Doc {
 struct State {
     dpi: i32,
     width: i32,
-    options: [bool; 4],
+    options: [bool; OPTIONS],
     elevated: bool,
     /// The strip's reading: at opening, then the run's "after".
     memory: Result<MemoryState, String>,
@@ -697,7 +748,8 @@ impl State {
         Self {
             dpi,
             width,
-            options: [true, true, false, true],
+            // Trim, standby and the zombie scan, as before the RAMMap items.
+            options: [true, false, false, true, false, true],
             elevated: crate::netetw::is_elevated(),
             memory: memclean::memory_state(),
             phase: Phase::Idle,
@@ -716,8 +768,10 @@ impl State {
     fn cleanup_options(&self) -> CleanupOptions {
         CleanupOptions {
             trim: self.options[TRIM],
-            standby: self.options[STANDBY],
+            system_working_set: self.options[SYSTEM],
             modified: self.options[MODIFIED],
+            standby: self.options[STANDBY],
+            low_standby: self.options[LOW_STANDBY],
             zombies: self.options[ZOMBIES],
         }
     }
@@ -1829,14 +1883,21 @@ impl Session {
         !self.state.borrow().waiting_for_administrator()
     }
     unsafe fn toggle(&self, index: usize) {
-        let on = {
+        let (on, released) = {
             let mut s = self.state.borrow_mut();
             if s.running() {
                 return;
             }
-            s.options[index] = !s.options[index];
-            s.options[index]
+            flip(&mut s.options, index)
         };
+        if let (Some(host), Some(other)) = (self.host(), released) {
+            host.set_target(
+                switch_key(other),
+                0.0,
+                anim::motion::SWITCH,
+                anim::Easing::Ease,
+            );
+        }
         if let Some(host) = self.host() {
             host.set_target(
                 switch_key(index),
@@ -2370,14 +2431,18 @@ unsafe fn run(p: *mut App) -> Outcome {
 /// outcome: the UAC prompt was cancelled).
 fn preview_report() -> CleanupReport {
     let before = memclean::memory_state();
-    let trim = memclean::process_ids().map(|ids| memclean::count_trimmable(&ids));
+    let trim = memclean::process_ids()
+        .map(|ids| TrimOutcome::Processes(memclean::count_trimmable(&ids)))
+        .map_err(PurgeError::Unavailable);
     let zombies = memclean::scan_zombies();
     CleanupReport {
         before,
         after: memclean::memory_state(),
         trim: Some(trim),
+        system_working_set: None,
         modified: None,
         standby: Some(Err(PurgeError::Declined)),
+        low_standby: None,
         zombies: Some(zombies),
         elevated: crate::netetw::is_elevated(),
     }
@@ -2471,13 +2536,15 @@ mod tests {
         CleanupReport {
             before: Ok(memory(10 << 30, 1 << 30)),
             after: Ok(memory(12 << 30, 9 << 30)),
-            trim: Some(Ok(TrimReport {
+            trim: Some(Ok(TrimOutcome::Processes(TrimReport {
                 trimmed: 287,
                 skipped: 25,
                 failed: 0,
-            })),
+            }))),
+            system_working_set: None,
             modified: None,
             standby: Some(Err(PurgeError::Declined)),
+            low_standby: None,
             zombies: Some(Ok(ZombieScan {
                 holders: vec![ZombieHolder {
                     pid: 16464,
@@ -2522,6 +2589,56 @@ mod tests {
                 "Trimming 1,312 processes…"
             );
         });
+    }
+
+    #[test]
+    fn every_rammap_step_reports_in_panel_order() {
+        crate::i18n::with_language(Language::English, || {
+            let mut all = report();
+            all.elevated = true;
+            all.trim = Some(Ok(TrimOutcome::AllProcesses));
+            all.system_working_set = Some(Ok(()));
+            all.modified = Some(Err(PurgeError::Status(0xC000_0061_u32 as i32)));
+            all.standby = Some(Err(PurgeError::NotRun));
+            let rows = steps(&all);
+            let order: Vec<usize> = rows.iter().map(|r| r.0).collect();
+            assert_eq!(order, [TRIM, SYSTEM, MODIFIED, STANDBY, ZOMBIES]);
+            assert_eq!(rows[0].2, "Done · every process");
+            assert_eq!((rows[1].1, rows[1].2.as_str()), (Status::Done, "Done"));
+            assert_eq!(rows[2].1, Status::Failed);
+            assert_eq!(rows[3].1, Status::Skipped);
+            all.standby = None;
+            all.low_standby = Some(Ok(()));
+            let rows = steps(&all);
+            assert_eq!(rows[3].0, LOW_STANDBY);
+            let text = details(&all);
+            assert!(text.contains("Empty system working set: Done"), "{text}");
+            assert!(
+                text.contains("Clear priority 0 standby only: Done"),
+                "{text}"
+            );
+            // A trim that could not start says why instead of failing silently.
+            all.trim = Some(Err(PurgeError::Unavailable("no list".into())));
+            assert_eq!(steps(&all)[0].1, Status::Attention);
+        });
+        // Every memory step but the trim needs administrator rights.
+        assert!(!needs_admin(TRIM) && !needs_admin(ZOMBIES));
+        assert!([SYSTEM, MODIFIED, STANDBY, LOW_STANDBY]
+            .into_iter()
+            .all(needs_admin));
+    }
+
+    #[test]
+    fn the_two_standby_purges_exclude_each_other() {
+        let mut options = [true, false, false, true, false, true];
+        assert_eq!(flip(&mut options, LOW_STANDBY), (true, Some(STANDBY)));
+        assert_eq!(options, [true, false, false, false, true, true]);
+        assert_eq!(flip(&mut options, STANDBY), (true, Some(LOW_STANDBY)));
+        assert_eq!(options, [true, false, false, true, false, true]);
+        // Turning one off, or any other switch, leaves the rest alone.
+        assert_eq!(flip(&mut options, STANDBY), (false, None));
+        assert_eq!(flip(&mut options, SYSTEM), (true, None));
+        assert_eq!(options, [true, true, false, false, false, true]);
     }
 
     #[test]

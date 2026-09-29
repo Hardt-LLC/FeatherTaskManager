@@ -23,10 +23,12 @@ use windows_sys::Win32::{
         WAIT_OBJECT_0,
     },
     Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
-        SE_PROF_SINGLE_PROCESS_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_INCREASE_QUOTA_NAME,
+        SE_PRIVILEGE_ENABLED, SE_PROF_SINGLE_PROCESS_NAME, TOKEN_ADJUST_PRIVILEGES,
+        TOKEN_PRIVILEGES, TOKEN_QUERY,
     },
     System::{
+        Memory::SetSystemFileCacheSize,
         ProcessStatus::{K32EmptyWorkingSet, K32EnumProcesses},
         SystemInformation::{
             GetSystemInfo, GetSystemTimeAsFileTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
@@ -337,48 +339,88 @@ pub fn trim_working_sets(ids: &[u32]) -> TrimReport {
 
 // ───────────────────────────── memory lists (administrator) ─────────────────────────────
 
-/// A memory list the elevated purge can act on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// What the elevated purge can empty: every item of RAMMap's Empty menu.
+/// Declared in run order: trimmed working sets land on the modified and
+/// standby lists, a flush moves modified pages to standby, and the standby
+/// purges come last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemoryList {
-    /// `MemoryPurgeStandbyList`: drops cached file data.
-    Standby,
-    /// `MemoryPurgeLowPriorityStandbyList`.
-    LowPriorityStandby,
+    /// `MemoryEmptyWorkingSets`: every process's working set at once.
+    WorkingSets,
+    /// `SetSystemFileCacheSize(-1, -1)`: the system working set (the file
+    /// cache and pageable kernel memory Windows keeps resident).
+    SystemWorkingSet,
     /// `MemoryFlushModifiedList`: writes changed pages to disk.
     Modified,
+    /// `MemoryPurgeLowPriorityStandbyList`: priority 0 standby pages only.
+    LowPriorityStandby,
+    /// `MemoryPurgeStandbyList`: drops cached file data (all priorities).
+    Standby,
 }
 
 impl MemoryList {
-    /// `SYSTEM_MEMORY_LIST_COMMAND`.
-    fn command(self) -> u32 {
+    const ALL: [Self; 5] = [
+        Self::WorkingSets,
+        Self::SystemWorkingSet,
+        Self::Modified,
+        Self::LowPriorityStandby,
+        Self::Standby,
+    ];
+    /// The name in a `--purge-memory-lists` argument.
+    fn name(self) -> &'static str {
         match self {
-            Self::Modified => 3,
-            Self::Standby => 4,
-            Self::LowPriorityStandby => 5,
+            Self::WorkingSets => "workingsets",
+            Self::SystemWorkingSet => "systemworkingset",
+            Self::Modified => "modified",
+            Self::LowPriorityStandby => "lowstandby",
+            Self::Standby => "standby",
+        }
+    }
+    /// `SYSTEM_MEMORY_LIST_COMMAND`; None for the system working set, which
+    /// is emptied through `SetSystemFileCacheSize`.
+    fn command(self) -> Option<u32> {
+        match self {
+            Self::WorkingSets => Some(2),
+            Self::Modified => Some(3),
+            Self::Standby => Some(4),
+            Self::LowPriorityStandby => Some(5),
+            Self::SystemWorkingSet => None,
         }
     }
 }
 
-/// The lists a `--purge-memory-lists` argument names, in the order they
-/// run (modified first: flushed pages then join the standby list).
+/// The lists a `--purge-memory-lists` argument names (comma-separated
+/// names, each at most once; "all" is modified,standby), in run order.
 pub fn parse_lists(argument: &str) -> Option<Vec<MemoryList>> {
-    Some(match argument {
-        "standby" => vec![MemoryList::Standby],
-        "lowstandby" => vec![MemoryList::LowPriorityStandby],
-        "modified" => vec![MemoryList::Modified],
-        "all" => vec![MemoryList::Modified, MemoryList::Standby],
-        _ => return None,
-    })
+    if argument == "all" {
+        return Some(vec![MemoryList::Modified, MemoryList::Standby]);
+    }
+    let mut lists = Vec::new();
+    for name in argument.split(',') {
+        let list = MemoryList::ALL
+            .into_iter()
+            .find(|list| list.name() == name)?;
+        if lists.contains(&list) {
+            return None;
+        }
+        lists.push(list);
+    }
+    lists.sort();
+    Some(lists)
 }
 
-/// The helper argument for the UI's choice (None: nothing to purge).
-pub fn lists_argument(modified: bool, standby: bool) -> Option<&'static str> {
-    match (modified, standby) {
-        (true, true) => Some("all"),
-        (true, false) => Some("modified"),
-        (false, true) => Some("standby"),
-        (false, false) => None,
-    }
+/// The helper argument for `lists` (None: nothing to purge).
+pub fn lists_argument(lists: &[MemoryList]) -> Option<String> {
+    let mut lists = lists.to_vec();
+    lists.sort();
+    lists.dedup();
+    (!lists.is_empty()).then(|| {
+        lists
+            .iter()
+            .map(|list| list.name())
+            .collect::<Vec<_>>()
+            .join(",")
+    })
 }
 
 /// Why a list was not purged.
@@ -496,28 +538,20 @@ impl Drop for EnabledPrivilege {
     }
 }
 
-/// Purge `lists` in order from this (elevated) process. After a failure
-/// the remaining lists are not attempted. `SeProfileSingleProcessPrivilege`
-/// (administrators hold it, disabled by default) is enabled only for the
-/// duration of the purge.
-pub fn purge_in_process(lists: &[MemoryList]) -> PurgeResults {
-    let privilege = match EnabledPrivilege::enable(SE_PROF_SINGLE_PROCESS_NAME) {
-        Ok(privilege) => privilege,
-        Err(detail) => {
-            return lists
-                .iter()
-                .map(|&list| (list, Err(PurgeError::Privilege(detail.clone()))))
-                .collect();
-        }
-    };
-    let mut failed = false;
-    let results = lists
-        .iter()
-        .map(|&list| {
-            if failed {
-                return (list, Err(PurgeError::NotRun));
-            }
-            let command = list.command();
+/// A Win32 error as an NTSTATUS (`NTSTATUS_FROM_WIN32`), so every step
+/// reports one kind of code.
+fn status_from_win32(code: u32) -> i32 {
+    if code == 0 {
+        0xC000_0001_u32 as i32 // STATUS_UNSUCCESSFUL
+    } else {
+        (0xC007_0000 | (code & 0xFFFF)) as i32
+    }
+}
+
+/// Empty one list or working set. The caller holds the privilege it needs.
+fn empty(list: MemoryList) -> Result<(), PurgeError> {
+    match list.command() {
+        Some(command) => {
             let status = unsafe {
                 NtSetSystemInformation(
                     SYSTEM_MEMORY_LIST_INFORMATION,
@@ -526,25 +560,80 @@ pub fn purge_in_process(lists: &[MemoryList]) -> PurgeResults {
                 )
             };
             if status < 0 {
-                failed = true;
-                (list, Err(PurgeError::Status(status)))
+                Err(PurgeError::Status(status))
             } else {
-                (list, Ok(()))
+                Ok(())
             }
+        }
+        // Both limits (SIZE_T)-1 empty the system cache's working set.
+        None if unsafe { SetSystemFileCacheSize(usize::MAX, usize::MAX, 0) } == 0 => {
+            Err(PurgeError::Status(status_from_win32(unsafe {
+                GetLastError()
+            })))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Purge `lists` in order from this (elevated) process. After a failure
+/// the remaining lists are not attempted. Only the privileges the chosen
+/// steps need are enabled (administrators hold them, disabled by default),
+/// and only for the duration of the purge: `SeProfileSingleProcessPrivilege`
+/// for the memory list commands, `SeIncreaseQuotaPrivilege` for the system
+/// working set.
+pub fn purge_in_process(lists: &[MemoryList]) -> PurgeResults {
+    let needed = [
+        (
+            lists.iter().any(|list| list.command().is_some()),
+            SE_PROF_SINGLE_PROCESS_NAME,
+        ),
+        (
+            lists.contains(&MemoryList::SystemWorkingSet),
+            SE_INCREASE_QUOTA_NAME,
+        ),
+    ];
+    let mut privileges = Vec::new();
+    for (wanted, name) in needed {
+        if !wanted {
+            continue;
+        }
+        match EnabledPrivilege::enable(name) {
+            Ok(privilege) => privileges.push(privilege),
+            Err(detail) => {
+                return lists
+                    .iter()
+                    .map(|&list| (list, Err(PurgeError::Privilege(detail.clone()))))
+                    .collect();
+            }
+        }
+    }
+    let mut failed = false;
+    let results = lists
+        .iter()
+        .map(|&list| {
+            if failed {
+                return (list, Err(PurgeError::NotRun));
+            }
+            let result = empty(list);
+            failed = result.is_err();
+            (list, result)
         })
         .collect();
-    // Disable it again right away (restores the previous state).
-    drop(privilege);
+    // Disable them again right away (restores the previous state).
+    drop(privileges);
     results
 }
 
-/// Helper exit codes: 0 success; 1 usage; 2 privilege not enabled; an
-/// NTSTATUS error of the failed list otherwise, with the NTSTATUS
-/// "customer" bit (never set by Windows) marking a failure of the second
-/// list of "all" (the first then succeeded).
+/// Helper exit codes: 0 success; 1 usage; 2 privilege not enabled; the
+/// NTSTATUS error of the failed step otherwise. When a later step failed
+/// (the earlier ones then succeeded), the NTSTATUS "customer" bit (never
+/// set by Windows) is set and bits 25-27 carry the step's index; no status
+/// these calls return uses those facility bits.
 pub const HELPER_USAGE: u32 = 1;
 pub const HELPER_PRIVILEGE: u32 = 2;
-const SECOND_LIST: u32 = 0x2000_0000;
+const LATER_STEP: u32 = 0x2000_0000;
+const STEP_SHIFT: u32 = 25;
+const STEP_BITS: u32 = 0x0E00_0000;
 
 /// The exit code for a purge's results.
 pub fn helper_exit_code(results: &PurgeResults) -> u32 {
@@ -553,8 +642,12 @@ pub fn helper_exit_code(results: &PurgeResults) -> u32 {
             Ok(()) | Err(PurgeError::NotRun) => {}
             Err(PurgeError::Privilege(_)) => return HELPER_PRIVILEGE,
             Err(PurgeError::Status(status)) => {
-                let code = *status as u32 & !SECOND_LIST;
-                return if index == 0 { code } else { code | SECOND_LIST };
+                let code = *status as u32 & !(LATER_STEP | STEP_BITS);
+                return match index {
+                    0 => code,
+                    // Five steps at most: the index always fits.
+                    index => code | LATER_STEP | ((index as u32) << STEP_SHIFT),
+                };
             }
             Err(_) => return HELPER_USAGE,
         }
@@ -579,9 +672,16 @@ pub fn decode_helper_exit(lists: &[MemoryList], code: u32) -> PurgeResults {
             )
             .into(),
         )),
-        code if code & 0x8000_0000 != 0 => {
-            let failed = usize::from(code & SECOND_LIST != 0);
-            let status = (code & !SECOND_LIST) as i32;
+        code if code & 0x8000_0000 != 0
+            && (code & LATER_STEP == 0
+                || (1..lists.len()).contains(&(((code & STEP_BITS) >> STEP_SHIFT) as usize))) =>
+        {
+            let failed = if code & LATER_STEP == 0 {
+                0
+            } else {
+                ((code & STEP_BITS) >> STEP_SHIFT) as usize
+            };
+            let status = (code & !(LATER_STEP | STEP_BITS)) as i32;
             lists
                 .iter()
                 .enumerate()
@@ -603,7 +703,8 @@ pub fn decode_helper_exit(lists: &[MemoryList], code: u32) -> PurgeResults {
     }
 }
 
-/// `FeatherTaskManager.exe --purge-memory-lists <standby|lowstandby|modified|all>`
+/// `FeatherTaskManager.exe --purge-memory-lists <list>[,<list>...]`, a list being
+/// workingsets, systemworkingset, modified, lowstandby or standby
 /// (launched elevated by the UI): purge and return the exit code. Writes
 /// nothing; the UI measures memory before and after itself.
 pub fn helper_main(argument: Option<&str>) -> u32 {
@@ -925,15 +1026,51 @@ pub fn scan_zombies() -> Result<ZombieScan, String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CleanupOptions {
     pub trim: bool,
-    pub standby: bool,
+    /// RAMMap's Empty System Working Set.
+    pub system_working_set: bool,
     pub modified: bool,
+    pub standby: bool,
+    /// Priority 0 standby pages only; `standby` already includes them.
+    pub low_standby: bool,
     pub zombies: bool,
 }
 
 impl CleanupOptions {
     pub fn any(&self) -> bool {
-        self.trim || self.standby || self.modified || self.zombies
+        self.trim
+            || self.system_working_set
+            || self.modified
+            || self.standby
+            || self.low_standby
+            || self.zombies
     }
+    /// The administrator steps, in run order. Elevated, the working sets of
+    /// every process are emptied at once (RAMMap's Empty Working Sets);
+    /// otherwise `run` trims the processes it can open itself, without UAC.
+    pub fn admin_lists(&self, elevated: bool) -> Vec<MemoryList> {
+        [
+            (self.trim && elevated, MemoryList::WorkingSets),
+            (self.system_working_set, MemoryList::SystemWorkingSet),
+            (self.modified, MemoryList::Modified),
+            (
+                self.low_standby && !self.standby,
+                MemoryList::LowPriorityStandby,
+            ),
+            (self.standby, MemoryList::Standby),
+        ]
+        .into_iter()
+        .filter_map(|(chosen, list)| chosen.then_some(list))
+        .collect()
+    }
+}
+
+/// How working sets were trimmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimOutcome {
+    /// Not elevated: every process this account may open, one by one.
+    Processes(TrimReport),
+    /// Elevated: every process at once (`MemoryEmptyWorkingSets`).
+    AllProcesses,
 }
 
 /// Progress of a run, reported before each step.
@@ -951,37 +1088,46 @@ pub enum Progress {
 pub struct CleanupReport {
     pub before: Result<MemoryState, String>,
     pub after: Result<MemoryState, String>,
-    pub trim: Option<Result<TrimReport, String>>,
+    pub trim: Option<Result<TrimOutcome, PurgeError>>,
+    pub system_working_set: Option<Result<(), PurgeError>>,
     pub modified: Option<Result<(), PurgeError>>,
     pub standby: Option<Result<(), PurgeError>>,
+    pub low_standby: Option<Result<(), PurgeError>>,
     pub zombies: Option<Result<ZombieScan, String>>,
     pub elevated: bool,
 }
 
-/// Run the chosen steps in order (trim, flush modified, purge standby,
-/// zombie scan), measuring memory right before and after. Worker thread
-/// only: the administrator step waits for the UAC prompt.
+/// Run the chosen steps in order (working sets, system working set, flush
+/// modified, purge standby, zombie scan), measuring memory right before and
+/// after. Worker thread only: the administrator steps wait for the UAC
+/// prompt.
 pub fn run(options: CleanupOptions, mut progress: impl FnMut(Progress)) -> CleanupReport {
     let elevated = crate::netetw::is_elevated();
     let before = memory_state();
-    let trim = options.trim.then(|| {
-        process_ids().map(|ids| {
-            progress(Progress::Trimming(ids.len()));
-            trim_working_sets(&ids)
-        })
+    let mut trim = (options.trim && !elevated).then(|| {
+        process_ids()
+            .map(|ids| {
+                progress(Progress::Trimming(ids.len()));
+                TrimOutcome::Processes(trim_working_sets(&ids))
+            })
+            .map_err(PurgeError::Unavailable)
     });
-    let (mut modified, mut standby) = (None, None);
-    if let Some(argument) = lists_argument(options.modified, options.standby) {
-        let lists = parse_lists(argument).unwrap_or_default();
+    let (mut system_working_set, mut modified, mut standby, mut low_standby) =
+        (None, None, None, None);
+    let lists = options.admin_lists(elevated);
+    if let Some(argument) = lists_argument(&lists) {
         progress(if elevated {
             Progress::Purging
         } else {
             Progress::WaitingForAdministrator
         });
-        for (list, result) in purge(&lists, argument, elevated) {
+        for (list, result) in purge(&lists, &argument, elevated) {
             match list {
+                MemoryList::WorkingSets => trim = Some(result.map(|()| TrimOutcome::AllProcesses)),
+                MemoryList::SystemWorkingSet => system_working_set = Some(result),
                 MemoryList::Modified => modified = Some(result),
-                _ => standby = Some(result),
+                MemoryList::LowPriorityStandby => low_standby = Some(result),
+                MemoryList::Standby => standby = Some(result),
             }
         }
     }
@@ -993,8 +1139,10 @@ pub fn run(options: CleanupOptions, mut progress: impl FnMut(Progress)) -> Clean
         before,
         after: memory_state(),
         trim,
+        system_working_set,
         modified,
         standby,
+        low_standby,
         zombies,
         elevated,
     }
@@ -1033,10 +1181,16 @@ pub fn dry_run_report() -> Result<String, String> {
     let trimmable = count_trimmable(&ids);
     let _ = writeln!(
         out,
-        "processes={}\ntrimmable={}\ntrim_skipped_access={}",
+        "processes={}\ntrimmable={}\ntrim_skipped_access={}\ntrim_scope={}",
         ids.len(),
         trimmable.trimmed,
-        trimmable.skipped
+        trimmable.skipped,
+        // Elevated runs empty every working set through the kernel instead.
+        if crate::netetw::is_elevated() {
+            "every_process"
+        } else {
+            "openable_processes"
+        }
     );
     let started = std::time::Instant::now();
     let scan = scan_zombies()?;
@@ -1213,14 +1367,81 @@ mod tests {
         assert_eq!(parse_lists("standby"), Some(vec![Standby]));
         assert_eq!(parse_lists("lowstandby"), Some(vec![LowPriorityStandby]));
         assert_eq!(parse_lists("modified"), Some(vec![Modified]));
-        assert_eq!(parse_lists("everything"), None);
-        assert_eq!(parse_lists(""), None);
-        assert_eq!(lists_argument(true, true), Some("all"));
-        assert_eq!(lists_argument(false, true), Some("standby"));
-        assert_eq!(lists_argument(true, false), Some("modified"));
-        assert_eq!(lists_argument(false, false), None);
+        // Any order in, run order out: every RAMMap Empty item.
+        assert_eq!(
+            parse_lists("standby,modified,systemworkingset,workingsets,lowstandby"),
+            Some(MemoryList::ALL.to_vec())
+        );
+        for rejected in [
+            "everything",
+            "",
+            "standby,",
+            ",standby",
+            "standby,standby",
+            "Standby",
+            "standby modified",
+            "all,standby",
+        ] {
+            assert_eq!(parse_lists(rejected), None, "{rejected:?}");
+        }
+        for lists in [
+            vec![Standby],
+            vec![WorkingSets, SystemWorkingSet],
+            MemoryList::ALL.to_vec(),
+        ] {
+            let argument = lists_argument(&lists).unwrap();
+            assert_eq!(parse_lists(&argument), Some(lists), "{argument}");
+        }
+        assert_eq!(
+            lists_argument(&[Standby, Modified, Standby]).as_deref(),
+            Some("modified,standby")
+        );
+        assert_eq!(lists_argument(&[]), None);
         assert_eq!(helper_main(Some("bogus")), HELPER_USAGE);
         assert_eq!(helper_main(None), HELPER_USAGE);
+    }
+
+    #[test]
+    fn options_map_to_rammap_steps() {
+        use MemoryList::*;
+        let every = CleanupOptions {
+            trim: true,
+            system_working_set: true,
+            modified: true,
+            standby: true,
+            low_standby: true,
+            zombies: false,
+        };
+        // Elevated, working sets go through the kernel for every process;
+        // the whole standby purge makes the priority 0 one redundant.
+        assert_eq!(
+            every.admin_lists(true),
+            vec![WorkingSets, SystemWorkingSet, Modified, Standby]
+        );
+        // Not elevated, the trim runs in-process (no UAC for it alone).
+        assert_eq!(
+            every.admin_lists(false),
+            vec![SystemWorkingSet, Modified, Standby]
+        );
+        let low = CleanupOptions {
+            standby: false,
+            ..every
+        };
+        assert_eq!(
+            low.admin_lists(false),
+            vec![SystemWorkingSet, Modified, LowPriorityStandby]
+        );
+        let trim_only = CleanupOptions {
+            trim: true,
+            system_working_set: false,
+            modified: false,
+            standby: false,
+            low_standby: false,
+            zombies: false,
+        };
+        assert!(trim_only.admin_lists(false).is_empty());
+        assert_eq!(trim_only.admin_lists(true), vec![WorkingSets]);
+        assert!(trim_only.any());
     }
 
     #[test]
@@ -1246,8 +1467,30 @@ mod tests {
             (Standby, Err(PurgeError::Status(denied))),
         ];
         let code = helper_exit_code(&second);
-        assert_eq!(code, 0xE000_0061);
+        assert_eq!(code, 0xE200_0061);
         assert_eq!(decode_helper_exit(&lists, code), second);
+        // Five steps: the fifth failed with a converted Win32 error.
+        let all = MemoryList::ALL;
+        let win32 = status_from_win32(1314); // ERROR_PRIVILEGE_NOT_HELD
+        let mut fifth: PurgeResults = all.iter().map(|&list| (list, Ok(()))).collect();
+        fifth[4].1 = Err(PurgeError::Status(win32));
+        let code = helper_exit_code(&fifth);
+        assert_eq!(code, 0xE807_0522);
+        assert_eq!(decode_helper_exit(&all, code), fifth);
+        // The system working set (second step) failed: the rest never ran.
+        let mut system: PurgeResults = all
+            .iter()
+            .map(|&list| (list, Err(PurgeError::NotRun)))
+            .collect();
+        system[0].1 = Ok(());
+        system[1].1 = Err(PurgeError::Status(win32));
+        assert_eq!(decode_helper_exit(&all, helper_exit_code(&system)), system);
+        // An index that does not name a later step is not trusted.
+        for code in [0xE000_0061, 0xE400_0061] {
+            assert!(decode_helper_exit(&lists, code)
+                .iter()
+                .all(|(_, result)| matches!(result, Err(PurgeError::Unavailable(_)))));
+        }
         // The privilege could not be enabled.
         let privilege: PurgeResults = vec![(Standby, Err(PurgeError::Privilege("x".into())))];
         assert_eq!(helper_exit_code(&privilege), HELPER_PRIVILEGE);
@@ -1282,8 +1525,24 @@ mod tests {
                 "{result:?}"
             );
         }
+        // The system working set needs another privilege; it is refused too.
+        let results = purge_in_process(&MemoryList::ALL);
+        assert_eq!(results.len(), 5);
+        for (_, result) in &results {
+            assert!(
+                matches!(result, Err(PurgeError::Privilege(_))),
+                "{result:?}"
+            );
+        }
         assert_eq!(helper_exit_code(&results), HELPER_PRIVILEGE);
         assert!(status_text(0xC000_0061_u32 as i32).contains("0xC0000061"));
+        // A converted Win32 error keeps its Windows message.
+        let text = status_text(status_from_win32(1314));
+        assert!(
+            text.contains("0xC0070522") && !text.starts_with("NTSTATUS"),
+            "{text}"
+        );
+        assert_eq!(status_from_win32(0), 0xC000_0001_u32 as i32);
     }
 
     /// Whether this process's token holds `name` enabled (None: not held).

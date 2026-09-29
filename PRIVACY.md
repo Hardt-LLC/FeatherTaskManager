@@ -40,7 +40,7 @@ None of this information is stored in a file or sent anywhere. It is kept in mem
 
 ### Actions that change your system
 
-Feather ends processes, changes priority or efficiency mode, starts or stops services, trims working sets, clears memory lists, starts the program you enter in Run new task and restarts Windows Explorer only when you ask it to. Administrator actions use the standard Windows UAC prompt.
+Feather ends processes, changes priority or efficiency mode, starts or stops services, trims working sets, empties the system working set, clears memory lists, starts the program you enter in Run new task and restarts Windows Explorer only when you ask it to. Administrator actions use the standard Windows UAC prompt.
 
 ### Third parties
 
@@ -96,7 +96,7 @@ Feather Task Manager는 개인정보를 수집·전송·판매·공유하지 않
 
 ### 시스템을 바꾸는 동작
 
-프로세스 끝내기, 우선순위나 효율 모드 변경, 서비스 시작·중지, 작업 집합 정리, 메모리 목록 비우기, "새 작업 실행"에 입력한 프로그램 실행, Windows 탐색기 다시 시작은 사용자가 요청할 때만 실행합니다. 관리자 권한이 필요한 동작은 Windows 표준 UAC 창을 거칩니다.
+프로세스 끝내기, 우선순위나 효율 모드 변경, 서비스 시작·중지, 작업 집합 정리, 시스템 작업 집합 비우기, 메모리 목록 비우기, "새 작업 실행"에 입력한 프로그램 실행, Windows 탐색기 다시 시작은 사용자가 요청할 때만 실행합니다. 관리자 권한이 필요한 동작은 Windows 표준 UAC 창을 거칩니다.
 
 ### 제3자
 
