@@ -954,9 +954,10 @@ unsafe fn end_processes(s: *mut State, ids: Vec<(u32, u64)>) {
     configure(owner);
     // Feather's confirm dialog over this window (not a MessageBox): Cancel
     // has the focus; the window's input waits until it closes.
+    let hwnd = (*s).hwnd;
     let confirmed = popup::confirm_dialog_on(
         popup::Host {
-            hwnd: (*s).hwnd,
+            hwnd,
             dpi: (*s).dpi,
             fonts: &(*s).fonts,
         },
@@ -973,7 +974,12 @@ unsafe fn end_processes(s: *mut State, ids: Vec<(u32, u64)>) {
     configure(owner);
     PostMessageW((*owner).hwnd, SNAPSHOT_READY, 0, 0);
     PostMessageW((*owner).hwnd, JOB_READY, 0, 0);
-    if IsWindow(focus) != 0 && IsChild((*s).hwnd, focus) != 0 {
+    // The dialog's message loop ran: act only if this window still exists.
+    let s = owner_state(owner);
+    if s.is_null() || (*s).hwnd != hwnd {
+        return;
+    }
+    if IsWindow(focus) != 0 && IsChild(hwnd, focus) != 0 {
         SetFocus(focus);
     }
     if confirmed {
@@ -1174,12 +1180,20 @@ pub(super) unsafe fn keyboard(owner: *mut App, msg: &MSG) -> bool {
             }
         }
     }
+    let hwnd = (*s).hwnd;
     let before = GetFocus();
-    if IsDialogMessageW((*s).hwnd, msg as *const MSG) != 0 {
+    if IsDialogMessageW(hwnd, msg as *const MSG) != 0 {
+        // Handling the message can close the window and free its state
+        // (Alt+F4, a button that closes it): use only what is current.
+        let s = owner_state(owner);
         // Tab into a panel scrolled out of the list brings it into view.
-        let focus = GetFocus();
-        if focus != before {
-            body_scroll::reveal(s, focus);
+        // Only keys: a click that focuses a partly visible table must not
+        // move its rows between the press and the release.
+        if matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) && !s.is_null() && (*s).hwnd == hwnd {
+            let focus = GetFocus();
+            if focus != before {
+                body_scroll::reveal(s, focus);
+            }
         }
         return true;
     }
@@ -1614,6 +1628,26 @@ pub(super) unsafe fn assert_keyboard_focus(owner: *mut App) {
         last.bounds.bottom > body.bottom,
         "precondition: out of view"
     );
+    // A click focuses the table without scrolling: the rows must stay
+    // under the pointer between the press and the release.
+    SetFocus((*s).nav[0]);
+    let at = (40 << 16 | 60) as isize;
+    for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+        let click = MSG {
+            hwnd: table,
+            message,
+            wParam: if message == WM_LBUTTONDOWN {
+                1 // MK_LBUTTON
+            } else {
+                0
+            },
+            lParam: at,
+            ..zeroed()
+        };
+        assert!(keyboard(owner, &click));
+    }
+    assert_eq!(GetFocus(), table);
+    assert_eq!((*s).scroll, 0, "a click does not scroll the list");
     SetFocus(header);
     let tab = MSG {
         hwnd: header,
@@ -1642,7 +1676,36 @@ pub(super) unsafe fn assert_keyboard_focus(owner: *mut App) {
     (*s).focus = null_mut();
     SendMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE as usize, 0);
     assert_eq!(GetFocus(), (*s).nav[(*s).tab as usize]);
-    close(owner);
+    // A key that closes the window while IsDialogMessage handles it (here
+    // through the search box) frees its state: nothing may use it after.
+    unsafe extern "system" fn close_on_f9(
+        control: HWND,
+        msg: u32,
+        w: WPARAM,
+        l: LPARAM,
+        id: usize,
+        window: usize,
+    ) -> LRESULT {
+        if msg == WM_NCDESTROY {
+            RemoveWindowSubclass(control, Some(close_on_f9), id);
+        }
+        if msg == WM_KEYDOWN && w == VK_F9 as usize {
+            DestroyWindow(window as HWND);
+            return 0;
+        }
+        DefSubclassProc(control, msg, w, l)
+    }
+    let search = (*s).search;
+    SetWindowSubclass(search, Some(close_on_f9), 0xF9, hwnd as usize);
+    SetFocus(search);
+    let key = MSG {
+        hwnd: search,
+        message: WM_KEYDOWN,
+        wParam: VK_F9 as usize,
+        ..zeroed()
+    };
+    assert!(keyboard(owner, &key));
+    assert!((*owner).resource_window.is_null() && IsWindow(hwnd) == 0);
 }
 
 /// A kept frame's reasons follow a language change on the next rebuild:
