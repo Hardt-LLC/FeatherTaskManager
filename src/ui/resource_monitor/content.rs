@@ -153,45 +153,184 @@ fn identity_columns(s: &State, pid: u32, created: Option<u64>) -> (Option<(u32, 
         ],
     )
 }
-/// A collector's reason in the UI language. `netetw` reports stable English
-/// codes (the main window matches them too); the other collectors and the
-/// aggregation already speak the UI language and pass through.
-fn reason(text: &str) -> String {
-    match text {
-        "Preparing endpoint traffic" => tr(
-            "원격 주소별 전송량을 준비하는 중입니다",
-            "Preparing endpoint traffic",
-        )
-        .into(),
-        "Endpoint limit reached" => tr(
-            "원격 주소 추적 한도에 도달했습니다",
-            "Endpoint limit reached",
-        )
-        .into(),
-        "Endpoint event format unavailable" => tr(
-            "이 Windows의 연결 이벤트 형식을 해석할 수 없습니다",
-            "Endpoint event format unavailable",
-        )
-        .into(),
-        _ if text == "Requires administrator"
+/// Korean for the English codes the collectors (`netetw`, `fileetw`,
+/// `resource`) and the aggregation report. A code matches whole, or as a
+/// prefix followed by its detail (`: <Windows message>`, ` (Windows 5)`).
+const REASONS: &[(&str, &str)] = &[
+    // aggregate.rs
+    (
+        "Some resource samples were skipped; waiting for a complete interval",
+        "일부 리소스 샘플을 건너뛰어 완전한 구간을 기다리는 중입니다",
+    ),
+    (
+        "Network sample unavailable",
+        "네트워크 샘플을 사용할 수 없습니다",
+    ),
+    (
+        "Process network tracking limit reached",
+        "프로세스 네트워크 추적 한도에 도달했습니다",
+    ),
+    (
+        "Endpoint traffic unavailable",
+        "원격 주소별 전송량을 사용할 수 없습니다",
+    ),
+    (
+        "Endpoint tracking limit reached",
+        "원격 주소 추적 한도에 도달했습니다",
+    ),
+    (
+        "File I/O requests unavailable",
+        "파일 I/O 요청을 사용할 수 없습니다",
+    ),
+    // netetw.rs (endpoint traffic)
+    (
+        "Preparing endpoint traffic",
+        "원격 주소별 전송량을 준비하는 중입니다",
+    ),
+    (
+        "Endpoint limit reached",
+        "원격 주소 추적 한도에 도달했습니다",
+    ),
+    (
+        "Endpoint event format unavailable",
+        "이 Windows의 연결 이벤트 형식을 해석할 수 없습니다",
+    ),
+    // fileetw.rs
+    ("Requires administrator", "관리자 권한이 필요합니다"),
+    (
+        "Cannot start file I/O trace",
+        "파일 I/O 추적을 시작할 수 없습니다",
+    ),
+    (
+        "Cannot enable file I/O trace",
+        "파일 I/O 추적을 켤 수 없습니다",
+    ),
+    (
+        "Cannot open file I/O trace",
+        "파일 I/O 추적을 열 수 없습니다",
+    ),
+    ("File I/O trace stopped", "파일 I/O 추적이 중지되었습니다"),
+    (
+        "Cannot check file I/O event loss",
+        "파일 I/O 이벤트 손실을 확인할 수 없습니다",
+    ),
+    (
+        "File I/O events dropped",
+        "파일 I/O 이벤트가 누락되어 이 구간은 표시하지 않습니다",
+    ),
+    (
+        "Preparing file I/O requests",
+        "파일 I/O 요청을 준비하는 중입니다",
+    ),
+    (
+        "File I/O tracking limit reached",
+        "파일 I/O 추적 한도에 도달했습니다",
+    ),
+    (
+        "Some file I/O requests could not be attributed",
+        "일부 파일 I/O 요청은 프로세스를 확인할 수 없어 제외했습니다",
+    ),
+    // resource.rs
+    (
+        "Resource details worker unavailable",
+        "리소스 세부 정보 작업을 시작할 수 없습니다",
+    ),
+    (
+        "Process details are unavailable or access was denied.",
+        "프로세스 정보를 사용할 수 없거나 액세스가 거부되었습니다.",
+    ),
+    (
+        "The selected process has exited or changed.",
+        "선택한 프로세스가 종료되었거나 바뀌었습니다.",
+    ),
+    (
+        "The selected process has exited.",
+        "선택한 프로세스가 종료되었습니다.",
+    ),
+    ("Module list unavailable", "모듈 목록을 사용할 수 없습니다"),
+    (
+        "Module list exceeds the 4096-entry limit.",
+        "모듈 목록이 4096개 제한을 넘습니다.",
+    ),
+    ("Volume list unavailable", "볼륨 목록을 사용할 수 없습니다"),
+    (
+        "Endpoint table reported an invalid length.",
+        "연결 테이블의 길이가 잘못되었습니다.",
+    ),
+    (
+        "Endpoint table unavailable",
+        "연결 테이블을 사용할 수 없습니다",
+    ),
+    (
+        "Endpoint table exceeds the 8 MiB limit.",
+        "연결 테이블이 8 MiB 제한을 넘습니다.",
+    ),
+    (
+        "Endpoint table changed too quickly to collect.",
+        "연결 테이블이 너무 빨리 바뀌어 수집하지 못했습니다.",
+    ),
+    ("Endpoint table is truncated.", "연결 테이블이 잘렸습니다."),
+    (
+        "Endpoint table exceeds the 16384-entry limit.",
+        "연결 테이블이 16384개 제한을 넘습니다.",
+    ),
+    (
+        "Endpoint table is malformed.",
+        "연결 테이블 형식이 잘못되었습니다.",
+    ),
+    (
+        "Endpoint list limited to 16384 entries.",
+        "연결 목록은 16384개까지만 표시합니다.",
+    ),
+];
+
+/// A collector's reason in the UI language, translated when shown: the
+/// collectors keep stable English codes (the main window matches
+/// `netetw`'s), so a frozen frame follows a language change too. `network`:
+/// the per-process network reasons, worded like the main window's notes.
+fn reason(text: &str, network: bool) -> String {
+    if network
+        && (text == "Requires administrator"
             || text == "Network events dropped"
             || text.starts_with("Network trace stopped")
             || text.starts_with("Cannot check network event loss")
             || text.starts_with("Cannot enable the network provider")
             || text.starts_with("Cannot open the network trace")
             || text.starts_with("Cannot start the network")
-            || text.starts_with("Cannot read this process") =>
-        {
-            paint::network_note(text).0.into()
-        }
-        _ => text.into(),
+            || text.starts_with("Cannot read this process"))
+    {
+        return paint::network_note(text).0.into();
     }
+    if language() == Language::English {
+        return text.into();
+    }
+    for (english, korean) in REASONS {
+        if let Some(detail) = text.strip_prefix(english) {
+            if detail.is_empty() || detail.starts_with(": ") || detail.starts_with(" (") {
+                return format!("{korean}{detail}");
+            }
+        }
+    }
+    // `resource`'s "C:\ capacity unavailable: <Windows message>".
+    if let Some((volume, detail)) = text.split_once(" capacity unavailable") {
+        return format!("{volume} 용량을 확인할 수 없습니다{detail}");
+    }
+    text.into()
 }
 fn error_text(s: &State, fallback: &str) -> String {
     s.data
         .as_ref()
         .filter(|d| !d.errors.is_empty())
-        .map_or_else(|| fallback.into(), |d| d.errors.join(" · "))
+        .map_or_else(
+            || fallback.into(),
+            |d| {
+                d.errors
+                    .iter()
+                    .map(|error| reason(error, false))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            },
+        )
 }
 fn process_rows(s: &State, kind: Kind, at: Instant) -> Vec<Row> {
     let at = s.accepted_at.unwrap_or(at);
@@ -306,7 +445,7 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                     if st.network.as_ref().is_none_or(|n| !n.measured) {
                         st.network
                             .as_ref()
-                            .and_then(|n| n.reason.as_deref().map(reason))
+                            .and_then(|n| n.reason.as_deref().map(|r| reason(r, true)))
                             .unwrap_or_else(|| {
                                 tr(
                                     "프로세스별 측정에는 관리자 권한이 필요합니다",
@@ -400,8 +539,9 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                 empty=tr("상세 추적을 켜면 파일별 I/O 요청을 수집합니다. 캐시를 포함하며 물리 디스크 전송량과 다릅니다.","Turn on tracing to collect file I/O requests. These include cache activity and differ from physical disk transfers.").into();
                 Vec::new()
             } else if let Some(files) = &st.files {
-                summary = files.reason.clone().unwrap_or_default();
-                empty = files.reason.clone().unwrap_or_else(|| {
+                let shown = files.reason.as_deref().map(|r| reason(r, false));
+                summary = shown.clone().unwrap_or_default();
+                empty = shown.unwrap_or_else(|| {
                     tr(
                         "이 구간에 프로세스와 파일을 확인할 수 있는 요청이 없습니다.",
                         "No attributable process/file requests in this interval.",
@@ -443,8 +583,9 @@ unsafe fn rows(s: *mut State, kind: Kind, at: Instant) -> (Vec<Row>, String, Str
                 Vec::new()
             } else if let Some(network) = &st.network {
                 let endpoints = &network.endpoints;
-                summary = endpoints.reason.as_deref().map(reason).unwrap_or_default();
-                empty = endpoints.reason.as_deref().map(reason).unwrap_or_else(|| {
+                let shown = endpoints.reason.as_deref().map(|r| reason(r, true));
+                summary = shown.clone().unwrap_or_default();
+                empty = shown.unwrap_or_else(|| {
                     tr(
                         "이 구간에 확인된 전송이 없습니다.",
                         "No attributable transfers in this interval.",
@@ -998,28 +1139,64 @@ mod tests {
     use crate::i18n::{with_language, Language};
 
     #[test]
-    fn collector_reasons_follow_the_ui_language() {
+    fn collector_reasons_are_translated_when_shown() {
         with_language(Language::Korean, || {
+            // Whole codes, and codes followed by their detail.
             assert_eq!(
-                reason("Preparing endpoint traffic"),
-                "원격 주소별 전송량을 준비하는 중입니다"
-            );
-            assert_eq!(
-                reason("Network trace stopped (error 5)"),
-                paint::network_note("Network trace stopped").0
-            );
-            assert_eq!(
-                reason("Requires administrator"),
-                paint::network_note("Requires administrator").0
-            );
-            // Other collectors already speak the UI language.
-            assert_eq!(
-                reason("파일 I/O 요청을 준비하는 중입니다"),
+                reason("Preparing file I/O requests", false),
                 "파일 I/O 요청을 준비하는 중입니다"
             );
+            assert_eq!(
+                reason("Cannot start file I/O trace (Windows 1450)", false),
+                "파일 I/O 추적을 시작할 수 없습니다 (Windows 1450)"
+            );
+            assert_eq!(
+                reason(
+                    "Module list unavailable: Access is denied. (os error 5)",
+                    false
+                ),
+                "모듈 목록을 사용할 수 없습니다: Access is denied. (os error 5)"
+            );
+            assert_eq!(
+                reason(r"D:\ capacity unavailable: The device is not ready.", false),
+                r"D:\ 용량을 확인할 수 없습니다: The device is not ready."
+            );
+            assert_eq!(
+                reason(
+                    "Some resource samples were skipped; waiting for a complete interval",
+                    true
+                ),
+                "일부 리소스 샘플을 건너뛰어 완전한 구간을 기다리는 중입니다"
+            );
+            // The file trace's and the network's administrator notes differ.
+            assert_eq!(
+                reason("Requires administrator", false),
+                "관리자 권한이 필요합니다"
+            );
+            assert_eq!(
+                reason("Requires administrator", true),
+                paint::network_note("Requires administrator").0
+            );
+            assert_eq!(
+                reason("Network trace stopped (error 5)", true),
+                paint::network_note("Network trace stopped").0
+            );
+            // A prefix must be followed by a detail, not by more words.
+            assert_eq!(
+                reason("Endpoint table unavailableX", false),
+                "Endpoint table unavailableX"
+            );
+            assert_eq!(reason("unknown", false), "unknown");
         });
         with_language(Language::English, || {
-            assert_eq!(reason("Endpoint limit reached"), "Endpoint limit reached");
+            assert_eq!(
+                reason("Endpoint limit reached", true),
+                "Endpoint limit reached"
+            );
+            assert_eq!(
+                reason("Requires administrator", false),
+                "Requires administrator"
+            );
         });
     }
 }

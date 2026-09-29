@@ -4459,6 +4459,14 @@ mod tests {
         }
     }
     #[test]
+    fn resource_monitor_reasons_follow_a_language_change() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_reasons_follow_the_language(test.p);
+        }
+    }
+    #[test]
     fn resource_monitor_rows_keep_their_identity_across_refreshes() {
         let test = TestWindow::new();
         test.snapshot(rows());

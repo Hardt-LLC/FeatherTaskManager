@@ -1645,6 +1645,35 @@ pub(super) unsafe fn assert_keyboard_focus(owner: *mut App) {
     close(owner);
 }
 
+/// A kept frame's reasons follow a language change on the next rebuild:
+/// the collectors report codes, translated only when shown.
+#[cfg(test)]
+pub(super) unsafe fn assert_reasons_follow_the_language(owner: *mut App) {
+    use crate::i18n::{with_language, Language};
+    create(owner, false);
+    let s = owner_state(owner);
+    assert!(!s.is_null());
+    set_tab(s, Tab::Disk);
+    (*s).detailed = true;
+    (*s).files = Some(Arc::new(crate::fileetw::Sample {
+        enabled: true,
+        reason: Some("Preparing file I/O requests".into()),
+        ..Default::default()
+    }));
+    let shown = |language| {
+        with_language(language, || {
+            content::rebuild(s, Instant::now());
+            let panel = (*s).panels.iter().find(|p| p.kind == Kind::Files).unwrap();
+            (panel.summary.clone(), panel.empty.clone())
+        })
+    };
+    let korean = "파일 I/O 요청을 준비하는 중입니다";
+    assert_eq!(shown(Language::Korean), (korean.into(), korean.into()));
+    let english = "Preparing file I/O requests";
+    assert_eq!(shown(Language::English), (english.into(), english.into()));
+    close(owner);
+}
+
 #[cfg(test)]
 pub(super) unsafe fn assert_rows_keep_identity(owner: *mut App) {
     create(owner, false);
