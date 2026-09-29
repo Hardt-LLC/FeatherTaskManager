@@ -1,4 +1,6 @@
-//! On-demand native modal dialog; no timers, polling, or retained command history.
+//! On-demand native modal dialog; no polling or retained command history. The
+//! program is resolved on a worker thread (a one-shot timer only labels a
+//! slow check), so a slow drive never blocks the dialog or the app's windows.
 use super::*;
 use crate::actions::TaskLaunch;
 use windows_sys::Win32::{
@@ -11,6 +13,24 @@ const ARGUMENTS: i32 = 702;
 const BROWSE: i32 = 703;
 const ADMIN: i32 = 704;
 const ERROR: i32 = 705;
+/// A program check finished (its result waits in `State::checked`).
+const CHECKED: u32 = WM_APP + 0x70;
+/// Shows [`checking_text`] when a check takes longer than `CHECK_LABEL_MS`.
+const CHECK_TIMER: usize = 0x7A5;
+const CHECK_LABEL_MS: u32 = 250;
+
+type Checked = (u64, Result<(), String>);
+
+/// Tests stand in for a slow drive by delaying the worker's check.
+#[cfg(test)]
+static CHECK_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(super) fn set_check_delay(delay: Duration) {
+    CHECK_DELAY_MS.store(
+        delay.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 struct State {
     app: *mut App,
@@ -20,12 +40,114 @@ struct State {
     /// The administrator switch (owner-drawn; always on when Feather is elevated).
     admin: bool,
     result: Option<TaskLaunch>,
+    /// The Run request whose program is being resolved; an edit discards it
+    /// (a late result for it is then ignored).
+    checking: Option<(u64, TaskLaunch)>,
+    requests: u64,
+    checked: (mpsc::Sender<Checked>, mpsc::Receiver<Checked>),
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         unsafe {
             DeleteObject(self.surface);
+        }
+    }
+}
+
+/// The error line while a program check is slow (muted, not an error).
+pub(super) fn checking_text() -> &'static str {
+    tr("프로그램을 확인하는 중…", "Checking the program…")
+}
+
+/// Forget the check in flight: the fields it was made for changed.
+unsafe fn discard_check(hwnd: HWND, state: &mut State) {
+    if state.checking.take().is_some() {
+        KillTimer(hwnd, CHECK_TIMER);
+        SetDlgItemTextW(hwnd, ERROR, wide("").as_ptr());
+    }
+}
+
+/// Run: the command's syntax is checked at once; resolving the program
+/// searches folders and reads the file system, so it runs on a worker
+/// thread and its result arrives as [`CHECKED`]. Cancel works meanwhile.
+unsafe fn start_check(hwnd: HWND, state: &mut State) {
+    if state.checking.is_some() {
+        return;
+    }
+    let task = TaskLaunch {
+        command: read(hwnd, PROGRAM),
+        arguments: read(hwnd, ARGUMENTS),
+        elevated: state.admin,
+    };
+    if let Err(error) = crate::actions::task_command(&task) {
+        SetDlgItemTextW(hwnd, ERROR, wide(&error).as_ptr());
+        SetFocus(GetDlgItem(hwnd, PROGRAM));
+        return;
+    }
+    state.requests += 1;
+    let request = state.requests;
+    let sender = state.checked.0.clone();
+    let dialog = hwnd as usize;
+    let checked = task.clone();
+    let started = std::thread::Builder::new()
+        .name("feather-run-task-check".into())
+        .spawn(move || {
+            #[cfg(test)]
+            std::thread::sleep(Duration::from_millis(
+                CHECK_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+            let result = crate::actions::check_task(&checked);
+            // A closed dialog dropped the receiver: nothing is posted.
+            if sender.send((request, result)).is_ok() {
+                unsafe { PostMessageW(dialog as HWND, CHECKED, 0, 0) };
+            }
+        });
+    match started {
+        Ok(_) => {
+            state.checking = Some((request, task));
+            SetDlgItemTextW(hwnd, ERROR, wide("").as_ptr());
+            SetTimer(hwnd, CHECK_TIMER, CHECK_LABEL_MS, None);
+        }
+        Err(error) => {
+            SetDlgItemTextW(
+                hwnd,
+                ERROR,
+                wide(&tf!(
+                    "프로그램을 확인할 수 없습니다: {}",
+                    "Cannot check the program: {}",
+                    error
+                ))
+                .as_ptr(),
+            );
+        }
+    }
+}
+
+/// Results of finished checks: the current one closes the dialog with its
+/// task or shows why the program was rejected; discarded ones are dropped.
+unsafe fn finish_checks(hwnd: HWND, state: &mut State) {
+    while let Ok((request, result)) = state.checked.1.try_recv() {
+        if state
+            .checking
+            .as_ref()
+            .is_none_or(|(current, _)| *current != request)
+        {
+            continue;
+        }
+        let Some((_, task)) = state.checking.take() else {
+            continue;
+        };
+        KillTimer(hwnd, CHECK_TIMER);
+        match result {
+            Ok(()) => {
+                state.result = Some(task);
+                EndDialog(hwnd, IDOK as isize);
+            }
+            Err(error) => {
+                SetDlgItemTextW(hwnd, ERROR, wide(&error).as_ptr());
+                SetFocus(GetDlgItem(hwnd, PROGRAM));
+            }
         }
     }
 }
@@ -298,34 +420,24 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         WM_COMMAND => {
             let id = (w & 0xffff) as i32;
             match id {
-                IDOK => {
-                    let task = TaskLaunch {
-                        command: read(hwnd, PROGRAM),
-                        arguments: read(hwnd, ARGUMENTS),
-                        elevated: state.admin,
-                    };
-                    // Resolve the program here: an unknown name or a
-                    // rejected path shows below the fields, not after closing.
-                    match crate::actions::check_task(&task) {
-                        Ok(_) => {
-                            state.result = Some(task);
-                            EndDialog(hwnd, IDOK as isize);
-                        }
-                        Err(error) => {
-                            SetDlgItemTextW(hwnd, ERROR, wide(&error).as_ptr());
-                            SetFocus(GetDlgItem(hwnd, PROGRAM));
-                        }
-                    }
-                }
+                // An unknown name or a rejected path shows below the fields,
+                // not after closing.
+                IDOK => start_check(hwnd, state),
                 IDCANCEL => {
                     EndDialog(hwnd, IDCANCEL as isize);
                 }
-                BROWSE => browse(hwnd),
+                BROWSE => {
+                    discard_check(hwnd, state);
+                    browse(hwnd);
+                }
                 ADMIN if w >> 16 == BN_CLICKED as usize => {
+                    discard_check(hwnd, state);
                     state.admin = !state.admin;
                     InvalidateRect(l as HWND, null(), 0);
                 }
+                ARGUMENTS if w >> 16 == EN_CHANGE as usize => discard_check(hwnd, state),
                 PROGRAM if w >> 16 == EN_CHANGE as usize => {
+                    discard_check(hwnd, state);
                     EnableWindow(
                         GetDlgItem(hwnd, IDOK),
                         i32::from(!read(hwnd, PROGRAM).trim().is_empty()),
@@ -333,6 +445,17 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     SetDlgItemTextW(hwnd, ERROR, wide("").as_ptr());
                 }
                 _ => return 0,
+            }
+            1
+        }
+        CHECKED => {
+            finish_checks(hwnd, state);
+            1
+        }
+        WM_TIMER if w == CHECK_TIMER => {
+            KillTimer(hwnd, CHECK_TIMER);
+            if state.checking.is_some() {
+                SetDlgItemTextW(hwnd, ERROR, wide(checking_text()).as_ptr());
             }
             1
         }
@@ -345,10 +468,10 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             SetBkColor(w as HDC, colors().surface);
             SetTextColor(
                 w as HDC,
-                if GetDlgCtrlID(l as HWND) == ERROR {
-                    colors().danger
-                } else {
-                    colors().fg
+                match GetDlgCtrlID(l as HWND) {
+                    ERROR if state.checking.is_some() => colors().muted,
+                    ERROR => colors().danger,
+                    _ => colors().fg,
                 },
             );
             state.surface as isize
@@ -418,6 +541,9 @@ pub(super) unsafe fn show(app: *mut App) -> Option<TaskLaunch> {
         surface: CreateSolidBrush(colors().surface),
         admin: crate::netetw::is_elevated(),
         result: None,
+        checking: None,
+        requests: 0,
+        checked: mpsc::channel(),
     };
     let result = DialogBoxIndirectParamW(
         GetModuleHandleW(null()),

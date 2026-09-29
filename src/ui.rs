@@ -4498,12 +4498,35 @@ mod tests {
             Cancel,
             Run,
             RunMissing,
+            /// Run, then Cancel once the dialog says the check is slow.
+            RunSlow,
         }
         thread_local! {
             static PLAN: Cell<(usize, Plan)> = const { Cell::new((0, Plan::Cancel)) };
             static PROGRAM: RefCell<String> = const { RefCell::new(String::new()) };
             static INSPECTED: Cell<bool> = const { Cell::new(false) };
             static ERROR_LINE: RefCell<String> = const { RefCell::new(String::new()) };
+            static WAITED: Cell<u32> = const { Cell::new(0) };
+            static LABELED: Cell<bool> = const { Cell::new(false) };
+        }
+        /// Run resolves the program on a worker thread: wait (a pumped
+        /// timer) for its rejection, then cancel; never wait over 10 s.
+        unsafe extern "system" fn await_error(dialog: HWND, _: u32, timer: usize, _: u32) {
+            let mut text = [0u16; 512];
+            let length = GetDlgItemTextW(dialog, 705, text.as_mut_ptr(), text.len() as i32);
+            let line = String::from_utf16_lossy(&text[..length as usize]);
+            WAITED.set(WAITED.get() + 1);
+            let labeled = line == run_task::checking_text();
+            LABELED.set(LABELED.get() || labeled);
+            let done = if PLAN.get().1 == Plan::RunSlow {
+                labeled
+            } else {
+                !line.is_empty() && !labeled
+            };
+            if done || WAITED.get() > 500 {
+                KillTimer(dialog, timer);
+                PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0);
+            }
         }
         unsafe extern "system" fn dialog_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             let dialog = w as HWND;
@@ -4531,11 +4554,17 @@ mod tests {
                     (BN_CLICKED as usize) << 16 | 704,
                     GetDlgItem(dialog, 704) as isize,
                 );
-                if plan != Plan::Cancel {
-                    PostMessageW(dialog, WM_COMMAND, IDOK as usize, 0);
-                }
-                if plan != Plan::Run {
-                    PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0);
+                WAITED.set(0);
+                match plan {
+                    Plan::Cancel => {
+                        PostMessageW(dialog, WM_COMMAND, IDCANCEL as usize, 0);
+                    }
+                    Plan::Run | Plan::RunMissing | Plan::RunSlow => {
+                        PostMessageW(dialog, WM_COMMAND, IDOK as usize, 0);
+                        // A valid program closes the dialog itself; an error
+                        // line cancels it (so a failing test never hangs).
+                        SetTimer(dialog, 0x7E57, 20, Some(await_error));
+                    }
                 }
             }
             CallNextHookEx(null_mut(), code, w, l)
@@ -4585,11 +4614,22 @@ mod tests {
                 )
             );
             assert!(!(*test.p).modal && !(*test.p).busy);
+            // A slow drive: the check runs off the UI thread, the dialog
+            // says it is checking, and Cancel closes it before the check
+            // ends, starting nothing.
             let program = format!(
                 "\"{}\" --inline",
                 std::env::current_exe().unwrap().display()
             );
             set_program(&program);
+            run_task::set_check_delay(Duration::from_millis(3000));
+            PLAN.set(((*test.p).hwnd as usize, Plan::RunSlow));
+            let started = Instant::now();
+            SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
+            run_task::set_check_delay(Duration::ZERO);
+            assert!(started.elapsed() < Duration::from_millis(3000));
+            assert!(LABELED.get(), "a slow check is labelled");
+            assert!(test.jobs.try_recv().is_err(), "Cancel starts nothing");
             PLAN.set(((*test.p).hwnd as usize, Plan::Run));
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             let Job::Action(Action::RunTask(task)) = test.jobs.try_recv().expect("submitted task")
