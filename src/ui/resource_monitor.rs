@@ -670,6 +670,7 @@ unsafe fn control(parent: HWND, id: usize, class_name: &str, label: &str, style:
 unsafe fn initialize(s: *mut State) {
     let hwnd = (*s).hwnd;
     (*s).search = control(hwnd, SEARCH, "EDIT", "", ES_AUTOHSCROLL as u32);
+    SetWindowSubclass((*s).search, Some(search_subclass), 0xF453, s as usize);
     SendMessageW((*s).search, EM_SETLIMITTEXT, 512, 0);
     SendMessageW(
         (*s).search,
@@ -831,6 +832,26 @@ unsafe fn host(s: *mut State) -> popup::Host {
         dpi: (*s).dpi,
         fonts: &(*s).fonts,
     }
+}
+/// The search box's context menu: Feather's edit menu over this window (as
+/// in the main window's search box), never the stock Edit menu.
+unsafe extern "system" fn search_subclass(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    data: usize,
+) -> LRESULT {
+    if msg == WM_NCDESTROY {
+        RemoveWindowSubclass(hwnd, Some(search_subclass), id);
+    }
+    if msg == WM_CONTEXTMENU {
+        let s = data as *mut State;
+        super::interactions::edit_menu_with(hwnd, l, |menu, anchor| track_menu(s, menu, anchor));
+        return 0;
+    }
+    DefSubclassProc(hwnd, msg, w, l)
 }
 /// Feather's layered menu over this window (the command id, 0 = cancelled).
 unsafe fn track_menu(s: *mut State, menu: HMENU, anchor: popup::Anchor) -> usize {
@@ -1595,7 +1616,7 @@ pub(super) unsafe fn render_previews(owner: *mut App, dir: &std::path::Path) -> 
 }
 
 #[cfg(test)]
-pub(super) unsafe fn assert_end_confirmation(owner: *mut App) {
+pub(super) unsafe fn assert_end_confirmation(owner: *mut App) -> (u32, u64) {
     use crate::i18n::{with_language, Language};
     with_language(Language::English, || {
         let names: Vec<String> = (0..14).map(|i| format!("app{i}.exe (PID {i})")).collect();
@@ -1646,7 +1667,47 @@ b",
     assert!(card.top > client.top && card.bottom < client.bottom);
     popup::destroy(dialog);
     popup::destroy(scrim);
+    // End process itself: that dialog, modal while it runs. Esc cancels;
+    // Tab (to End processes) + Enter ends the process.
+    let panel = (*s)
+        .panels
+        .iter()
+        .position(|p| p.kind == Kind::Cpu)
+        .unwrap();
+    let id = (&(*s).panels)[panel].rows[0].identity.unwrap();
+    let hwnd = (*s).hwnd;
+    let post = |keys: &[u16]| {
+        for &vk in keys {
+            PostMessageW(hwnd, WM_KEYDOWN, vk as usize, 0);
+        }
+    };
+    let settle = || {
+        let popups = popup::thread_popups();
+        assert_eq!(popups.len(), 2, "its scrim and card, fading out");
+        assert!(popups
+            .iter()
+            .all(|&popup| GetWindow(popup, GW_OWNER) == hwnd));
+        popup::finish_closing();
+        let mut msg: MSG = zeroed();
+        while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+            if msg.message != WM_QUIT {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        assert!(popup::thread_popups().is_empty());
+    };
+    post(&[VK_ESCAPE]);
+    end_processes(s, vec![id]);
+    settle();
+    assert!(!(*owner).modal && !(*owner).busy, "cancelled");
+    post(&[VK_TAB, VK_RETURN]);
+    end_processes(s, vec![id]);
+    settle();
+    assert!(!(*owner).modal);
+    assert!((*owner).busy, "ending it");
     close(owner);
+    id
 }
 
 /// Moves the window under an open menu, then posts keys that would pick
@@ -1766,6 +1827,26 @@ pub(super) unsafe fn assert_feather_menus(owner: *mut App) {
         (anchor.left, anchor.bottom + gap())
     );
     settle();
+    // The search box's context menu is Feather's edit menu over this window,
+    // not the stock Edit menu: from the keyboard, End + Enter is Select all.
+    SetWindowTextW((*s).search, wide("svchost").as_ptr());
+    SendMessageW((*s).search, EM_SETSEL, 0, 0);
+    controls::keyboard_used(hwnd);
+    post(&[VK_END, VK_RETURN]);
+    SendMessageW((*s).search, WM_CONTEXTMENU, (*s).search as usize, -1);
+    let (menu, _) = last_menu();
+    assert!(popup::row_rect(menu, 7).is_some(), "Undo … Select all");
+    let (mut start, mut end) = (0u32, 0u32);
+    SendMessageW(
+        (*s).search,
+        EM_GETSEL,
+        &mut start as *mut u32 as usize,
+        &mut end as *mut u32 as isize,
+    );
+    assert_eq!((start, end), (0, 7), "Select all ran");
+    assert!(!(*owner).modal);
+    settle();
+    SetWindowTextW((*s).search, wide("").as_ptr());
     // On a monitor of another DPI the menu takes this window's DPI and
     // fonts, not the main window's.
     let dpi = (*owner).dpi * 2;
@@ -1818,6 +1899,15 @@ pub(super) unsafe fn show_traced(owner: *mut App) {
     let s = show_invisibly(owner);
     (*s).detailed = true;
     changed(s, true);
+}
+/// Tests: the shown window's Overview tab (file and endpoint traces) or its
+/// CPU tab (neither).
+#[cfg(test)]
+pub(super) unsafe fn select_traced_tab(owner: *mut App, traced: bool) {
+    set_tab(
+        owner_state(owner),
+        if traced { Tab::Overview } else { Tab::Cpu },
+    );
 }
 
 #[cfg(test)]

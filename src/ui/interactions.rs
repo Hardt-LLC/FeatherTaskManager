@@ -729,6 +729,21 @@ pub(super) unsafe fn edit_menu(p: *mut App, edit: HWND, l: LPARAM) {
     if (*p).modal || (*p).hwnd.is_null() {
         return;
     }
+    edit_menu_with(edit, l, |menu, anchor| {
+        (*p).modal = true;
+        configure(p);
+        let id = popup::track_menu(p, menu, anchor);
+        finish_modal(p);
+        id
+    });
+}
+/// [`edit_menu`] for any text input: `track` shows the menu over its window
+/// (the main window's or the Resource Monitor's) and returns the command.
+pub(super) unsafe fn edit_menu_with(
+    edit: HWND,
+    l: LPARAM,
+    track: impl FnOnce(HMENU, popup::Anchor) -> usize,
+) {
     let (mut start, mut end) = (0u32, 0u32);
     SendMessageW(
         edit,
@@ -805,11 +820,8 @@ pub(super) unsafe fn edit_menu(p: *mut App, edit: HWND, l: LPARAM) {
             y: ((l >> 16) & 0xffff) as i16 as i32,
         })
     };
-    (*p).modal = true;
-    configure(p);
-    let id = popup::track_menu(p, menu, anchor);
+    let id = track(menu, anchor);
     DestroyMenu(menu);
-    finish_modal(p);
     if IsWindow(edit) == 0 {
         return;
     }
