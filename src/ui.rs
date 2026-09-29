@@ -4622,14 +4622,24 @@ mod tests {
                 std::env::current_exe().unwrap().display()
             );
             set_program(&program);
-            run_task::set_check_delay(Duration::from_millis(1500));
+            run_task::set_check_delay(Duration::from_millis(2500));
             PLAN.set(((*test.p).hwnd as usize, Plan::RunSlow));
             let started = Instant::now();
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             run_task::set_check_delay(Duration::ZERO);
-            assert!(started.elapsed() < Duration::from_millis(1500));
+            assert!(started.elapsed() < Duration::from_millis(2500));
             assert!(LABELED.get(), "a slow check is labelled");
             assert!(test.jobs.try_recv().is_err(), "Cancel starts nothing");
+            // Reopened while that check still runs: the new request waits,
+            // and cancelling the dialog withdraws it from the queue.
+            LABELED.set(false);
+            SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
+            assert!(LABELED.get());
+            assert!(
+                run_task::nothing_waits(),
+                "the closed dialog's request is gone"
+            );
+            assert!(test.jobs.try_recv().is_err());
             PLAN.set(((*test.p).hwnd as usize, Plan::Run));
             SendMessageW((*test.p).hwnd, WM_COMMAND, RUN_TASK, 0);
             let Job::Action(Action::RunTask(task)) = test.jobs.try_recv().expect("submitted task")

@@ -22,9 +22,13 @@ const CHECK_LABEL_MS: u32 = 250;
 
 type Checked = (u64, Result<(), String>);
 
+/// Set when a request is withdrawn (its dialog was edited or closed).
+type Cancelled = Arc<std::sync::atomic::AtomicBool>;
+
 /// One program check and what to do with its result.
 struct Check {
     task: TaskLaunch,
+    cancelled: Cancelled,
     done: Box<dyn FnOnce(Result<(), String>) + Send>,
 }
 
@@ -81,6 +85,20 @@ impl Checks {
             }
         }
     }
+    /// Withdraw a request: one that has not started leaves the queue now, and
+    /// the thread skips it if it was just taken. A running check cannot be
+    /// interrupted; its result is ignored.
+    fn withdraw(&self, cancelled: &Cancelled) {
+        cancelled.store(true, std::sync::atomic::Ordering::Release);
+        let mut queue = self.queue();
+        if queue
+            .waiting
+            .as_ref()
+            .is_some_and(|check| Arc::ptr_eq(&check.cancelled, cancelled))
+        {
+            queue.waiting = None;
+        }
+    }
     fn work(&self) {
         loop {
             let Some(check) = self.queue().waiting.take() else {
@@ -93,6 +111,9 @@ impl Checks {
                 }
                 continue;
             };
+            if check.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
             #[cfg(test)]
             std::thread::sleep(Duration::from_millis(
                 self.delay_ms.load(std::sync::atomic::Ordering::Relaxed),
@@ -105,6 +126,12 @@ impl Checks {
 fn checks() -> &'static Arc<Checks> {
     static CHECKS: std::sync::OnceLock<Arc<Checks>> = std::sync::OnceLock::new();
     CHECKS.get_or_init(Default::default)
+}
+
+/// No request waits for the check thread (tests).
+#[cfg(test)]
+pub(super) fn nothing_waits() -> bool {
+    checks().queue().waiting.is_none()
 }
 
 #[cfg(test)]
@@ -123,15 +150,26 @@ struct State {
     /// The administrator switch (owner-drawn; always on when Feather is elevated).
     admin: bool,
     result: Option<TaskLaunch>,
-    /// The Run request whose program is being resolved; an edit discards it
-    /// (a late result for it is then ignored).
-    checking: Option<(u64, TaskLaunch)>,
+    /// The Run request whose program is being resolved. An edit or closing
+    /// the dialog withdraws it (a late result for it is then ignored).
+    checking: Option<Pending>,
     requests: u64,
     checked: (mpsc::Sender<Checked>, mpsc::Receiver<Checked>),
 }
 
+struct Pending {
+    request: u64,
+    task: TaskLaunch,
+    cancelled: Cancelled,
+}
+
 impl Drop for State {
     fn drop(&mut self) {
+        // Closed (Cancel, Esc, the close button) while a check waits: it
+        // must not hold the check thread for a dialog that is gone.
+        if let Some(pending) = self.checking.take() {
+            checks().withdraw(&pending.cancelled);
+        }
         unsafe {
             DeleteObject(self.surface);
         }
@@ -145,7 +183,8 @@ pub(super) fn checking_text() -> &'static str {
 
 /// Forget the check in flight: the fields it was made for changed.
 unsafe fn discard_check(hwnd: HWND, state: &mut State) {
-    if state.checking.take().is_some() {
+    if let Some(pending) = state.checking.take() {
+        checks().withdraw(&pending.cancelled);
         KillTimer(hwnd, CHECK_TIMER);
         SetDlgItemTextW(hwnd, ERROR, wide("").as_ptr());
     }
@@ -172,8 +211,10 @@ unsafe fn start_check(hwnd: HWND, state: &mut State) {
     let request = state.requests;
     let sender = state.checked.0.clone();
     let dialog = hwnd as usize;
+    let cancelled = Cancelled::default();
     let started = checks().submit(Check {
         task: task.clone(),
+        cancelled: Arc::clone(&cancelled),
         done: Box::new(move |result| {
             // A closed dialog dropped the receiver: nothing is posted.
             if sender.send((request, result)).is_ok() {
@@ -183,7 +224,11 @@ unsafe fn start_check(hwnd: HWND, state: &mut State) {
     });
     match started {
         Ok(_) => {
-            state.checking = Some((request, task));
+            state.checking = Some(Pending {
+                request,
+                task,
+                cancelled,
+            });
             SetDlgItemTextW(hwnd, ERROR, wide("").as_ptr());
             SetTimer(hwnd, CHECK_TIMER, CHECK_LABEL_MS, None);
         }
@@ -209,11 +254,11 @@ unsafe fn finish_checks(hwnd: HWND, state: &mut State) {
         if state
             .checking
             .as_ref()
-            .is_none_or(|(current, _)| *current != request)
+            .is_none_or(|pending| pending.request != request)
         {
             continue;
         }
-        let Some((_, task)) = state.checking.take() else {
+        let Some(Pending { task, .. }) = state.checking.take() else {
             continue;
         };
         KillTimer(hwnd, CHECK_TIMER);
@@ -647,6 +692,65 @@ pub(super) unsafe fn show(app: *mut App) -> Option<TaskLaunch> {
 mod tests {
     use super::*;
 
+    fn submit_to(
+        checks: &Arc<Checks>,
+        sender: &mpsc::Sender<(&'static str, bool)>,
+        name: &'static str,
+    ) -> Cancelled {
+        let sender = sender.clone();
+        let cancelled = Cancelled::default();
+        checks
+            .submit(Check {
+                task: TaskLaunch {
+                    command: "cmd".into(),
+                    arguments: String::new(),
+                    elevated: false,
+                },
+                cancelled: Arc::clone(&cancelled),
+                done: Box::new(move |result| {
+                    let _ = sender.send((name, result.is_ok()));
+                }),
+            })
+            .unwrap();
+        cancelled
+    }
+
+    /// A request withdrawn before it starts (its dialog was edited or
+    /// closed) never reaches the drive, whether it still waited or the
+    /// thread had just taken it.
+    #[test]
+    fn withdrawn_requests_are_never_checked() {
+        let checks = Arc::new(Checks::default());
+        checks
+            .delay_ms
+            .store(300, std::sync::atomic::Ordering::Relaxed);
+        let (sender, results) = mpsc::channel();
+        let running = submit_to(&checks, &sender, "running");
+        while checks.queue().waiting.is_some() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let waiting = submit_to(&checks, &sender, "withdrawn");
+        // Withdrawing the running check only marks it: the waiting one stays.
+        checks.withdraw(&running);
+        assert!(checks.queue().waiting.is_some());
+        checks.withdraw(&waiting);
+        assert!(
+            checks.queue().waiting.is_none(),
+            "it left the queue at once"
+        );
+        // The same request already taken by the thread: only its token says
+        // it was withdrawn (as when the thread takes it just before).
+        let taken = submit_to(&checks, &sender, "cancelled");
+        taken.store(true, std::sync::atomic::Ordering::Release);
+        let wait = || results.recv_timeout(Duration::from_secs(10));
+        assert_eq!(wait().unwrap(), ("running", true));
+        // Neither withdrawn request is checked; the thread goes idle.
+        assert!(results.recv_timeout(Duration::from_millis(800)).is_err());
+        while checks.queue().running {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// A stalled drive: re-running and reopening the dialog meanwhile never
     /// adds threads, and only the newest waiting request is checked.
     #[test]
@@ -657,19 +761,7 @@ mod tests {
             .store(300, std::sync::atomic::Ordering::Relaxed);
         let (sender, results) = mpsc::channel();
         let submit = |name: &'static str| {
-            let sender = sender.clone();
-            checks
-                .submit(Check {
-                    task: TaskLaunch {
-                        command: "cmd".into(),
-                        arguments: String::new(),
-                        elevated: false,
-                    },
-                    done: Box::new(move |result| {
-                        let _ = sender.send((name, result.is_ok()));
-                    }),
-                })
-                .unwrap();
+            submit_to(&checks, &sender, name);
         };
         submit("first");
         // Once the thread has taken it, later requests wait behind it.
