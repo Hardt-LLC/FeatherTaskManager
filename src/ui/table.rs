@@ -2322,17 +2322,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             let keyboard =
                 (l & 0xffff) as u16 as i16 == -1 && ((l >> 16) & 0xffff) as u16 as i16 == -1;
             let target = if keyboard {
-                // Shift+F10 / the menu key while pointing at a header cell:
-                // that column's menu below the cell (rows keep their menu).
-                (*s).hover_header.and_then(|column| {
-                    let (left, _) = *column_spans(s).get(column)?;
-                    let mut at = POINT {
-                        x: left.max(0),
-                        y: (*s).model.header_height(),
-                    };
-                    ClientToScreen(hwnd, &mut at);
-                    Some((column, at))
-                })
+                // Shift+F10 / the menu key act on the selected row, wherever
+                // the pointer was left (a hovered header must not take the
+                // row's menu away); Ctrl+Shift+C is the keyboard column menu.
+                None
             } else {
                 let mut pt = point(l);
                 ScreenToClient(hwnd, &mut pt);
@@ -3571,10 +3564,14 @@ mod tests {
             let (x, y) = screen(20, 10);
             SendMessageW(h.table, WM_CONTEXTMENU, h.table as usize, Harness::at(x, y));
             assert_eq!(h.menus.borrow().last(), Some(&(Some(0), x, y)));
-            // Shift+F10 while pointing at the Value header: below its cell.
+            // Shift+F10 with the pointer left on the Value header still opens
+            // the selected row's menu, not the column's.
             SendMessageW(h.table, WM_MOUSEMOVE, 0, Harness::at(value + 20, 10));
             SendMessageW(h.table, WM_CONTEXTMENU, h.table as usize, keyboard);
-            let (x, y) = screen(value, 34);
+            assert_eq!(h.menus.borrow().len(), 1);
+            // Right-click on that header: its menu, at the pointer.
+            let (x, y) = screen(value + 20, 10);
+            SendMessageW(h.table, WM_CONTEXTMENU, h.table as usize, Harness::at(x, y));
             assert_eq!(h.menus.borrow().last(), Some(&(Some(1), x, y)));
             // Ctrl+Shift+C: no header is pointed at, every column is offered.
             let mut keys = [0u8; 256];

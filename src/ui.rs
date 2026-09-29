@@ -3546,10 +3546,11 @@ unsafe fn drain_jobs(p: *mut App) {
             JobResult::Services(result)
                 if std::mem::take(&mut (*p).services_for_monitor)
                     && (*p).page == Page::Services
-                    && ((*p).paused || (*p).minimized) =>
+                    && (*p).paused =>
             {
                 // A paused Services page keeps its frame; only the Resource
-                // Monitor takes this list.
+                // Monitor takes this list. A minimized page still takes it,
+                // so it is current again the moment the window is restored.
                 (*p).services_loading = false;
                 if let Ok(services) = result {
                     (*p).resource_services = Some(services);
@@ -5107,6 +5108,21 @@ mod tests {
             test.result(JobResult::Services(Ok(two())));
             assert_eq!(test.count(), 2);
             assert!((*test.p).resource_services.is_none());
+            // Minimized but not paused: the page follows the monitor's list,
+            // so a restore never shows a stale one.
+            (*test.p).paused = false;
+            (*test.p).minimized = true;
+            (*test.p).services_loading = true;
+            (*test.p).services_for_monitor = true;
+            test.result(JobResult::Services(Ok(vec![service(
+                "Gamma",
+                SERVICE_RUNNING,
+                9,
+                Some(2),
+            )])));
+            assert_eq!((*test.p).services.len(), 1);
+            assert_eq!((&(*test.p).services)[0].name, "Gamma");
+            (*test.p).minimized = false;
         }
     }
 

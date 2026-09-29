@@ -209,6 +209,14 @@ const REASONS: &[(&str, &str)] = &[
         "Cannot open file I/O trace",
         "파일 I/O 추적을 열 수 없습니다",
     ),
+    (
+        "Cannot start file I/O consumer",
+        "파일 I/O 이벤트 수신을 시작할 수 없습니다",
+    ),
+    (
+        "Cannot read process identity",
+        "Feather 프로세스 정보를 읽을 수 없습니다",
+    ),
     ("File I/O trace stopped", "파일 I/O 추적이 중지되었습니다"),
     (
         "Cannot check file I/O event loss",
@@ -1149,6 +1157,14 @@ mod tests {
             assert_eq!(
                 reason("Cannot start file I/O trace (Windows 1450)", false),
                 "파일 I/O 추적을 시작할 수 없습니다 (Windows 1450)"
+            );
+            assert_eq!(
+                reason("Cannot start file I/O consumer: out of memory", false),
+                "파일 I/O 이벤트 수신을 시작할 수 없습니다: out of memory"
+            );
+            assert_eq!(
+                reason("Cannot read process identity", false),
+                "Feather 프로세스 정보를 읽을 수 없습니다"
             );
             assert_eq!(
                 reason(

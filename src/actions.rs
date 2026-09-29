@@ -757,11 +757,17 @@ fn task_executable(path: &str) -> Result<std::path::PathBuf, String> {
 fn app_execution_alias(path: &std::path::Path) -> Option<std::path::PathBuf> {
     let alias = path.parent()?.canonicalize().ok()?.join(path.file_name()?);
     let target = std::path::PathBuf::from(alias_target(&alias)?);
+    if !local_path(&target) || !local_drive(&target) {
+        return None;
+    }
+    // Resolve links in the target as well, so a local-looking path cannot
+    // lead to a network share; a stale alias (no target) is refused here.
+    let target = target.canonicalize().ok()?;
     let executable = target
         .extension()
         .and_then(OsStr::to_str)
         .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
-    (executable && local_path(&target) && local_drive(&target)).then_some(alias)
+    (executable && target.is_file() && local_path(&target) && local_drive(&target)).then_some(alias)
 }
 
 /// The target executable an app execution alias names (None: `path` is not one).
