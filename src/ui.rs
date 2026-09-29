@@ -4458,6 +4458,25 @@ mod tests {
         }
     }
     #[test]
+    fn resource_monitor_menus_are_feather_menus_over_its_own_window() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_feather_menus(test.p);
+            // Each menu ran modal: sampling paused while it was open and
+            // resumed after it closed.
+            let sent: Vec<_> = test.commands.try_iter().collect();
+            assert!(sent
+                .iter()
+                .any(|c| matches!(c, Command::Configure { paused: true, .. })));
+            assert!(matches!(
+                sent.last(),
+                Some(Command::Configure { paused: false, .. })
+            ));
+            assert!(!(*test.p).modal);
+        }
+    }
+    #[test]
     fn resource_monitor_keyboard_focus_scrolls_into_view_and_survives_activation() {
         let test = TestWindow::new();
         test.snapshot(rows());

@@ -31,6 +31,17 @@ pub(super) unsafe fn pointer_pressed(hwnd: HWND) {
     );
 }
 
+/// Keyboard use the dialog manager does not see (Apps / Shift+F10) shows the
+/// focus cues, like Tab does.
+pub(super) unsafe fn keyboard_used(hwnd: HWND) {
+    SendMessageW(
+        hwnd,
+        WM_CHANGEUISTATE,
+        (UIS_CLEAR | (UISF_HIDEFOCUS << 16)) as usize,
+        0,
+    );
+}
+
 /// The main message loop's view of every message before dispatch: a mouse
 /// press anywhere in the app hides the keyboard focus cues, so no custom
 /// control (table, select, button) needs a hook of its own for
@@ -1075,17 +1086,26 @@ pub(super) unsafe fn save_with_popups(
     popups: &[HWND],
 ) -> Result<(), String> {
     (*p).anim.finish_all();
+    save_window_with_popups((*p).hwnd, path, popups)
+}
+
+/// [`save_with_popups`] for another Feather window (the Resource Monitor).
+pub(super) unsafe fn save_window_with_popups(
+    owner: HWND,
+    path: &std::path::Path,
+    popups: &[HWND],
+) -> Result<(), String> {
     let mut client: RECT = zeroed();
-    GetClientRect((*p).hwnd, &mut client);
+    GetClientRect(owner, &mut client);
     let mut frame =
         gfx::Dib::new(client.right, client.bottom).ok_or("Preview allocation failed")?;
     frame.pixels().fill(0xffff_ffff);
-    capture::paint_client_and_children((*p).hwnd, frame.dc())?;
+    capture::paint_client_and_children(owner, frame.dc())?;
     // Popups that open past the client (a submenu at the right edge) get
     // the reference's desk color around the window.
     let mut bounds = client;
     for &hwnd in popups {
-        if let Some(r) = popup::client_bounds((*p).hwnd, hwnd) {
+        if let Some(r) = popup::client_bounds(owner, hwnd) {
             bounds = RECT {
                 left: bounds.left.min(r.left),
                 top: bounds.top.min(r.top),
@@ -1109,7 +1129,7 @@ pub(super) unsafe fn save_with_popups(
         SRCCOPY,
     );
     popup::composite(
-        (*p).hwnd,
+        owner,
         &mut dib,
         POINT {
             x: bounds.left,
