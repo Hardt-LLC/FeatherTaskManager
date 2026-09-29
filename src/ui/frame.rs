@@ -1244,19 +1244,7 @@ pub(super) unsafe fn save_previews(p: *mut App, dir: &std::path::Path) -> Result
         // 150 %: the same states from the WM_DPICHANGED path.
         (*p).prefs.theme = 1;
         interactions::apply_theme(p);
-        let size = RECT {
-            left: 0,
-            top: 0,
-            right: 1800,
-            bottom: 1230,
-        };
-        SendMessageW(
-            (*p).hwnd,
-            WM_DPICHANGED,
-            144 | (144 << 16),
-            &size as *const _ as isize,
-        );
-        fit_client((*p).hwnd, 1800, 1230);
+        preview_dpi((*p).hwnd, 144, 1800, 1230);
         let mut strips = Vec::new();
         for &(state, hot, pressed, maximized, active) in PREVIEW_STATES {
             stage(p, hot, pressed, maximized, active);
@@ -1266,19 +1254,7 @@ pub(super) unsafe fn save_previews(p: *mut App, dir: &std::path::Path) -> Result
         capture::save_client(p, &dir.join("search-hangul-dpi150.bmp"))?;
         end_search_state(p);
         save_sheet(&mut strips, &dir.join("titlebar-states-dpi150.bmp"))?;
-        let size = RECT {
-            left: 0,
-            top: 0,
-            right: 1200,
-            bottom: 820,
-        };
-        SendMessageW(
-            (*p).hwnd,
-            WM_DPICHANGED,
-            96 | (96 << 16),
-            &size as *const _ as isize,
-        );
-        fit_client((*p).hwnd, 1200, 820);
+        preview_dpi((*p).hwnd, 96, 1200, 820);
         Ok(())
     })();
     stage(p, None, None, None, true);

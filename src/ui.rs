@@ -4144,6 +4144,26 @@ unsafe fn save_layout_states(p: *mut App, dir: &std::path::Path) -> Result<(), S
     Ok(())
 }
 
+/// A preview window at `dpi` with a `width` × `height` px client: the
+/// controlled WM_DPICHANGED of a monitor change (fonts, icons, layout), then
+/// [`fit_client`]. The window keeps its monitor's own DPI, which only sizes
+/// the non-client resize borders that captures leave out.
+unsafe fn preview_dpi(hwnd: HWND, dpi: i32, width: i32, height: i32) {
+    let r = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    SendMessageW(
+        hwnd,
+        WM_DPICHANGED,
+        (dpi | (dpi << 16)) as usize,
+        &r as *const _ as isize,
+    );
+    fit_client(hwnd, width, height);
+}
+
 /// Render this application's own hidden native client, using read-only live data.
 pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
     unsafe {
@@ -4161,8 +4181,10 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
             dispose(p);
             return Err("Preview window creation failed".into());
         }
-        // Client 1200 × 820 compares 1:1 with the reference window renders.
-        fit_client(hwnd, 1200, 820);
+        // Client 1200 × 820 at 96 DPI compares 1:1 with the reference window
+        // renders. Per-Monitor-V2 gave the window its monitor's DPI (144 at
+        // 150 %), where the 980 × 660 DIP minimum alone is 1470 × 990 px.
+        preview_dpi(hwnd, 96, 1200, 820);
         let result = (|| {
             (*p).startup = crate::startup::list()?;
             (*p).startup_loaded = true;
@@ -4286,19 +4308,7 @@ pub fn render_previews(dir: &std::path::Path) -> Result<(), String> {
                 // These captures come long after the last preview sample: the
                 // status bar would read "Waiting" instead of the live state.
                 (*p).last_sample = Some(Instant::now());
-                let r = RECT {
-                    left: 0,
-                    top: 0,
-                    right: width,
-                    bottom: height,
-                };
-                SendMessageW(
-                    hwnd,
-                    WM_DPICHANGED,
-                    dpi | (dpi << 16),
-                    &r as *const _ as isize,
-                );
-                fit_client(hwnd, width, height);
+                preview_dpi(hwnd, dpi, width, height);
                 for (page, name) in [
                     (Page::Processes, "processes"),
                     (Page::Performance, "performance"),
@@ -4848,6 +4858,34 @@ mod tests {
                     assert_eq!((bitmap.bmWidth, bitmap.bmHeight), (expected, expected));
                 }
             }
+        }
+    }
+    #[test]
+    fn previews_start_at_96_dpi_and_1200_by_820_from_any_monitor_dpi() {
+        let test = TestWindow::new();
+        unsafe {
+            let hwnd = (*test.p).hwnd;
+            let client = || {
+                let mut r: RECT = zeroed();
+                GetClientRect(hwnd, &mut r);
+                (r.right, r.bottom)
+            };
+            // A window created on a 150 % monitor: its 980 × 660 DIP minimum
+            // (1470 × 990 px) keeps the client above 1200 × 820.
+            preview_dpi(hwnd, 144, 1800, 1230);
+            fit_client(hwnd, 1200, 820);
+            let (min_width, min_height) = frame::MIN_CLIENT;
+            assert_eq!(
+                client(),
+                (gfx::pxi(144, min_width), gfx::pxi(144, min_height))
+            );
+            // render_previews' first step.
+            preview_dpi(hwnd, 96, 1200, 820);
+            assert_eq!(client(), (1200, 820));
+            assert_eq!(((*test.p).dpi, (*test.p).fonts.dpi()), (96, 96));
+            // The reference geometry (layout::tests): 44 px strip, 220 px rail.
+            let l = current_layout(test.p);
+            assert_eq!((l.dpi, l.titlebar.bottom, l.rail.right), (96, 44, 220));
         }
     }
     #[test]
