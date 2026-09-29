@@ -2652,7 +2652,14 @@ unsafe fn settings_menu(p: *mut App) {
     let mut bounds: RECT = zeroed();
     GetWindowRect((*p).settings, &mut bounds);
     // The layered menu above the Settings item (below it without room).
-    let command = popup::track_menu(p, menu, popup::Anchor::Above { r: bounds });
+    let command = popup::track_menu(
+        p,
+        menu,
+        popup::Anchor::Above {
+            r: bounds,
+            right: false,
+        },
+    );
     DestroyMenu(menu);
     (*p).modal = false;
     configure(p);
@@ -4477,6 +4484,25 @@ mod tests {
         test.snapshot(rows());
         unsafe {
             resource_monitor::assert_end_confirmation(test.p);
+        }
+    }
+    #[test]
+    fn resource_monitor_menus_are_feather_menus_over_its_own_window() {
+        let test = TestWindow::new();
+        test.snapshot(rows());
+        unsafe {
+            resource_monitor::assert_feather_menus(test.p);
+            // Each menu ran modal: sampling paused while it was open and
+            // resumed after it closed.
+            let sent: Vec<_> = test.commands.try_iter().collect();
+            assert!(sent
+                .iter()
+                .any(|c| matches!(c, Command::Configure { paused: true, .. })));
+            assert!(matches!(
+                sent.last(),
+                Some(Command::Configure { paused: false, .. })
+            ));
+            assert!(!(*test.p).modal);
         }
     }
     #[test]

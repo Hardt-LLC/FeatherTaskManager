@@ -213,8 +213,9 @@ pub(super) enum Anchor {
     /// Below `r` (left edges aligned, or right edges when `right`), flipping
     /// above it when the work area has no room below.
     Below { r: RECT, right: bool },
-    /// Above `r`, left edges aligned, flipping below.
-    Above { r: RECT },
+    /// Above `r` (left edges aligned, or right edges when `right`), flipping
+    /// below it when the work area has no room above.
+    Above { r: RECT, right: bool },
     /// A context menu at a point: below-right, flipping left / up.
     Point(POINT),
     /// A submenu beside a parent menu's `item` row (`parent` = its box):
@@ -263,15 +264,10 @@ pub(super) fn place(
             let (y, slide) = vertical(r.top, r.bottom, true);
             (POINT { x, y }, slide)
         }
-        Anchor::Above { r } => {
+        Anchor::Above { r, right } => {
+            let x = clamp_x(if right { r.right - w } else { r.left });
             let (y, slide) = vertical(r.top, r.bottom, false);
-            (
-                POINT {
-                    x: clamp_x(r.left),
-                    y,
-                },
-                slide,
-            )
+            (POINT { x, y }, slide)
         }
         Anchor::Point(pt) => {
             let x = if pt.x + w <= work.right {
@@ -557,7 +553,7 @@ pub(super) struct Popup {
 
 /// The window a popup belongs to, with the DPI and fonts it is drawn in: the
 /// main window, or another Feather window (the Resource Monitor) that shows
-/// the same confirm dialog over itself.
+/// the same menus and confirm dialog over itself.
 #[derive(Clone, Copy)]
 pub(super) struct Host {
     pub hwnd: HWND,
@@ -1368,21 +1364,35 @@ pub(super) unsafe fn open_list(
     anchor: Anchor,
     hot: Option<usize>,
 ) -> HWND {
-    if app.is_null() || (*app).hwnd.is_null() || items.is_empty() {
+    if app.is_null() {
         return null_mut();
     }
-    let dpi = (*app).dpi;
+    open_list_on(Host::main(app), items, style, anchor, hot)
+}
+
+/// [`open_list`] for `host`.
+unsafe fn open_list_on(
+    host: Host,
+    items: Vec<MenuItem>,
+    style: MenuStyle,
+    anchor: Anchor,
+    hot: Option<usize>,
+) -> HWND {
+    if host.hwnd.is_null() || items.is_empty() {
+        return null_mut();
+    }
+    let dpi = host.dpi;
     let (size, rows, gutter) = {
         let dc = MeasureDc::new();
         if dc.0.is_null() {
             return null_mut();
         }
-        let pt = Painter::new(dc.0, dpi, &(*app).fonts);
+        let pt = Painter::new(dc.0, dpi, &*host.fonts);
         layout_menu(&pt, &items, &style)
     };
     let hot = hot.filter(|&i| items.get(i).is_some_and(MenuItem::selectable));
     let reference = match anchor {
-        Anchor::Below { r, .. } | Anchor::Above { r } | Anchor::Center(r) => r,
+        Anchor::Below { r, .. } | Anchor::Above { r, .. } | Anchor::Center(r) => r,
         Anchor::Beside { item, .. } => item,
         Anchor::Point(pt) => RECT {
             left: pt.x,
@@ -1409,7 +1419,7 @@ pub(super) unsafe fn open_list(
         open: None,
     };
     let hwnd = create(
-        Host::main(app),
+        host,
         Kind::Menu(view),
         size,
         origin,
@@ -1523,7 +1533,7 @@ pub(super) unsafe fn move_list(hwnd: HWND, anchor: Anchor) {
     }
     let dpi = (*s).dpi;
     let reference = match anchor {
-        Anchor::Below { r, .. } | Anchor::Above { r } | Anchor::Center(r) => r,
+        Anchor::Below { r, .. } | Anchor::Above { r, .. } | Anchor::Center(r) => r,
         Anchor::Beside { item, .. } => item,
         Anchor::Point(pt) => RECT {
             left: pt.x,
@@ -1556,7 +1566,7 @@ pub(super) enum Flow {
 
 /// An open menu: level 0 plus the open submenus (each its own popup).
 pub(super) struct MenuSession {
-    app: *mut App,
+    host: Host,
     pub(super) levels: Vec<HWND>,
 }
 
@@ -1567,10 +1577,19 @@ impl MenuSession {
         anchor: Anchor,
         hot: Option<usize>,
     ) -> Option<Self> {
-        let style = MenuStyle::menu((*app).dpi);
-        let hwnd = open_list(app, items, style, anchor, hot);
+        Self::open_on(Host::main(app), items, anchor, hot)
+    }
+    /// [`MenuSession::open`] for `host`.
+    pub(super) unsafe fn open_on(
+        host: Host,
+        items: Vec<MenuItem>,
+        anchor: Anchor,
+        hot: Option<usize>,
+    ) -> Option<Self> {
+        let style = MenuStyle::menu(host.dpi);
+        let hwnd = open_list_on(host, items, style, anchor, hot);
         (!hwnd.is_null()).then(|| Self {
-            app,
+            host,
             levels: vec![hwnd],
         })
     }
@@ -1611,10 +1630,10 @@ impl MenuSession {
         } else {
             None
         };
-        let hwnd = open_list(
-            self.app,
+        let hwnd = open_list_on(
+            self.host,
             item.submenu,
-            MenuStyle::menu((*self.app).dpi),
+            MenuStyle::menu(self.host.dpi),
             Anchor::Beside {
                 item: row,
                 parent: content,
@@ -1822,29 +1841,35 @@ fn menu_show_delay() -> u32 {
 /// like `TrackPopupMenu(TPM_RETURNCMD)`. Opened from the keyboard (focus
 /// cues shown), the first item is highlighted. The caller owns the HMENU.
 pub(super) unsafe fn track_menu(p: *mut App, menu: HMENU, anchor: Anchor) -> usize {
+    track_menu_on(Host::main(p), menu, anchor)
+}
+
+/// [`track_menu`] over `host` (another Feather window): the menu is owned by
+/// it, drawn in its DPI and fonts, and closes when it moves.
+pub(super) unsafe fn track_menu_on(host: Host, menu: HMENU, anchor: Anchor) -> usize {
+    let owner = host.hwnd;
     let items = menu_items(menu);
-    if items.is_empty() || (*p).hwnd.is_null() {
+    if items.is_empty() || owner.is_null() {
         return 0;
     }
-    let keyboard = !super::controls::cues_hidden((*p).hwnd);
+    let keyboard = !super::controls::cues_hidden(owner);
     let hot = if keyboard {
         step_item(&items, None, true)
     } else {
         None
     };
-    let Some(mut session) = MenuSession::open(p, items, anchor, hot) else {
+    let Some(mut session) = MenuSession::open_on(host, items, anchor, hot) else {
         return 0;
     };
     let capture = session.levels[0];
     SetCapture(capture);
     let captured = GetCapture() == capture;
-    let root = GetAncestor((*p).hwnd, GA_ROOT);
+    let root = GetAncestor(owner, GA_ROOT);
     let foreground = GetForegroundWindow() == root;
     let delay = menu_show_delay();
     let mut chosen = 0;
     let mut pressed = false;
     let mut pending: Option<usize> = None;
-    let owner = (*p).hwnd;
     let geometry = || unsafe { rect_key(visible_bounds(owner), client_screen(owner)) };
     let placed = geometry();
     let session_ptr = &mut session as *mut MenuSession;
@@ -3104,10 +3129,14 @@ mod tests {
         );
         assert_eq!(pt.x, 1000 - 220);
         // Above the Settings button; below when the top has no room.
-        let (pt, slide) = place(Anchor::Above { r: low }, 200, 150, work, 4, 0);
-        assert_eq!((pt.y, slide), (700 - 4 - 150, 1));
-        let (pt, slide) = place(Anchor::Above { r: button }, 200, 150, work, 4, 0);
+        let above = |r: RECT, right: bool| place(Anchor::Above { r, right }, 200, 150, work, 4, 0);
+        let (pt, slide) = above(low, false);
+        assert_eq!((pt.x, pt.y, slide), (1000 - 200, 700 - 4 - 150, 1));
+        let (pt, slide) = above(button, false);
         assert_eq!((pt.y, slide), (136, -1));
+        // Right-aligned above the Resource Monitor's Refresh button.
+        let (pt, slide) = above(low, true);
+        assert_eq!((pt.x, pt.y, slide), (932 - 200, 700 - 4 - 150, 1));
         // Context menus flip left / up at the edges.
         let (pt, slide) = place(
             Anchor::Point(POINT { x: 950, y: 750 }),

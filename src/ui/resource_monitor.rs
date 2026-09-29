@@ -823,32 +823,43 @@ unsafe fn sync_rate(s: *mut State) {
         .as_ptr(),
     );
 }
-unsafe fn track_menu(s: *mut State, menu: HMENU, flags: u32, at: POINT) -> u32 {
+/// Feather's popups (menus, the confirm dialog) over this window, in its DPI
+/// and fonts.
+unsafe fn host(s: *mut State) -> popup::Host {
+    popup::Host {
+        hwnd: (*s).hwnd,
+        dpi: (*s).dpi,
+        fonts: &(*s).fonts,
+    }
+}
+/// Feather's layered menu over this window (the command id, 0 = cancelled).
+unsafe fn track_menu(s: *mut State, menu: HMENU, anchor: popup::Anchor) -> usize {
     let owner = (*s).owner;
     if (*owner).modal {
         return 0;
     }
-    // Keep both window states alive while the native menu pumps messages.
+    // Keep both window states alive while the menu's loop pumps messages.
     (*owner).modal = true;
     configure(owner);
-    let chosen = TrackPopupMenu(
-        menu,
-        flags | TPM_RETURNCMD | TPM_NONOTIFY,
-        at.x,
-        at.y,
-        0,
-        (*s).hwnd,
-        null(),
-    );
+    let hwnd = (*s).hwnd;
+    let chosen = popup::track_menu_on(host(s), menu, anchor);
     (*owner).modal = false;
     configure(owner);
     PostMessageW((*owner).hwnd, SNAPSHOT_READY, 0, 0);
     PostMessageW((*owner).hwnd, JOB_READY, 0, 0);
-    chosen as u32
+    // The menu's message loop ran: a command only for a window that still
+    // exists (its callers use its state).
+    let s = owner_state(owner);
+    if s.is_null() || (*s).hwnd != hwnd {
+        return 0;
+    }
+    chosen
 }
-unsafe fn choose_rate(s: *mut State) {
+const RATES: [u64; 4] = [0, 500, 1000, 2000];
+/// The Refresh menu (command n = `RATES[n - 1]`), the current rate checked.
+unsafe fn rate_menu(s: *mut State) -> HMENU {
     let menu = CreatePopupMenu();
-    for (i, rate) in [0, 500, 1000, 2000].into_iter().enumerate() {
+    for (i, rate) in RATES.into_iter().enumerate() {
         AppendMenuW(
             menu,
             MF_STRING | if rate == (*s).interval { MF_CHECKED } else { 0 },
@@ -856,22 +867,19 @@ unsafe fn choose_rate(s: *mut State) {
             wide(rate_label(rate)).as_ptr(),
         );
     }
-    let mut rect: RECT = zeroed();
-    GetWindowRect((*s).rate, &mut rect);
-    let chosen = track_menu(
-        s,
-        menu,
-        TPM_RIGHTALIGN | TPM_BOTTOMALIGN,
-        POINT {
-            x: rect.right,
-            y: rect.top,
-        },
-    );
+    menu
+}
+/// Right-aligned above the footer's Refresh button (below it without room).
+unsafe fn rate_anchor(s: *mut State) -> popup::Anchor {
+    let mut r: RECT = zeroed();
+    GetWindowRect((*s).rate, &mut r);
+    popup::Anchor::Above { r, right: true }
+}
+unsafe fn choose_rate(s: *mut State) {
+    let menu = rate_menu(s);
+    let chosen = track_menu(s, menu, rate_anchor(s));
     DestroyMenu(menu);
-    if let Some(rate) = chosen
-        .checked_sub(1)
-        .and_then(|n| [0, 500, 1000, 2000].get(n as usize))
-    {
+    if let Some(rate) = chosen.checked_sub(1).and_then(|n| RATES.get(n)) {
         set_rate(s, *rate);
     }
 }
@@ -956,11 +964,7 @@ unsafe fn end_processes(s: *mut State, ids: Vec<(u32, u64)>) {
     // has the focus; the window's input waits until it closes.
     let hwnd = (*s).hwnd;
     let confirmed = popup::confirm_dialog_on(
-        popup::Host {
-            hwnd,
-            dpi: (*s).dpi,
-            fonts: &(*s).fonts,
-        },
+        host(s),
         &popup::ConfirmSpec {
             title: &heading,
             body: &body,
@@ -1041,11 +1045,25 @@ unsafe fn notify(s: *mut State, l: LPARAM) -> LRESULT {
     }
     0
 }
+/// A panel row's menu: End process (1), Filter to this process (2), Show in
+/// Task Manager (3).
+unsafe fn row_menu() -> HMENU {
+    let menu = CreatePopupMenu();
+    for (id, label) in [
+        (1, tr("프로세스 종료", "End process")),
+        (2, tr("이 프로세스로 필터", "Filter to this process")),
+        (3, tr("작업 관리자에서 보기", "Show in Task Manager")),
+    ] {
+        AppendMenuW(menu, MF_STRING, id, wide(label).as_ptr());
+    }
+    menu
+}
 unsafe fn context(s: *mut State, hwnd: HWND, l: LPARAM) {
     let Some(index) = (*s).panels.iter().position(|p| p.table == hwnd) else {
         return;
     };
-    let anchor = table::keyboard_menu_anchor(hwnd, l);
+    // Apps / Shift+F10: the selected row's first cell (revealed first).
+    let below = table::keyboard_menu_anchor(hwnd, l);
     let row = if l == -1 {
         SendMessageW(hwnd, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize)
     } else {
@@ -1063,40 +1081,28 @@ unsafe fn context(s: *mut State, hwnd: HWND, l: LPARAM) {
     else {
         return;
     };
-    let menu = CreatePopupMenu();
-    AppendMenuW(
-        menu,
-        MF_STRING,
-        1,
-        wide(tr("프로세스 종료", "End process")).as_ptr(),
-    );
-    AppendMenuW(
-        menu,
-        MF_STRING,
-        2,
-        wide(tr("이 프로세스로 필터", "Filter to this process")).as_ptr(),
-    );
-    AppendMenuW(
-        menu,
-        MF_STRING,
-        3,
-        wide(tr("작업 관리자에서 보기", "Show in Task Manager")).as_ptr(),
-    );
-    let mut pt = POINT {
-        x: (l as u32 & 0xffff) as i16 as i32,
-        y: ((l as u32 >> 16) & 0xffff) as i16 as i32,
+    let menu = row_menu();
+    let anchor = match below {
+        // Left-aligned under the row, flipping above it near the bottom,
+        // like the main window's list.
+        Some(r) => popup::Anchor::Below { r, right: false },
+        None => {
+            let mut pt = POINT {
+                x: (l as u32 & 0xffff) as i16 as i32,
+                y: ((l as u32 >> 16) & 0xffff) as i16 as i32,
+            };
+            if l == -1 {
+                GetCursorPos(&mut pt);
+            }
+            popup::Anchor::Point(pt)
+        }
     };
     if l == -1 {
-        if let Some(r) = anchor {
-            pt = POINT {
-                x: r.left,
-                y: r.bottom,
-            };
-        } else {
-            GetCursorPos(&mut pt);
-        }
+        // Keyboard use shows the focus cues, so the menu opens with its
+        // first item highlighted even after a click in the window.
+        controls::keyboard_used((*s).hwnd);
     }
-    let command = track_menu(s, menu, TPM_RIGHTBUTTON, pt);
+    let command = track_menu(s, menu, anchor);
     DestroyMenu(menu);
     match command {
         1 => end_processes(s, vec![id]),
@@ -1412,6 +1418,24 @@ unsafe extern "system" fn body_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
     }
 }
 
+/// Capture `menu` (destroyed here) open at `anchor` over this window with
+/// `hot` highlighted (previews).
+unsafe fn menu_preview(
+    s: *mut State,
+    menu: HMENU,
+    anchor: popup::Anchor,
+    hot: Option<usize>,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let items = popup::menu_items(menu);
+    DestroyMenu(menu);
+    let session =
+        popup::MenuSession::open_on(host(s), items, anchor, hot).ok_or("Menu preview failed")?;
+    let saved = controls::save_window_with_popups((*s).hwnd, path, &session.levels);
+    session.destroy();
+    saved
+}
+
 /// Diagnostic-only render path: real local data, hidden Feather-owned windows,
 /// no process actions and no optional ETW session.
 pub(super) unsafe fn render_previews(owner: *mut App, dir: &std::path::Path) -> Result<(), String> {
@@ -1492,6 +1516,58 @@ pub(super) unsafe fn render_previews(owner: *mut App, dir: &std::path::Path) -> 
             capture::save_window((*s).hwnd, &dir.join("resource-selected-modules.bmp"))?;
             (*s).checked.clear();
         }
+        // Feather's menus over this window: a row's menu opened from the
+        // keyboard (first item highlighted) and the Refresh menu.
+        for theme in [2, 1] {
+            (*owner).prefs.theme = theme;
+            (*owner).prefs.apply_theme();
+            settings_changed(owner);
+            set_tab(s, Tab::Overview);
+            (*s).scroll = 0;
+            content::rebuild(s, (*s).accepted_at.unwrap_or_else(Instant::now));
+            view::layout(s);
+            let suffix = if theme == 2 { "dark" } else { "light" };
+            let list = (*s)
+                .panels
+                .iter()
+                .find(|p| p.kind == Kind::Cpu && !p.rows.is_empty())
+                .map(|p| p.table);
+            if let Some(list) = list {
+                let item = LVITEMW {
+                    stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                    state: LVIS_SELECTED | LVIS_FOCUSED,
+                    ..zeroed()
+                };
+                SendMessageW(list, LVM_SETITEMSTATE, 0, &item as *const LVITEMW as isize);
+                table::settle(list);
+                if let Some(r) = table::keyboard_menu_anchor(list, -1) {
+                    menu_preview(
+                        s,
+                        row_menu(),
+                        popup::Anchor::Below { r, right: false },
+                        Some(0),
+                        &dir.join(format!("resource-row-menu-{suffix}.bmp")),
+                    )?;
+                }
+                let none = LVITEMW {
+                    stateMask: LVIS_SELECTED,
+                    ..zeroed()
+                };
+                SendMessageW(
+                    list,
+                    LVM_SETITEMSTATE,
+                    usize::MAX,
+                    &none as *const LVITEMW as isize,
+                );
+            }
+            menu_preview(
+                s,
+                rate_menu(s),
+                rate_anchor(s),
+                None,
+                &dir.join(format!("resource-rate-menu-{suffix}.bmp")),
+            )?;
+        }
         for (dpi, width, height, name) in [(96, 780, 560, "minimum"), (144, 1980, 1260, "dpi150")] {
             let r = RECT {
                 left: 0,
@@ -1545,11 +1621,6 @@ pub(super) unsafe fn assert_end_confirmation(owner: *mut App) {
     create(owner, false);
     let s = owner_state(owner);
     assert!(!s.is_null());
-    let host = popup::Host {
-        hwnd: (*s).hwnd,
-        dpi: (*s).dpi,
-        fonts: &(*s).fonts,
-    };
     let spec = popup::ConfirmSpec {
         title: "End 2 processes?",
         body: "a
@@ -1559,7 +1630,7 @@ b",
         cancel: "Cancel",
         danger: true,
     };
-    let (scrim, dialog) = popup::stage_confirm_on(host, &spec).unwrap();
+    let (scrim, dialog) = popup::stage_confirm_on(host(s), &spec).unwrap();
     for popup in [scrim, dialog] {
         assert_eq!(GetWindow(popup, GW_OWNER), (*s).hwnd);
     }
@@ -1576,6 +1647,150 @@ b",
     popup::destroy(dialog);
     popup::destroy(scrim);
     close(owner);
+}
+
+/// Moves the window under an open menu, then posts keys that would pick
+/// "1 s" if the menu were still open.
+#[cfg(test)]
+unsafe extern "system" fn move_under_menu(hwnd: HWND, _: u32, id: usize, _: u32) {
+    KillTimer(hwnd, id);
+    let mut r: RECT = zeroed();
+    GetWindowRect(hwnd, &mut r);
+    SetWindowPos(
+        hwnd,
+        null_mut(),
+        r.left + 40,
+        r.top + 30,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    for vk in [VK_DOWN, VK_DOWN, VK_RETURN] {
+        PostMessageW(hwnd, WM_KEYDOWN, vk as usize, 0);
+    }
+}
+
+/// Destroys the window under an open menu.
+#[cfg(test)]
+unsafe extern "system" fn destroy_under_menu(hwnd: HWND, _: u32, id: usize, _: u32) {
+    KillTimer(hwnd, id);
+    DestroyWindow(hwnd);
+}
+
+#[cfg(test)]
+pub(super) unsafe fn assert_feather_menus(owner: *mut App) {
+    create(owner, false);
+    let s = owner_state(owner);
+    assert!(!s.is_null());
+    let hwnd = (*s).hwnd;
+    let post = |keys: &[u16]| {
+        for &vk in keys {
+            PostMessageW(hwnd, WM_KEYDOWN, vk as usize, 0);
+        }
+    };
+    // Feather's menus fade out, so the one that just closed is still there.
+    let last_menu = || {
+        let menus: Vec<_> = popup::thread_popups()
+            .into_iter()
+            .filter(|&popup| popup::row_rect(popup, 0).is_some())
+            .collect();
+        assert_eq!(menus.len(), 1);
+        let menu = menus[0];
+        assert_eq!(GetWindow(menu, GW_OWNER), hwnd, "owned by this window");
+        (menu, popup::geometry(menu).unwrap().0)
+    };
+    let settle = || {
+        popup::finish_closing();
+        let mut msg: MSG = zeroed();
+        while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+            if msg.message != WM_QUIT {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        assert!(popup::thread_popups().is_empty());
+    };
+    let gap = || gfx::pxi((*s).dpi, 4.0);
+    // Refresh: right-aligned above its button. After a click nothing is
+    // highlighted (Down = Paused); from the keyboard the first item is
+    // (Down = 0.5 s).
+    set_rate(s, 1000);
+    let mut button: RECT = zeroed();
+    GetWindowRect((*s).rate, &mut button);
+    controls::pointer_pressed(hwnd);
+    post(&[VK_DOWN, VK_RETURN]);
+    choose_rate(s);
+    assert_eq!((*s).interval, 0);
+    let (menu, content) = last_menu();
+    assert_eq!(
+        (content.right, content.bottom),
+        (button.right, button.top - gap())
+    );
+    let row = popup::row_rect(menu, 0).unwrap();
+    assert_eq!(row.bottom - row.top, gfx::pxi((*s).dpi, 32.0));
+    settle();
+    controls::keyboard_used(hwnd);
+    post(&[VK_DOWN, VK_RETURN]);
+    choose_rate(s);
+    assert_eq!((*s).interval, 500);
+    settle();
+    // The window moving under the menu closes it.
+    SetTimer(hwnd, 0x5152, 1, Some(move_under_menu));
+    choose_rate(s);
+    assert_eq!((*s).interval, 500);
+    settle();
+    // Apps / Shift+F10 on a panel row: below the selected row's first cell,
+    // the first item highlighted even after a click (Down = Filter to this
+    // process; the Esc would cancel End process's confirmation instead).
+    let panel = (*s)
+        .panels
+        .iter()
+        .position(|p| p.kind == Kind::Cpu)
+        .unwrap();
+    let list = (&(*s).panels)[panel].table;
+    let id = (&(*s).panels)[panel].rows[0].identity.unwrap();
+    let item = LVITEMW {
+        stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+        state: LVIS_SELECTED | LVIS_FOCUSED,
+        ..zeroed()
+    };
+    SendMessageW(list, LVM_SETITEMSTATE, 0, &item as *const LVITEMW as isize);
+    let anchor = table::keyboard_menu_anchor(list, -1).unwrap();
+    controls::pointer_pressed(hwnd);
+    post(&[VK_DOWN, VK_RETURN, VK_ESCAPE]);
+    SendMessageW(hwnd, WM_CONTEXTMENU, list as usize, -1);
+    assert_eq!((*s).checked, HashSet::from([id]));
+    let (_, content) = last_menu();
+    assert_eq!(
+        (content.left, content.top),
+        (anchor.left, anchor.bottom + gap())
+    );
+    settle();
+    // On a monitor of another DPI the menu takes this window's DPI and
+    // fonts, not the main window's.
+    let dpi = (*owner).dpi * 2;
+    let mut window: RECT = zeroed();
+    GetWindowRect(hwnd, &mut window);
+    SendMessageW(
+        hwnd,
+        WM_DPICHANGED,
+        (dpi | (dpi << 16)) as usize,
+        &window as *const RECT as isize,
+    );
+    post(&[VK_ESCAPE]);
+    choose_rate(s);
+    let (menu, content) = last_menu();
+    let row = popup::row_rect(menu, 0).unwrap();
+    assert_eq!(row.bottom - row.top, gfx::pxi(dpi, 32.0));
+    assert_eq!(content.right - content.left, gfx::pxi(dpi, 200.0));
+    settle();
+    // Destroying the window under its menu ends the menu (its popups go
+    // with the window) and the modal state; nothing touches the freed state.
+    SetTimer(hwnd, 0x5153, 1, Some(destroy_under_menu));
+    choose_rate(s);
+    assert!((*owner).resource_window.is_null() && IsWindow(hwnd) == 0);
+    assert!(!(*owner).modal);
+    settle();
 }
 
 /// Open the window shown (so it counts as active and its controls take the
