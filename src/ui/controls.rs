@@ -1288,22 +1288,7 @@ pub(super) unsafe fn save_previews(p: *mut App, dir: &std::path::Path) -> Result
     (*p).prefs.theme = theme;
     interactions::apply_theme(p);
     // 150 %: the popups scale with the window (controlled WM_DPICHANGED).
-    let resize = |dpi: i32, width: i32, height: i32| {
-        let r = RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: height,
-        };
-        SendMessageW(
-            (*p).hwnd,
-            WM_DPICHANGED,
-            (dpi | (dpi << 16)) as usize,
-            &r as *const _ as isize,
-        );
-        fit_client((*p).hwnd, width, height);
-    };
-    resize(144, 1800, 1230);
+    preview_dpi((*p).hwnd, 144, 1800, 1230);
     switch_page(p, Page::Processes);
     rebuild(p, None);
     preview_selection(p);
@@ -1311,7 +1296,7 @@ pub(super) unsafe fn save_previews(p: *mut App, dir: &std::path::Path) -> Result
     select_preview(p, &dir.join("select-open-dpi150.bmp"))?;
     menu_preview(p, &dir.join("menu-open-dpi150.bmp"))?;
     dialog_preview(p, &dir.join("dialog-dpi150.bmp"))?;
-    resize(96, 1200, 820);
+    preview_dpi((*p).hwnd, 96, 1200, 820);
     rebuild(p, None);
     layout(p);
     Ok(())
