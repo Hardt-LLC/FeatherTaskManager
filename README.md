@@ -24,7 +24,7 @@ These images come from the [interactive design prototype](design/reference/feath
 - **Designed, not default** — one title bar with the logo, search and window buttons (Snap Layouts supported), custom-drawn tables, menus and dialogs, pixel-smooth scrolling and matching light/dark themes.
 - **Flexible process views** — switch between app groups, a list and a process tree; inspect live history, control efficiency mode, and end a task or an entire tree.
 - **System overview** — CPU cores, memory, disks, network adapters and GPUs with their model names, GPU temperature, memory speed and slots; toggle startup apps; start, stop or restart services.
-- **Nuclear Zombie** — tidy memory on a long-running PC without closing apps (trim working sets, clear the standby cache with administrator approval) and find "zombie" processes that another program still holds open.
+- **Nuclear Zombie** — tidy memory on a long-running PC without closing apps (every Empty command of Sysinternals RAMMap: working sets, system working set, modified page list, standby list and priority 0 standby list; all but the working-set trim need administrator approval) and find "zombie" processes that another program still holds open.
 - **English and Korean** — switch languages and light/dark themes from Settings; use command search and optional tray minimize.
 - **Optional Task Manager replacement** — launch Feather through the familiar Windows shortcuts.
 

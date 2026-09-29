@@ -7247,8 +7247,10 @@ mod tests {
                 options,
                 crate::memclean::CleanupOptions {
                     trim: true,
-                    standby: true,
+                    system_working_set: false,
                     modified: false,
+                    standby: true,
+                    low_standby: false,
                     zombies: true
                 }
             );
@@ -7260,8 +7262,10 @@ mod tests {
                         before: Err("test".into()),
                         after: Err("test".into()),
                         trim: None,
+                        system_working_set: None,
                         modified: None,
                         standby: None,
+                        low_standby: None,
                         zombies: None,
                         elevated: false,
                     },
@@ -7309,13 +7313,17 @@ mod tests {
         let report = crate::memclean::CleanupReport {
             before: memory.clone(),
             after: memory,
-            trim: Some(Ok(crate::memclean::TrimReport {
-                trimmed: 3,
-                skipped: 1,
-                failed: 0,
-            })),
+            trim: Some(Ok(crate::memclean::TrimOutcome::Processes(
+                crate::memclean::TrimReport {
+                    trimmed: 3,
+                    skipped: 1,
+                    failed: 0,
+                },
+            ))),
+            system_working_set: None,
             modified: None,
             standby: Some(Err(crate::memclean::PurgeError::Declined)),
+            low_standby: None,
             zombies: Some(Ok(crate::memclean::ZombieScan {
                 holders: vec![crate::memclean::ZombieHolder {
                     pid: 4242,
