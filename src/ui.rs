@@ -810,6 +810,48 @@ fn initial_page(args: &[String]) -> Page {
         _ => Page::Processes,
     }
 }
+/// When the monitor samples: one interval after the last sample, whatever
+/// commands arrive in between.
+struct Schedule {
+    interval: u64,
+    paused: bool,
+    /// When the last sample was taken.
+    last: Option<Instant>,
+}
+impl Schedule {
+    /// How long to wait for a command before the next sample is due.
+    fn wait(&self, now: Instant) -> Duration {
+        let period = Duration::from_millis(self.interval);
+        self.last.map_or(period, |at| {
+            period.saturating_sub(now.saturating_duration_since(at))
+        })
+    }
+    /// A sample only milliseconds after the previous one measures CPU over a
+    /// sliver of time: a needle at the start of every chart (the app
+    /// configures itself twice while starting).
+    fn recent(&self, now: Instant) -> bool {
+        self.last.is_some_and(|at| {
+            now.saturating_duration_since(at) < Duration::from_millis((self.interval / 2).max(100))
+        })
+    }
+    /// Apply a Configure at `now`: whether it samples ahead of schedule.
+    /// Resizes, keystrokes and page switches re-send the same configuration:
+    /// only a change (or `new_work`, taken then) does, and not right after a
+    /// sample (that one stands; the next comes on schedule).
+    fn configure(
+        &mut self,
+        interval: u64,
+        paused: bool,
+        new_work: &mut bool,
+        now: Instant,
+    ) -> bool {
+        let changed =
+            interval != self.interval || paused != self.paused || std::mem::take(new_work);
+        self.interval = interval;
+        self.paused = paused;
+        changed && !paused && !self.recent(now)
+    }
+}
 fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<MonitorSample>) {
     let mut sampler = Sampler::new();
     // The performance counters are sampled on every page, like Windows Task
@@ -837,22 +879,24 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
     crate::fileetw::stop_stale_sessions();
     let mut metadata = crate::process_metadata::Client::default();
     let mut metadata_needs = crate::process_metadata::Needs::default();
-    let mut interval = 1000;
-    let mut paused = false;
+    let mut schedule = Schedule {
+        interval: 1000,
+        paused: false,
+        last: None,
+    };
     let mut refresh = true;
     let mut manual_refresh = false;
     // What a sample collects changed since the last one (a panel opened, a
     // column or trace turned on): the next Configure samples at once.
     let mut new_work = false;
     let mut traces = (false, false);
-    // When the last sample was taken: the next one is due one interval
-    // later, whatever commands arrive in between.
-    let mut last: Option<Instant> = None;
     loop {
         if refresh {
             new_work = false;
-            let elapsed = last.map_or(Duration::from_millis(interval), |at| at.elapsed());
-            last = Some(Instant::now());
+            let elapsed = schedule
+                .last
+                .map_or(Duration::from_millis(schedule.interval), |at| at.elapsed());
+            schedule.last = Some(Instant::now());
             if sampler.is_err() {
                 sampler = Sampler::new();
             }
@@ -926,13 +970,12 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
         }
         // A full delivery slot must not lose F5 while paused. Retry on the
         // normal interval until that one requested frame has been delivered.
-        let result = if paused && !manual_refresh {
+        let result = if schedule.paused && !manual_refresh {
             commands
                 .recv()
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
         } else {
-            let period = Duration::from_millis(interval);
-            commands.recv_timeout(last.map_or(period, |at| period.saturating_sub(at.elapsed())))
+            commands.recv_timeout(schedule.wait(Instant::now()))
         };
         match result {
             Ok(Command::Resource(request, file_trace, endpoint_trace)) => {
@@ -954,38 +997,26 @@ fn monitor(hwnd: usize, commands: Receiver<Command>, snapshots: SyncSender<Monit
                 refresh = false;
             }
             Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Ok(Command::Configure {
-                interval: i,
-                paused: p,
-            }) => {
-                // Resizes, keystrokes and page switches re-send the same
-                // configuration: only a change samples ahead of schedule.
-                let changed = i != interval || p != paused || std::mem::take(&mut new_work);
-                interval = i;
-                if p && !paused {
+            Ok(Command::Configure { interval, paused }) => {
+                if paused && !schedule.paused {
                     // Bytes counted while paused are not shown: the first
                     // sample after resuming starts a fresh interval (every
                     // process reads "—" once, like GPU after a pause).
                     let _ = network.sample(&[]);
                 }
-                paused = p;
+                let now = Instant::now();
+                let ahead = schedule.configure(interval, paused, &mut new_work, now);
                 if paused {
                     // Rates after a pause start over (the UI records the gap).
                     if let Some(sampler) = perf.take() {
                         thermal = sampler.into_thermal();
                     }
                 }
-                // A sample only milliseconds after the previous one measures
-                // CPU over a sliver of time: a needle at the start of every
-                // chart (the app configures itself twice while starting). A
-                // recent sample stands; the next comes on schedule, and a
-                // performance sampler dropped by a pause is primed now (its
-                // first collection has no rates anyway).
-                let recent = last.is_some_and(|at| {
-                    at.elapsed() < Duration::from_millis((interval / 2).max(100))
-                });
-                refresh = manual_refresh || (changed && !paused && !recent);
-                if !paused && recent && perf.is_none() {
+                refresh = manual_refresh || ahead;
+                // Right after a sample, a performance sampler dropped by a
+                // pause is primed now (its first collection has no rates
+                // anyway).
+                if !paused && schedule.recent(now) && perf.is_none() {
                     if let Ok(mut sampler) = resume_perf(&mut thermal) {
                         let _ = sampler.sample();
                         perf = Some(sampler);
@@ -2325,14 +2356,13 @@ unsafe fn configure(p: *mut App) {
     let main_paused = (*p).paused || (*p).minimized || (*p).modal;
     let resource_shown = resource_monitor::interval((*p).resource_window).is_some();
     let resource_active = !(*p).modal && resource_shown;
-    let request = if resource_active {
+    // Modal or not: a menu or dialog pauses sampling but not the file and
+    // endpoint traces (stopping them for it would restart and re-prime their
+    // ETW sessions after every menu), and beside the Run new task dialog the
+    // Resource Monitor stays usable, so its tab still picks what is traced.
+    let request = if resource_shown {
         let (files, endpoints) = resource_monitor::tracing((*p).resource_window);
         (resource_monitor::request(p), files, endpoints)
-    } else if resource_shown {
-        // A menu or dialog pauses sampling but keeps the request: stopping
-        // the file and endpoint traces for it would restart (and re-prime)
-        // their ETW sessions after every menu.
-        (*p).resource_request
     } else {
         Default::default()
     };
@@ -4078,10 +4108,12 @@ unsafe fn fit_client(hwnd: HWND, width: i32, height: i32) {
 /// Tests: [`fit_client`] to `width` × `height` DIP at the window's DPI, like
 /// `run` sizes the real window (the reference's 1200 × 820 is 1800 × 1230 px
 /// at 150 %; the same numbers in device px would land on the 980 × 660 DIP
-/// minimum above 100 %). Returns the client size in device px.
+/// minimum above 100 %). Returns the client size in device px. The size may
+/// exceed the monitor ([`lift_max_track_size`]).
 #[cfg(test)]
 unsafe fn fit_client_dip(p: *mut App, width: f32, height: f32) -> (i32, i32) {
     let size = (gfx::pxi((*p).dpi, width), gfx::pxi((*p).dpi, height));
+    lift_max_track_size((*p).hwnd);
     fit_client((*p).hwnd, size.0, size.1);
     let mut client: RECT = zeroed();
     GetClientRect((*p).hwnd, &mut client);
@@ -4092,6 +4124,32 @@ unsafe fn fit_client_dip(p: *mut App, width: f32, height: f32) -> (i32, i32) {
         (*p).dpi
     );
     size
+}
+/// Tests: let a test window be sized past its monitor. Windows caps
+/// SetWindowPos at the maximum tracking size (the virtual screen plus its
+/// borders), and the reference's 1200 × 820 DIP is 2400 × 1640 px at 200 %,
+/// taller than a 3440 × 1440 panel. The app's own minimum stays.
+#[cfg(test)]
+unsafe fn lift_max_track_size(hwnd: HWND) {
+    SetWindowSubclass(hwnd, Some(no_max_track_size), 0xF17C, 0);
+}
+#[cfg(test)]
+unsafe extern "system" fn no_max_track_size(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    _data: usize,
+) -> LRESULT {
+    if msg == WM_NCDESTROY {
+        RemoveWindowSubclass(hwnd, Some(no_max_track_size), id);
+    }
+    let result = DefSubclassProc(hwnd, msg, w, l);
+    if msg == WM_GETMINMAXINFO {
+        (*(l as *mut MINMAXINFO)).ptMaxTrackSize = POINT { x: 32767, y: 32767 };
+    }
+    result
 }
 
 /// Preview captures of layout states that need interaction: a selected
@@ -4471,6 +4529,24 @@ mod tests {
                 Some(Command::Configure { paused: false, .. })
             ));
             assert_eq!((*test.p).resource_request, traced);
+            // The Run new task dialog is modal to the main window only: the
+            // Resource Monitor's tab still starts and stops traces meanwhile.
+            (*test.p).modal = true;
+            configure(test.p);
+            resource_monitor::select_traced_tab(test.p, false);
+            assert_eq!(
+                ((*test.p).resource_request.1, (*test.p).resource_request.2),
+                (false, false)
+            );
+            assert!(test
+                .commands
+                .try_iter()
+                .any(|c| matches!(c, Command::Resource(_, false, false))));
+            resource_monitor::select_traced_tab(test.p, true);
+            assert_eq!((*test.p).resource_request, traced);
+            (*test.p).modal = false;
+            configure(test.p);
+            assert_eq!((*test.p).resource_request, traced);
             // Closing the window still stops them.
             resource_monitor::close(test.p);
             assert!(test.commands.try_iter().any(|c| matches!(
@@ -4480,11 +4556,37 @@ mod tests {
         }
     }
     #[test]
+    fn test_windows_fit_clients_larger_than_the_screen() {
+        // As at 200 % on a 3440 × 1440 panel, where the reference's
+        // 1200 × 820 DIP client is taller than the screen.
+        let test = TestWindow::new();
+        unsafe {
+            let dip = |px: i32| (px + 100) as f32 * 96.0 / (*test.p).dpi as f32;
+            fit_client_dip(
+                test.p,
+                dip(GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+                dip(GetSystemMetrics(SM_CYVIRTUALSCREEN)),
+            );
+        }
+    }
+    #[test]
     fn resource_monitor_confirms_ending_processes_over_its_own_window() {
         let test = TestWindow::new();
         test.snapshot(rows());
+        while test.commands.try_recv().is_ok() {}
         unsafe {
-            resource_monitor::assert_end_confirmation(test.p);
+            let id = resource_monitor::assert_end_confirmation(test.p);
+            // Only the confirmed dialog ended it, and sampling paused while
+            // each dialog was open.
+            let jobs: Vec<_> = test.jobs.try_iter().collect();
+            assert!(matches!(
+                &jobs[..],
+                [Job::Action(Action::EndMany(ids))] if ids[..] == [id]
+            ));
+            let sent: Vec<_> = test.commands.try_iter().collect();
+            assert!(sent
+                .iter()
+                .any(|c| matches!(c, Command::Configure { paused: true, .. })));
         }
     }
     #[test]
@@ -4933,9 +5035,11 @@ mod tests {
             assert_eq!(test.text(0, 4), "10.0%");
             let width = widths();
             let edge = width[..=4].iter().sum::<i32>();
+            // 600 DIP to the right (column widths are DIP at any DPI).
+            let drag = gfx::pxi((*p).dpi, 600.0);
             SendMessageW(list, WM_LBUTTONDOWN, 0, at(edge));
-            SendMessageW(list, WM_MOUSEMOVE, 0, at(edge + 600));
-            SendMessageW(list, WM_LBUTTONUP, 0, at(edge + 600));
+            SendMessageW(list, WM_MOUSEMOVE, 0, at(edge + drag));
+            SendMessageW(list, WM_LBUTTONUP, 0, at(edge + drag));
             assert!((*p).process_columns.columns()[4].width > 400.0);
             // The overflow bar is the themed one: Windows' native bar (which
             // ignores the dark theme) never appears.
@@ -6638,6 +6742,42 @@ mod tests {
             assert_eq!(last(&PerfTarget::Cpu), 12.);
         }
     }
+    #[test]
+    fn unchanged_configurations_keep_the_sampling_schedule() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut schedule = Schedule {
+            interval: 250,
+            paused: false,
+            last: Some(start),
+        };
+        let mut new_work = false;
+        // Page switches, resizes and keystrokes re-send the same
+        // configuration: past the recent window (125 ms here) each one used
+        // to sample at once. The schedule stands instead.
+        for ms in [10, 130, 200, 249] {
+            assert!(!schedule.configure(250, false, &mut new_work, at(ms)));
+        }
+        assert_eq!(schedule.wait(at(130)), Duration::from_millis(120));
+        assert_eq!(schedule.wait(at(300)), Duration::ZERO);
+        // A change samples at once, except right after a sample.
+        assert!(schedule.configure(500, false, &mut new_work, at(260)));
+        assert!(!schedule.configure(1000, false, &mut new_work, at(260)));
+        // New work (a panel, column or trace turned on) too, once.
+        new_work = true;
+        assert!(schedule.configure(1000, false, &mut new_work, at(600)));
+        assert!(!new_work);
+        assert!(!schedule.configure(1000, false, &mut new_work, at(600)));
+        // Right after a sample, new work waits for the next one.
+        schedule.last = Some(at(600));
+        new_work = true;
+        assert!(!schedule.configure(1000, false, &mut new_work, at(700)));
+        // Pausing never samples ahead.
+        assert!(!schedule.configure(1000, true, &mut new_work, at(5000)));
+        // Before the first sample the wait is one interval.
+        schedule.last = None;
+        assert_eq!(schedule.wait(at(0)), Duration::from_millis(1000));
+    }
     /// The monitor samples the performance counters every interval whatever
     /// the page (the command no longer names one), also after a pause, and a
     /// page switch keeps the sampler warm (its next sample has rates).
@@ -6682,24 +6822,6 @@ mod tests {
         if counters_work {
             assert!(warm(&after_switch), "the page switch kept the sampler");
         }
-        // Page switches, resizes and keystrokes re-send the same
-        // configuration: past the "recent sample" window (125 ms here) each
-        // one used to sample at once. The schedule stands instead: about 6
-        // samples in 1.5 s, not one per Configure (10).
-        let mut samples = 0;
-        for _ in 0..10 {
-            configure(false);
-            let until = Instant::now() + Duration::from_millis(150);
-            while let Ok(sample) = rx.recv_timeout(until.saturating_duration_since(Instant::now()))
-            {
-                assert!(sample.snapshot.is_ok());
-                samples += 1;
-            }
-        }
-        assert!(
-            (4..=7).contains(&samples),
-            "{samples} samples for 10 unchanged configurations"
-        );
         // A pause drops it (the UI records the gap); sampling resumes with
         // performance data every interval.
         configure(true);

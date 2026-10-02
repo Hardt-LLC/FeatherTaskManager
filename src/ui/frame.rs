@@ -1719,8 +1719,19 @@ mod tests {
                 ));
                 let dpi = GetDpiForSystem().max(96);
                 let d = |v: f32| gfx::pxi(dpi as i32, v);
+                // Windows creates a window at most the virtual screen plus
+                // its borders (at 200 % the reference is taller than a
+                // 1440 px panel), with room left for the border row attach
+                // adds; after that the tests may size it past the screen.
                 let created = outer_size(dpi, d(1200.0), d(820.0), 0);
+                let created = (
+                    created.0.min(GetSystemMetrics(SM_CXMAXTRACK)),
+                    created
+                        .1
+                        .min(GetSystemMetrics(SM_CYMAXTRACK) - dpi.div_ceil(96) as i32),
+                );
                 assert!(!create_window(p, &class, created.0, created.1).is_null());
+                lift_max_track_size((*p).hwnd);
                 assert_eq!(IsWindowVisible((*p).hwnd), 0);
                 Self {
                     p,
